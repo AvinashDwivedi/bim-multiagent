@@ -1,0 +1,85 @@
+# =============================================================================
+# CLIENT OVERLAY — VORM (Sluisbuurt 10A2, Dutch MiniBIM)
+# client_id: 653fbe80-e4c5-11ed-95e8-fdb8a484b2c4
+# =============================================================================
+# The Dutch national/vendor INGEST-classification vocabulary, moved out of the
+# global concept_ontology.yaml by CP-C2 (design_ontology_cascade.md §2). It carries
+# ONLY the two fields the ingest classifier reads:
+#   • gebiedstype     — MiniBIM pset values (100% Dutch) → canonical space function.
+#   • classify_labels — the DUTCH subset of the long_name substrings the classifier
+#                       falls back to when no GebiedsType pset is present. The English/
+#                       language-neutral labels stay global (shared by every project);
+#                       only the Dutch terms live here.
+#   • aliases (CP-C4) — the DUTCH space-function query aliases (the substring-resolved
+#                       field read by normalize_space_type / resolve_space_function).
+#                       English aliases stay global; Hebrew ones live in the Proceed
+#                       project overlay. keyword_synonyms remain global (deferred split).
+#
+# Composed onto global by load_ontology(client_id="653fbe80-…") via compose_ontology:
+#   gebiedstype / classify_labels / aliases are LIST-APPEND (deduped) onto the global
+#   concept, query_priority / classify_priority are NOT restated so each concept inherits
+#   its global band position (no reordering). keyword_synonyms + materials + element
+#   classes remain global.
+#
+# INVARIANT: with this overlay composed in, the Sluisbuurt L1 canonical_* fields are
+# byte-for-byte identical to before the move (gated by `make ontology-verify` 0-diff on
+# 5224 nodes) — the classification is unchanged, only its home moved. Snowdon (a
+# different client with no Dutch overlay) must stay 0-diff too, proving the split does
+# not leak Dutch vocab into other projects.
+# =============================================================================
+
+concepts:
+
+  circulation:
+    gebiedstype: [verkeersruimte]
+    classify_labels: [gang, trap, verkeersruimte]
+    aliases: [gang, gangpad, verkeersruimte]
+
+  apartment:
+    gebiedstype: [appartement, duplex]
+    classify_labels: [appartement, woning]
+    aliases: [appartement, woning]
+
+  storage:
+    gebiedstype: ["berging inpandig"]
+    classify_labels: [berging, opslag]
+    aliases: [berging, opslag, opslagruimte]
+
+  technical_room:
+    gebiedstype: [techniekruimte]
+    classify_labels: [techniek]
+    aliases: [techniek, techniekruimte]
+
+  retail:
+    gebiedstype: [retail]
+    classify_labels: [winkel]
+    aliases: [winkel, commercieel, commerciële, commerciele, winkelruimte, winkelfunctie]
+
+  horeca:
+    gebiedstype: [horeca]
+    classify_labels: [keuken]
+
+  bicycle_storage:
+    gebiedstype: ["fietsenstalling inpandig"]
+    aliases: [fiets, fietsenstalling]
+
+  amenity:
+    gebiedstype: [voorziening]
+    classify_labels: [voorziening]
+    aliases: [voorziening]
+
+  residential_zone:
+    gebiedstype: [woongebied]
+    aliases: [woongebied]
+
+  parking:
+    classify_labels: [parkeer]
+    aliases: [parkeer, parkeerplaats]
+
+  office:
+    classify_labels: [kantoor]
+    aliases: [kantoor, bureau]
+
+  lobby:
+    classify_labels: [entree]
+    aliases: [entree, hal]

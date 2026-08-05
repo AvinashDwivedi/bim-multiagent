@@ -1,0 +1,93 @@
+version: 2
+
+# Canonical level vocabulary for values stored by supported projects.
+level_aliases:
+  ground:
+    - ground
+    - ground floor
+    - floor 0
+    - level 0
+    - begane grond
+    - begane
+    - קרקע
+    - קרקע מפלס 1.5
+  first:
+    - first
+    - first floor
+    - 1st floor
+    - floor 1
+    - level 1
+    - קומה א
+
+# Declarative contract between canonical BIM meaning and its Neo4j representation.
+# Agents never invent these labels, properties, or relationships.
+node_types:
+  client:
+    label: Client
+    identity_property: id
+    properties: [id]
+
+  project:
+    label: Project
+    identity_property: id
+    properties: [id]
+
+  bim_hub:
+    label: BIMHub
+    properties: []
+
+  ifc_project:
+    label: IfcProject
+    properties: [source]
+
+  bim_element:
+    label: BIMElement
+    identity_property: object_id
+    properties: [object_id, source, canonical_type, canonical_level]
+
+relationship_types:
+  client_has_project:
+    name: HAS_PROJECT
+    from_node: client
+    to_node: project
+
+  project_has_bim:
+    name: HAS_BIM
+    from_node: project
+    to_node: bim_hub
+
+  hub_contains_ifc_project:
+    name: CONTAINS
+    from_node: bim_hub
+    to_node: ifc_project
+
+authorization_path:
+  start_node: client
+  relationships:
+    - client_has_project
+    - project_has_bim
+    - hub_contains_ifc_project
+  source_node: ifc_project
+  source_property: source
+
+capabilities:
+  count_project_nodes:
+    description: Count all Neo4j nodes belonging to the authorized project scope.
+    executor: count_project_nodes
+    source_property: source
+    relationships:
+      - client_has_project
+      - project_has_bim
+      - hub_contains_ifc_project
+    source_scope_required: true
+
+  count_elements_by_type_and_level:
+    description: Count unique project-scoped BIM elements by canonical type and level.
+    executor: count_elements_by_type_and_level
+    node_type: bim_element
+    identity_property: object_id
+    source_property: source
+    type_property: canonical_type
+    level_property: canonical_level
+    relationships: []
+    source_scope_required: true

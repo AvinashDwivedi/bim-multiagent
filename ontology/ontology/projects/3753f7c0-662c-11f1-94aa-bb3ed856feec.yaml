@@ -1,0 +1,177 @@
+# =============================================================================
+# PROJECT OVERLAY — Proceed / Hebrew permit (properties-only DWFX)
+# client_id:  be872770-e4b7-11ed-80fd-1d4b3b851a74   (Proceed)
+# project_id: 3753f7c0-662c-11f1-94aa-bb3ed856feec
+# =============================================================================
+# The project-scoped ontology facts, moved out of the global concept_ontology.yaml
+# by CP-C3 (design_ontology_cascade.md §2). Both sections are bound to THIS one
+# permit-form/DWFX and have no business being visible to any other project:
+#   • permit_measures — the CanonicalMeasure `extract` paths are bound to ONE
+#       enrichment-JSON schema (block/path/unit/basis/label); the EN/HE `aliases`
+#       + level_role/level_markers are query-side resolution for those measures.
+#   • room_labels     — the Hebrew 2D-plan room vocabulary (some glyphs stored
+#       RTL-reversed) recovered from IfcAnnotation Text Content, for a model that
+#       has NO IfcSpace at all.
+#
+# Composed onto global by load_ontology(client_id="be872770-…",
+# project_id="3753f7c0-…") via compose_ontology (project band):
+#   permit_measures  — new slugs added wholesale; aliases/level_markers list-append,
+#                      every `extract` sub-field + level_role scalar-replace.
+#   room_labels      — slug -> exact-term lists, list-append.
+# The Dutch VORM client overlay is orthogonal; this project sits under the Proceed
+# client (be872770), which carries no client overlay today.
+#
+# INVARIANT: with this overlay composed in, the Hebrew project's ingest (the CP-PM4
+# CanonicalMeasure nodes + the CP-S3 room-label recovery) and query-side measure
+# resolution reproduce their golden values byte-for-byte — the facts are unchanged,
+# only their home moved (gated by check_ontology_compose.py under expect_hebrew).
+# Every OTHER dataset (VORM Sluisbuurt, Snowdon) must NOT see these facts, proving
+# the project vocab does not leak across projects.
+# =============================================================================
+
+# =============================================================================
+# CONCEPTS — HEBREW space-function query aliases (CP-C4).
+# -----------------------------------------------------------------------------
+# The Hebrew substring-resolved `aliases` (read by normalize_space_type /
+# resolve_space_function) split out of global by CP-C4. English aliases stay global;
+# the Dutch ones live in the VORM client overlay. LIST-APPEND (deduped) onto the global
+# concept; query_priority is NOT restated so each inherits its global band position.
+# These concepts (circulation, apartment, …) already exist in global — the overlay only
+# extends their alias list. keyword_synonyms remain global (deferred split).
+# =============================================================================
+
+concepts:
+
+  circulation:
+    aliases: [מסדרון, פרוזדור]
+
+  apartment:
+    aliases: [דירה, יחידה]
+
+  storage:
+    aliases: [מחסן]
+
+  parking:
+    aliases: [חניה]
+
+  office:
+    aliases: [משרד]
+
+# =============================================================================
+# PERMIT MEASURES (CP-PM) — project-level "official figures" (permit/drawing/form).
+#   extract   — WHERE the fact lives in the enrichment JSON, read ONCE at ingest into
+#               a CanonicalMeasure node (block/path/unit/basis/label).
+#   aliases   — EN/HE measure names → this key (query-time, longest-alias-match wins).
+#   level_role + level_markers — which floor-area/floor-height measure a level filter
+#               maps to (get_floor_area / get_floor_height fall back to the permit
+#               figure when a project has no IfcSpace/storey geometry).
+# A measure with no `aliases` (e.g. building_height_foundation_to_cornice_m) is
+# extract-only.
+# =============================================================================
+
+permit_measures:
+
+  ground_floor_area_m2:
+    extract: {block: area_calculation_summary, path: [ground_floor, net_floor_area_sqm], unit: "m²", basis: permit_area_calculation, label: "Ground floor net floor area"}
+    aliases: ["ground floor area", "ground floor", "ground area", "floor area ground",
+              "שטח קומת קרקע", "שטח קומה קרקע", "שטח קרקע", "קומת קרקע"]
+    level_role: floor_area
+    level_markers: [ground, grnd, קרקע, begane]
+
+  ground_floor_gross_area_m2:
+    extract: {block: area_calculation_summary, path: [ground_floor, gross_area_sqm], unit: "m²", basis: permit_area_calculation, label: "Ground floor gross area"}
+    aliases: ["ground floor gross area", "gross floor area ground"]
+
+  mamad_area_m2:
+    extract: {block: area_calculation_summary, path: [ground_floor, less_mamad_sqm], unit: "m²", basis: permit_area_calculation, label: "Mamad (protected room) area"}
+    aliases: [mamad, "mamad size", "mamad area", "protected room", "protected space",
+              ממד, 'ממ"ד', "גודל הממד", "שטח ממד", "מרחב מוגן", "מרחב מוגן דירתי"]
+
+  first_floor_area_m2:
+    extract: {block: area_calculation_summary, path: [floor_a_first_floor, net_floor_area_sqm], unit: "m²", basis: permit_area_calculation, label: "First floor net floor area"}
+    aliases: ["first floor area", "1st floor area", "first floor",
+              "שטח קומה א", "שטח קומה ראשונה", "קומה ראשונה", "קומה א"]
+    level_role: floor_area
+    level_markers: ["first floor", 1st, "קומה א", ראשונה]
+
+  uncovered_balcony_area_m2:
+    extract: {block: area_calculation_summary, path: [uncovered_balcony, area_sqm], unit: "m²", basis: permit_area_calculation, label: "Uncovered balcony area"}
+    aliases: ["balcony area", "uncovered balcony", מרפסת]
+
+  total_building_proposed_m2:
+    extract: {block: area_calculation_summary, path: [total_building_proposed_sqm_official], unit: "m²", basis: permit_area_calculation, label: "Total proposed building area"}
+    aliases: ["total building area", "total proposed area", "סך שטח בניה", "שטח בניה כולל"]
+
+  basement_wall_height_cm:
+    extract: {block: facade_and_section_drawings, path: [sections_summary, section_4_4, wall_dims_cm, lower_wall], unit: cm, basis: permit_drawing_section, label: "Lower/sunken-level (מרתף) wall height, section 4-4"}
+    aliases: ["basement height", "basement floor height", "sunken floor",
+              "sunken level", "גובה קומת מרתף", "קומת מרתף", מרתף, "קומה שקועה"]
+    level_role: floor_height
+    level_markers: [basement, sunken, מרתף, שקוע]
+
+  upper_floor_wall_height_cm:
+    extract: {block: facade_and_section_drawings, path: [sections_summary, section_4_4, wall_dims_cm, upper_wall], unit: cm, basis: permit_drawing_section, label: "Upper-floor wall height, section 4-4"}
+    aliases: ["floor height", "storey height", "story height", "wall height",
+              "גובה קומה", "גובה קומה ראשונה", "קומה ראשונה", "קומה א"]
+    level_role: floor_height
+    level_markers: ["first floor", 1st, "קומה א", ראשונה]
+
+  setback_side_cm:
+    extract: {block: facade_and_section_drawings, path: [setback_dimensions, side_setback_cm], unit: cm, basis: permit_drawing_setback, label: "Side building-line setback (קו בניין)"}
+    aliases: ["building line", setback, "side setback", "building setback",
+              "distance from plot", "קו בניין", "קו בנין", "מרחק מקו מגרש", "קו מגרש"]
+
+  setback_front_cm:
+    extract: {block: facade_and_section_drawings, path: [setback_dimensions, front_setback_cm], unit: cm, basis: permit_drawing_setback, label: "Front building-line setback"}
+    aliases: ["front setback", "front building line", "קו בניין קדמי"]
+
+  building_height_ground_to_cornice_m:
+    extract: {block: level_reference_table, path: [overall_building_height_m, ground_to_cornice], unit: m, basis: permit_level_reference, label: "Building height, ground to cornice/parapet"}
+    aliases: ["building height", "height of building", cornice,
+              "parapet height", "גובה בניין", "גובה הבניין", כרכוב]
+
+  building_height_foundation_to_cornice_m:
+    extract: {block: level_reference_table, path: [overall_building_height_m, foundation_to_cornice], unit: m, basis: permit_level_reference, label: "Building height, foundation to cornice"}
+
+  plot_area_m2:
+    extract: {block: project_permit_info, path: [plot_area_sqm], unit: "m²", basis: permit_form2, label: "Plot area"}
+    aliases: ["plot area", "lot area", "שטח מגרש", מגרש]
+
+  permitted_main_coverage_m2:
+    extract: {block: project_permit_info, path: [building_coverage, permitted_main_coverage_sqm], unit: "m²", basis: permit_form2, label: "Permitted building coverage (תכסית)"}
+    aliases: ["building coverage", "permitted coverage", coverage,
+              "building percentage", תכסית, "אחוז בניה", "אחוז הבניה"]
+
+  permitted_coverage_for_main_m2:
+    extract: {block: project_permit_info, path: [building_coverage, permitted_coverage_up_to_sqm_for_main], unit: "m²", basis: permit_form2, label: "Permitted coverage for principal area (עיקרי)"}
+    aliases: ["principal area", "main coverage", עיקרי]
+
+  dwelling_units_count:
+    extract: {block: project_permit_info, path: [dwelling_units, count], unit: count, basis: permit_form2, label: "Dwelling units"}
+    aliases: ["dwelling units", units, "residential units", "יחידות דיור", דירות]
+
+
+# =============================================================================
+# ROOM LABELS (CP-S3) — Hebrew 2D-plan room labels → room function.
+# -----------------------------------------------------------------------------
+# A 2D DWFX permit drawing (properties-only ingest, no IFC) carries room names ONLY
+# as floating IfcAnnotation `Text Content` glyphs — no IfcSpace geometry, no level,
+# no area. Some glyphs are stored RTL-REVERSED (e.g. "הינח" = "חניה"/parking), which
+# the loader's classify_room_label handles by also testing the reversed string.
+# Consumed by chunker_bim._extract_room_label_nodes; EXACT match on the stripped text
+# or its reversal (so drawing titles like "חתך מחסן" — storage SECTION — are NOT
+# mistaken for a storage ROOM). Each value is a slug → list of EXACT label terms.
+# =============================================================================
+
+room_labels:
+  safe_room:   [ממד, 'ממ"ד', "מרחב מוגן", "מרחב מוגן דירתי", "חדר מוגן", mamad, "safe room", "protected space"]
+  kitchen:     [מטבח, kitchen]
+  dining:      ["חדר אוכל", אוכל, "dining room", dining]
+  living:      ["חדר דיור", דיור, "living room", living]
+  bedroom:     [שינה, "חדר שינה", "חדר הורים", הורים, bedroom]
+  bathroom:    [אמבטיה, מקלחת, שירותים, bathroom, toilet]
+  closet:      [ארונות, closet, wardrobe]
+  storage:     [מחסן, storage]
+  circulation: [מדרגות, "חדר מדרגות", מסדרון, stairs, circulation]
+  parking:     [חניה, חנייה, parking]
+  balcony:     [מרפסת, balcony, terrace]

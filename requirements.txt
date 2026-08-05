@@ -1,0 +1,7 @@
+openai-agents>=0.8,<1
+neo4j>=5.28,<7
+python-dotenv>=1.0,<2
+pydantic>=2.10,<3
+PyYAML>=6.0,<7
+starlette>=0.47,<2
+uvicorn>=0.35,<1

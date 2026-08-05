@@ -1,0 +1,37 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+
+from .observability import BimRunHooks, configure_logging
+from .runtime import answer_bim_question
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Ask a supervised, project-scoped BIM question.")
+    parser.add_argument("question", help="The BIM question to answer")
+    parser.add_argument("--timeout", type=float, default=None, help="Maximum total runtime in seconds (default: 180)")
+    parser.add_argument("--log-file", help="Also write detailed lifecycle logs to this file")
+    parser.add_argument("--quiet", action="store_true", help="Hide progress logs")
+    args = parser.parse_args()
+    logger = configure_logging(verbose=not args.quiet, log_file=args.log_file)
+    try:
+        report = asyncio.run(
+            answer_bim_question(
+                args.question,
+                timeout_seconds=args.timeout,
+                hooks=BimRunHooks(logger),
+            )
+        )
+    except Exception as exc:
+        logger.error("run.failed  | %s: %s", type(exc).__name__, exc)
+        if args.log_file:
+            logger.debug("failure traceback", exc_info=True)
+        raise SystemExit(1) from exc
+    print(json.dumps(report.model_dump(), ensure_ascii=False, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()
