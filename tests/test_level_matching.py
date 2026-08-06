@@ -4,13 +4,13 @@ from bim_agents.tools import _level_matches
 
 
 class LevelMatchingTests(unittest.TestCase):
-    def test_matches_ordinal_and_numeric_level(self):
-        self.assertTrue(_level_matches("seventh floor", "Level 7"))
+    def test_matches_agent_normalized_and_numeric_level(self):
+        self.assertTrue(_level_matches("7", "Level 7"))
         self.assertTrue(_level_matches("7th floor", "Floor 07"))
 
     def test_does_not_match_different_or_missing_level(self):
-        self.assertFalse(_level_matches("seventh floor", "Level 17"))
-        self.assertFalse(_level_matches("seventh floor", None))
+        self.assertFalse(_level_matches("7", "Level 17"))
+        self.assertFalse(_level_matches("7", None))
 
     def test_matches_cross_language_contract_alias(self):
         aliases = {

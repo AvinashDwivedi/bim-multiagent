@@ -48,7 +48,7 @@ node_types:
   ifc_space:
     label: IfcSpace
     identity_property: object_id
-    properties: [object_id, source, IFCtype, name, canonical_type, canonical_level, canonical_area_m2, Segment, Afnemer, Programma, WoningType]
+    properties: [object_id, source, IFCtype, name, canonical_type, canonical_level, canonical_area_m2]
 
   canonical_measure:
     label: CanonicalMeasure
@@ -96,7 +96,7 @@ query_entities:
     source_property: source
     classification_source_property: function_source_term
     classification_name_property: name
-    default_select: [object_id, ifc_class, name, type, level, area_m2, segment, owner, room_count]
+    default_select: [object_id, ifc_class, name, type, level]
     fields:
       object_id:
         property: object_id
@@ -124,19 +124,6 @@ query_entities:
         data_type: number
         unit: m²
         description: Canonical space area in square metres when modelled.
-      segment:
-        property: Segment
-        description: Housing or market segment code; MSH denotes Mid-segment.
-      owner:
-        property: Afnemer
-        description: Modelled owner, customer, or receiving party.
-      room_count:
-        property: Programma
-        description: Modelled residential room-count programme, such as 3 kamer.
-      dwelling_type:
-        property: WoningType
-        description: Modelled dwelling-type code.
-
   elements:
     kind: records
     description: Physical and spatial IFC products in the authorized BIM model.

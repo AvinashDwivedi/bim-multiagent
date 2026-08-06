@@ -46,8 +46,12 @@ async def health(request: Request) -> JSONResponse:
         bim = BimContext(Settings.from_env())
         try:
             bim.connect()
-            summary = bim.get_project_summary()
-            contract = load_graph_contract(os.getenv("BIM_GRAPH_SCHEMA_PATH") or None)
+            contract = load_graph_contract(
+                os.getenv("BIM_GRAPH_SCHEMA_PATH") or None,
+                client_id=bim.settings.client_id,
+                project_id=bim.settings.project_id,
+            )
+            summary = bim.get_project_summary(contract)
             validate_live_schema(bim, contract)
             return {
                 "status": "ok",

@@ -21,13 +21,18 @@ class GraphContractTests(unittest.TestCase):
         spaces = contract.query_entity("spaces")
         self.assertEqual(contract.node(spaces.node_type).label, "IfcSpace")
         self.assertEqual(spaces.fields["type"].ontology_kind, "canonical_type")
-        self.assertEqual(spaces.fields["segment"].property, "Segment")
-        self.assertEqual(spaces.fields["owner"].property, "Afnemer")
-        self.assertEqual(spaces.fields["room_count"].property, "Programma")
+        self.assertNotIn("segment", spaces.fields)
         self.assertIn("object_id", spaces.default_select)
 
         graph = contract.query_entity("project_graph")
         self.assertEqual(graph.kind, "project_graph")
+
+    def test_client_overlay_adds_deployment_specific_fields(self):
+        contract = load_graph_contract(client_id="653fbe80-e4c5-11ed-95e8-fdb8a484b2c4")
+        spaces = contract.query_entity("spaces")
+        self.assertEqual(spaces.fields["segment"].property, "Segment")
+        self.assertEqual(spaces.fields["owner"].property, "Afnemer")
+        self.assertEqual(spaces.fields["room_count"].property, "Programma")
 
     def test_rejects_unsafe_schema_identifier(self):
         bad_contract = """

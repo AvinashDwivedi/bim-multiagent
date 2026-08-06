@@ -19,6 +19,9 @@ separate agents.
 
 `graph_schema.yaml` is the versioned bridge between canonical ontology concepts and Neo4j storage.
 It declares supported node labels, properties, relationships, the project-authorization path, and
+query fields. Optional `graph_schema_overlays/clients/<id>.yaml` and
+`graph_schema_overlays/projects/<id>.yaml` files add deployment-specific mappings without making them
+global assumptions.
 the semantic entities and fields exposed to the general query language. The query engine reads this
 contract; agents never invent labels, relationship paths, property names, or Cypher.
 
@@ -35,9 +38,8 @@ questions such as:
 - What permit knowledge is available about balconies?
 
 Filtered space and apartment answers are analytical by default. A count or list includes a bounded,
-verified record breakdown with the source object ID, IFC class, name, modelled level, area, segment,
-owner, and room-count programme when those values exist. A caller can request a scalar-only space count
-with `include_details=false`; large result sets remain bounded by the query-plan limit.
+verified record breakdown when the analyst determines that record details help answer the question.
+Scalar counts remain scalar by default; requested lists and details remain bounded by the query-plan limit.
 
 For relationship questions or unfamiliar graph concepts, the Analyst can optionally call
 `inspect_project_graph_structure`. It returns distinct project-scoped node-label signatures, bounded

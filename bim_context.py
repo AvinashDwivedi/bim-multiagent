@@ -95,36 +95,56 @@ class BimContext:
         )
         return [record.data() for record in records]
 
-    def resolve_allowed_sources(self) -> list[str]:
+    def resolve_allowed_sources(self, graph_contract: Any) -> list[str]:
         """
         Resolve BIM sources through the authorized client/project hierarchy.
 
         Returns an empty list on missing or invalid scope, so callers fail closed.
         """
-        cypher = """
-        MATCH (c:Client {id: $client_id})
-              -[:HAS_PROJECT]->
-              (p:Project {id: $project_id})
-        MATCH (p)-[:HAS_BIM]->
-              (:BIMHub)-[:CONTAINS]->
-              (ip:IfcProject)
-        WHERE ip.source IS NOT NULL
-        RETURN DISTINCT ip.source AS source
-        ORDER BY source
-        """
+        path = graph_contract.authorization_path
+        current_key = path.start_node
+        current = graph_contract.node(current_key)
+        parameters: dict[str, Any] = {}
+
+        def scoped_node(alias: str, key: str) -> str:
+            node = graph_contract.node(key)
+            if key == path.start_node:
+                if not node.identity_property:
+                    raise RuntimeError("Authorization start node needs an identity property.")
+                parameters["client_id"] = self.settings.client_id
+                return f"({alias}:`{node.label}` {{`{node.identity_property}`: $client_id}})"
+            if key == "project":
+                if not node.identity_property:
+                    raise RuntimeError("Authorization project node needs an identity property.")
+                parameters["project_id"] = self.settings.project_id
+                return f"({alias}:`{node.label}` {{`{node.identity_property}`: $project_id}})"
+            return f"({alias}:`{node.label}`)"
+
+        pattern = scoped_node("n0", current_key)
+        for index, relationship_key in enumerate(path.relationships, start=1):
+            relationship = graph_contract.relationship_types[relationship_key]
+            if relationship.from_node != current_key:
+                raise RuntimeError("Authorization path is not a contiguous directed path.")
+            current_key = relationship.to_node
+            pattern += f"-[:`{relationship.name}`]->" + scoped_node(f"n{index}", current_key)
+        if current_key != path.source_node:
+            raise RuntimeError("Authorization path does not end at its configured source node.")
+        source_alias = f"n{len(path.relationships)}"
+        cypher = (
+            f"MATCH {pattern} "
+            f"WHERE {source_alias}.`{path.source_property}` IS NOT NULL "
+            f"RETURN DISTINCT {source_alias}.`{path.source_property}` AS source ORDER BY source"
+        )
 
         rows = self.query(
             cypher,
-            {
-                "client_id": self.settings.client_id,
-                "project_id": self.settings.project_id,
-            },
+            parameters,
         )
         return [row["source"] for row in rows if row.get("source")]
 
-    def get_project_summary(self) -> dict[str, Any]:
+    def get_project_summary(self, graph_contract: Any) -> dict[str, Any]:
         """Return a small, safely scoped BIM-model summary."""
-        allowed_sources = self.resolve_allowed_sources()
+        allowed_sources = self.resolve_allowed_sources(graph_contract)
 
         if not allowed_sources:
             return {
@@ -134,15 +154,12 @@ class BimContext:
                 "element_count": 0,
             }
 
+        entity = graph_contract.query_entity("elements")
+        node = graph_contract.node(entity.node_type)
         rows = self.query(
-            """
-            MATCH (b:BIMElement)
-            WHERE b.source IN $allowed_sources
-            RETURN
-                count(DISTINCT b.object_id) AS element_count,
-                count(DISTINCT b.canonical_type) AS canonical_type_count,
-                count(DISTINCT b.canonical_level) AS level_count
-            """,
+            f"MATCH (b:`{node.label}`) "
+            f"WHERE b.`{entity.source_property}` IN $allowed_sources "
+            f"RETURN count(DISTINCT b.`{entity.identity_property}`) AS element_count",
             {"allowed_sources": allowed_sources},
         )
 
@@ -182,7 +199,8 @@ def main() -> None:
         print(f"Loaded permit measures: {len(bim.ontology.permit_measures)}")
 
         print("\nProject summary:")
-        print(bim.get_project_summary())
+        from bim_agents.graph_contract import load_graph_contract
+        print(bim.get_project_summary(load_graph_contract()))
 
         print("\nExample ontology resolutions:")
         for term in ("apartment", "elevator", "door", "wood"):

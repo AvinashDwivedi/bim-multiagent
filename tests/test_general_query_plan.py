@@ -72,7 +72,7 @@ class GeneralQueryPlanTests(unittest.TestCase):
             "  - Name: Area:1952114\n"
             "  - Level: 07 zevende verdieping\n"
             "  - Area: 58.26 m²\n"
-            "  - Segment: MSH (Mid-segment)\n"
+            "  - Segment: MSH\n"
             "  - Owner: Belegger\n"
             "  - Room Count: 3 kamer",
         )
@@ -100,10 +100,10 @@ class GeneralQueryPlanTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             BimQueryPlan(entity="elements", operation="list", limit=1000)
 
-    def test_space_count_details_are_on_by_default_but_can_be_disabled(self):
-        self.assertTrue(BimQueryPlan(entity="spaces", operation="count").include_details)
-        self.assertFalse(
-            BimQueryPlan(entity="spaces", operation="count", include_details=False).include_details
+    def test_record_details_are_an_explicit_agent_choice(self):
+        self.assertFalse(BimQueryPlan(entity="spaces", operation="count").include_details)
+        self.assertTrue(
+            BimQueryPlan(entity="spaces", operation="count", include_details=True).include_details
         )
 
 

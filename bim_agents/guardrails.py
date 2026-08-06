@@ -49,6 +49,21 @@ def _render_claim_answer(claim: Claim) -> str:
     return claim.statement + "\n\n- " + "\n\n- ".join(claim.details)
 
 
+def _consolidate_claims(claims: list[Claim]) -> list[Claim]:
+    """Collapse duplicate conclusions, retaining the version with the richer details."""
+    consolidated: dict[tuple, Claim] = {}
+    for claim in claims:
+        key = (claim.statement, claim.value, claim.unit)
+        existing = consolidated.get(key)
+        if existing is None:
+            consolidated[key] = claim
+            continue
+        preferred = claim if len(claim.details) > len(existing.details) else existing
+        preferred.evidence_ids = list(dict.fromkeys(existing.evidence_ids + claim.evidence_ids))
+        consolidated[key] = preferred
+    return list(consolidated.values())
+
+
 def query_report_from_evidence(context: BimRunContext) -> BimQueryReport:
     claims: list[Claim] = []
     evidence_ids: list[str] = []
@@ -57,13 +72,15 @@ def query_report_from_evidence(context: BimRunContext) -> BimQueryReport:
         if evidence.kind != "query":
             continue
         payload = json.loads(evidence.payload)
-        claims.append(_claim_from_payload(payload, [evidence_id]))
+        include_in_answer = (payload.get("plan") or {}).get("include_in_answer", True)
+        if include_in_answer:
+            claims.append(_claim_from_payload(payload, [evidence_id]))
+            limitations.extend(payload.get("limitations") or [])
         evidence_ids.append(evidence_id)
-        limitations.extend(payload.get("limitations") or [])
     if not claims:
         limitations.append("The BIM Analyst produced no deterministic query evidence.")
     return BimQueryReport(
-        claims=claims,
+        claims=_consolidate_claims(claims),
         evidence_ids=evidence_ids,
         limitations=list(dict.fromkeys(limitations)),
     )
@@ -81,8 +98,10 @@ def verification_report_from_evidence(context: BimRunContext) -> VerificationRep
     claims: list[Claim] = []
     rejected: list[str] = []
     for check in payload.get("checks") or []:
-        limitations.extend(check.get("limitations") or [])
-        if check.get("verified") is True:
+        include_in_answer = (check.get("plan") or {}).get("include_in_answer", True)
+        if include_in_answer:
+            limitations.extend(check.get("limitations") or [])
+        if check.get("verified") is True and include_in_answer:
             claims.append(_claim_from_payload(
                 {"claim": check.get("claim") or {}},
                 [str(check.get("evidence_id")), evidence_id],
@@ -97,7 +116,7 @@ def verification_report_from_evidence(context: BimRunContext) -> VerificationRep
         )
         return VerificationReport(
             status="verified",
-            verified_claims=claims,
+            verified_claims=_consolidate_claims(claims),
             limitations=list(dict.fromkeys(limitations)),
         )
     return VerificationReport(

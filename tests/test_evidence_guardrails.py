@@ -88,6 +88,55 @@ class EvidenceGuardrailTests(unittest.TestCase):
         self.assertEqual(supervisor_report.claims[0].value, 100.0)
         self.assertIn("IfcSpace 6891\n  - Area: 58.26 m²", supervisor_report.answer)
 
+    def test_verified_exploration_is_not_rendered_as_an_answer_claim(self):
+        context = BimRunContext(
+            bim=object(),
+            scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+        )
+        exploration = BimQueryPlan(
+            entity="spaces", operation="distinct", group_by="level", include_in_answer=False
+        )
+        answer = BimQueryPlan(
+            entity="spaces",
+            operation="count",
+            filters=[BimFilter(field="level", operator="equals", value="7")],
+        )
+        context.add_evidence(Evidence(
+            evidence_id="verification-focused",
+            kind="verification",
+            summary="test focused verification",
+            payload=json.dumps({
+                "verified": True,
+                "checks": [
+                    {
+                        "evidence_id": "query-explore",
+                        "verified": True,
+                        "plan": exploration.model_dump(mode="json"),
+                        "claim": {"statement": "All 13 levels...", "basis": "test"},
+                        "limitations": [],
+                    },
+                    {
+                        "evidence_id": "query-answer",
+                        "verified": True,
+                        "plan": answer.model_dump(mode="json"),
+                        "claim": {
+                            "statement": "There are 8 apartments on the 7th floor.",
+                            "value": 8,
+                            "basis": "test",
+                        },
+                        "limitations": [],
+                    },
+                ],
+            }),
+        ))
+
+        report = supervisor_report_from_evidence(context)
+
+        self.assertEqual(len(report.claims), 1)
+        self.assertEqual(report.claims[0].value, 8)
+        self.assertNotIn("All 13 levels", report.answer)
+
 
 if __name__ == "__main__":
     unittest.main()

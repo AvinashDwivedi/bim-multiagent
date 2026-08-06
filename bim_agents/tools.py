@@ -14,14 +14,6 @@ from .graph_contract import QueryEntity, QueryField
 from .models import BimRunContext, Evidence
 
 
-_ORDINALS = {
-    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
-    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
-    "eleventh": 11, "twelfth": 12, "thirteenth": 13, "fourteenth": 14,
-    "fifteenth": 15, "sixteenth": 16, "seventeenth": 17, "eighteenth": 18,
-    "nineteenth": 19, "twentieth": 20,
-}
-
 Operation = Literal[
     "count", "list", "group_count", "group_summary", "distinct",
     "sum", "average", "minimum", "maximum"
@@ -51,8 +43,12 @@ class BimQueryPlan(BaseModel):
     sort_order: Literal["ascending", "descending"] = "ascending"
     limit: int = Field(default=10, ge=1, le=20)
     include_details: bool = Field(
-        default=True,
+        default=False,
         description="Include bounded technical record details when supported.",
+    )
+    include_in_answer: bool = Field(
+        default=True,
+        description="False only for a supporting exploration query whose claim should not be rendered.",
     )
 
 
@@ -67,9 +63,6 @@ def _normalize(value: str | None) -> str:
 
 def _level_number(value: str) -> int | None:
     normalized = _normalize(value)
-    for word, number in _ORDINALS.items():
-        if re.search(rf"\b{word}\b", normalized):
-            return number
     match = re.search(r"\b(\d{1,3})(?:st|nd|rd|th)?\b", normalized)
     return int(match.group(1)) if match else None
 
@@ -155,10 +148,7 @@ def _catalog(ctx: BimRunContext) -> dict[str, Any]:
             "group_summary": "set group_by and a numeric metric; returns count and summed metric per group",
             "numeric_aggregates": "set metric to a numeric field",
             "list": "select fields or use the entity defaults",
-            "space_count_details": (
-                "space counts include a bounded technical record breakdown by default; "
-                "set include_details=false only when the user explicitly wants just the total"
-            ),
+            "planning": "select the entity, fields, operation, and whether record details help answer the question",
             "missing_values": "is_missing already means absent, null, or blank; do not query extra sentinel values",
             "list_limit": "use the default 10 rows; the hard maximum is 20",
             "scope": "every operation is restricted to the authorized project",
@@ -540,7 +530,6 @@ def _space_list_headline(
 
 
 def _format_space_rows(rows: list[dict[str, Any]]) -> list[str]:
-    segment_labels = {"MSH": "Mid-segment"}
     formatted: list[str] = []
     for row in rows:
         ifc_class = str(row.get("ifc_class") or "IfcSpace")
@@ -557,8 +546,7 @@ def _format_space_rows(rows: list[dict[str, Any]]) -> list[str]:
         ]
         segment = row.get("segment")
         if segment not in (None, ""):
-            expanded = segment_labels.get(str(segment))
-            values.append(("Segment", f"{segment} ({expanded})" if expanded else segment))
+            values.append(("Segment", segment))
         values.extend([
             ("Owner", row.get("owner")),
             ("Room Count", row.get("room_count")),

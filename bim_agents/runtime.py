@@ -30,10 +30,14 @@ async def answer_bim_question(
     bim = BimContext(settings)
     try:
         bim.connect()
-        allowed_sources = bim.resolve_allowed_sources()
+        graph_contract = load_graph_contract(
+            os.getenv("BIM_GRAPH_SCHEMA_PATH") or None,
+            client_id=settings.client_id,
+            project_id=settings.project_id,
+        )
+        allowed_sources = bim.resolve_allowed_sources(graph_contract)
         if not allowed_sources:
             raise PermissionError("The configured client/project has no authorized BIM sources.")
-        graph_contract = load_graph_contract(os.getenv("BIM_GRAPH_SCHEMA_PATH") or None)
         schema_report = validate_live_schema(bim, graph_contract)
         context = BimRunContext(
             bim=bim,

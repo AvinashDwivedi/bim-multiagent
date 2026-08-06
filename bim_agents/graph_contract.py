@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
@@ -88,6 +88,14 @@ class GraphSchemaContract(BaseModel):
         for rel_key in path.relationships:
             if rel_key not in self.relationship_types:
                 raise ValueError(f"Authorization path references unknown relationship {rel_key!r}.")
+        current_node = path.start_node
+        for rel_key in path.relationships:
+            relationship = self.relationship_types[rel_key]
+            if relationship.from_node != current_node:
+                raise ValueError("Authorization relationships must form one contiguous directed path.")
+            current_node = relationship.to_node
+        if current_node != path.source_node:
+            raise ValueError("Authorization path must end at its configured source node.")
         _assert_identifier(path.source_property)
         for entity_name, entity in self.query_entities.items():
             _assert_identifier(entity_name)
@@ -142,10 +150,33 @@ def _assert_property(value: str) -> None:
         raise ValueError(f"Unsafe Neo4j property in graph schema contract: {value!r}")
 
 
-def load_graph_contract(path: str | Path | None = None) -> GraphSchemaContract:
+def _merge_contract(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Recursively apply a client/project mapping overlay; lists replace base lists."""
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_contract(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_graph_contract(
+    path: str | Path | None = None,
+    *,
+    client_id: str | None = None,
+    project_id: str | None = None,
+) -> GraphSchemaContract:
     contract_path = Path(path) if path else DEFAULT_CONTRACT_PATH
     with contract_path.open("r", encoding="utf-8") as stream:
-        return GraphSchemaContract.model_validate(yaml.safe_load(stream) or {})
+        data = yaml.safe_load(stream) or {}
+    overlay_root = contract_path.parent / "graph_schema_overlays"
+    for kind, scope_id in (("clients", client_id), ("projects", project_id)):
+        overlay_path = overlay_root / kind / f"{scope_id}.yaml" if scope_id else None
+        if overlay_path and overlay_path.is_file():
+            with overlay_path.open("r", encoding="utf-8") as stream:
+                data = _merge_contract(data, yaml.safe_load(stream) or {})
+    return GraphSchemaContract.model_validate(data)
 
 
 def validate_live_schema(
