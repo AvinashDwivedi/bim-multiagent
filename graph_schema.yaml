@@ -1,4 +1,4 @@
-version: 2
+version: 3
 
 # Canonical level vocabulary for values stored by supported projects.
 level_aliases:
@@ -40,10 +40,25 @@ node_types:
     label: IfcProject
     properties: [source]
 
-  bim_element:
-    label: BIMElement
+  ifc_product:
+    label: IfcProduct
     identity_property: object_id
-    properties: [object_id, source, canonical_type, canonical_level]
+    properties: [object_id, source]
+
+  ifc_space:
+    label: IfcSpace
+    identity_property: object_id
+    properties: [object_id, source, IFCtype, name, canonical_type, canonical_level, canonical_area_m2, Segment, Afnemer, Programma, WoningType]
+
+  canonical_measure:
+    label: CanonicalMeasure
+    identity_property: id
+    properties: [id, source]
+
+  permit_knowledge:
+    label: PermitKnowledge
+    identity_property: id
+    properties: [id, source]
 
 relationship_types:
   client_has_project:
@@ -70,24 +85,167 @@ authorization_path:
   source_node: ifc_project
   source_property: source
 
-capabilities:
-  count_project_nodes:
-    description: Count all Neo4j nodes belonging to the authorized project scope.
-    executor: count_project_nodes
-    source_property: source
-    relationships:
-      - client_has_project
-      - project_has_bim
-      - hub_contains_ifc_project
-    source_scope_required: true
-
-  count_elements_by_type_and_level:
-    description: Count unique project-scoped BIM elements by canonical type and level.
-    executor: count_elements_by_type_and_level
-    node_type: bim_element
+# General, declarative query surface. Agents use these semantic field names and never
+# receive permission to invent a label, property, relationship, or Cypher fragment.
+query_entities:
+  spaces:
+    kind: records
+    description: IFC spaces used for room, area, apartment, and functional-program questions.
+    node_type: ifc_space
     identity_property: object_id
     source_property: source
-    type_property: canonical_type
-    level_property: canonical_level
-    relationships: []
-    source_scope_required: true
+    classification_source_property: function_source_term
+    classification_name_property: name
+    default_select: [object_id, ifc_class, name, type, level, area_m2, segment, owner, room_count]
+    fields:
+      object_id:
+        property: object_id
+        description: Source-model object identifier.
+      ifc_class:
+        property: IFCtype
+        description: IFC class; expected to be IfcSpace for this entity.
+        ontology_kind: ifc_class
+      name:
+        property: name
+        description: Human-readable space name.
+      global_id:
+        property: GlobalID
+        description: IFC global identifier.
+      type:
+        property: canonical_type
+        description: Canonical space function such as apartment, parking, retail, or circulation.
+        ontology_kind: canonical_type
+      level:
+        property: canonical_level
+        description: Canonical building level or floor.
+        ontology_kind: level
+      area_m2:
+        property: canonical_area_m2
+        data_type: number
+        unit: m²
+        description: Canonical space area in square metres when modelled.
+      segment:
+        property: Segment
+        description: Housing or market segment code; MSH denotes Mid-segment.
+      owner:
+        property: Afnemer
+        description: Modelled owner, customer, or receiving party.
+      room_count:
+        property: Programma
+        description: Modelled residential room-count programme, such as 3 kamer.
+      dwelling_type:
+        property: WoningType
+        description: Modelled dwelling-type code.
+
+  elements:
+    kind: records
+    description: Physical and spatial IFC products in the authorized BIM model.
+    node_type: ifc_product
+    identity_property: object_id
+    source_property: source
+    classification_source_property: function_source_term
+    classification_name_property: name
+    default_select: [name, ifc_class, type, level]
+    fields:
+      name:
+        property: name
+        description: Human-readable element or space name.
+      global_id:
+        property: GlobalID
+        description: IFC global identifier.
+      ifc_class:
+        property: IFCtype
+        description: IFC class such as IfcWall, IfcSlab, IfcDoor, or IfcSpace.
+        ontology_kind: ifc_class
+      type:
+        property: canonical_type
+        description: Canonical element type or space function, such as wall, apartment, or office.
+        ontology_kind: canonical_type
+      level:
+        property: canonical_level
+        description: Canonical building level or floor.
+        ontology_kind: level
+      area_m2:
+        property: canonical_area_m2
+        data_type: number
+        unit: m²
+        description: Canonical element or space area in square metres when modelled.
+      phase:
+        property: canonical_phase
+        description: Construction phase such as existing or demolition.
+      load_bearing:
+        property: load_bearing
+        description: Whether the element is marked load-bearing.
+      fire_rating:
+        property: Fire Rate
+        description: Modelled fire-rating value.
+      predefined_type:
+        property: PredefinedType
+        description: IFC predefined type.
+      family_type:
+        property: object_family_type
+        description: Authoring-system family/type designation.
+      distance_from_level:
+        property: distance_from_level
+        data_type: number
+        description: Modelled vertical distance from the associated level.
+      tag:
+        property: ElementTag
+        description: Element tag from the source model.
+      location:
+        property: location
+        description: Modelled location text.
+
+  measures:
+    kind: records
+    description: Canonical project, permit, area, height, setback, and quantity measures.
+    node_type: canonical_measure
+    identity_property: id
+    source_property: source
+    default_select: [measure, value, unit, basis]
+    fields:
+      measure:
+        property: measure
+        description: Canonical measure name.
+      name:
+        property: name
+        description: Human-readable measure name.
+      value:
+        property: value
+        data_type: number
+        description: Numeric measure value.
+      unit:
+        property: unit
+        description: Unit of measurement.
+      basis:
+        property: basis
+        description: Basis or derivation of the value.
+      provenance:
+        property: provenance
+        description: Source provenance for the value.
+      confidence:
+        property: confidence
+        data_type: number
+        description: Extraction or normalization confidence.
+
+  permit_knowledge:
+    kind: records
+    description: Project-scoped permit and planning knowledge text.
+    node_type: permit_knowledge
+    identity_property: id
+    source_property: source
+    default_select: [name, summary, knowledge]
+    fields:
+      name:
+        property: name
+        description: Knowledge record title.
+      summary:
+        property: summary_text
+        description: Concise permit-knowledge summary.
+      knowledge:
+        property: knowledge_block
+        description: Full normalized permit-knowledge block.
+
+  project_graph:
+    kind: project_graph
+    description: All distinct nodes belonging to the authorized project scope.

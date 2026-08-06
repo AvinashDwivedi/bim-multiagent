@@ -7,19 +7,42 @@ A hierarchical, read-only agent system for answering questions from one authoriz
 Only three agents participate:
 
 - BIM Supervisor — routes once, requests verification once, and writes the final answer.
-- BIM Query Agent — uses ontology-aware, typed BIM query tools.
-- Verification Agent — independently reruns and checks candidate counts.
+- BIM Analyst — maps civil-engineering or plain-language questions to safe declarative query plans.
+- Verification Agent — independently reruns and checks every query result.
 
-The ontology is a deterministic tool, not another agent. Schema discovery, Cypher writing/review,
-result analysis, and answer composition are not separate agents. Unsupported question types fail
-closed until a corresponding typed BIM tool is implemented.
+The ontology and graph contract are deterministic resources, not additional agents. The analyst uses
+one general query language for model elements, canonical measures, permit knowledge, and project-graph
+scope. Schema discovery, Cypher writing/review, result analysis, and answer composition are not
+separate agents.
 
 ## Graph Schema Contract
 
 `graph_schema.yaml` is the versioned bridge between canonical ontology concepts and Neo4j storage.
 It declares supported node labels, properties, relationships, the project-authorization path, and
-each query capability's exact graph mapping. Typed tools read this contract; agents never invent
-labels, relationship paths, or property names.
+the semantic entities and fields exposed to the general query language. The query engine reads this
+contract; agents never invent labels, relationship paths, property names, or Cypher.
+
+The same query plan supports `count`, `list`, `group_count`, `group_summary`, `distinct`, `sum`,
+`average`, `minimum`, and `maximum`, with validated equality, text, existence, membership, and numeric
+filters. `group_summary` returns a distinct record count and summed numeric metric per group. This covers
+questions such as:
+
+- How many existing load-bearing walls are modelled?
+- Which IFC classes occur in the model, and how many of each are there?
+- What is the total modelled wall area?
+- Show the project height and setback measures.
+- Which spaces are on the ground floor?
+- What permit knowledge is available about balconies?
+
+Filtered space and apartment answers are analytical by default. A count or list includes a bounded,
+verified record breakdown with the source object ID, IFC class, name, modelled level, area, segment,
+owner, and room-count programme when those values exist. A caller can request a scalar-only space count
+with `include_details=false`; large result sets remain bounded by the query-plan limit.
+
+For relationship questions or unfamiliar graph concepts, the Analyst can optionally call
+`inspect_project_graph_structure`. It returns distinct project-scoped node-label signatures, bounded
+sample names, relationship types, endpoint labels, counts, and optional property names. A focus term
+keeps discovery compact. The result informs a contract-backed plan; it never enables raw Cypher.
 
 The runtime validates the contract against live Neo4j metadata before starting any agent. A missing
 label, relationship, or property fails closed. Validate it separately with:
@@ -32,9 +55,10 @@ python -m bim_agents.schema_check
 
 - Neo4j access is read-only at the application policy layer.
 - Agents cannot generate or execute arbitrary Cypher.
-- Typed query tools contain fixed read-only Cypher with `.source IN $allowed_sources`.
+- The query engine compiles only contract-approved plans to parameterized, read-only Cypher with
+  `.source IN $allowed_sources`.
 - The runtime supplies `allowed_sources`; the model cannot choose them.
-- Verification independently reruns candidate counts before the supervisor answers.
+- Verification independently reruns every saved plan and compares its complete result digest.
 
 Use a Neo4j account with database-level read-only privileges as the final security boundary.
 
@@ -101,8 +125,9 @@ python -m unittest discover -s tests -v
 
 ## Current boundary
 
-The current typed tools support authorized project-wide graph-node counts and ontology-resolved
-element counts by level. A project-wide node count includes source-scoped data nodes plus its Client,
-Project, and BIMHub hierarchy nodes; it does not count unrelated nodes in the Neo4j database.
-Additional BIM question types should be added as typed tools only when needed. Production rollout
-should also add a Neo4j read-only user and representative BIM evaluation questions.
+The general query layer can answer questions expressible from the graph's model elements, canonical
+measures, permit knowledge, and project scope. It does not infer facts absent from the BIM, perform
+structural-design calculations, or assert code compliance without corresponding trusted data and
+rules. New graph fields or relationship families are added declaratively to `graph_schema.yaml`, not
+by creating another agent or one tool per question. A project graph count includes source-scoped data
+nodes plus its Client, Project, and BIMHub nodes; it never includes unrelated database nodes.

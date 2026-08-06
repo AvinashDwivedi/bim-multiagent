@@ -26,6 +26,9 @@ class Claim(BaseModel):
     unit: str | None = None
     basis: str
     evidence_ids: list[str] = Field(default_factory=list)
+    details: list[str] = Field(default_factory=list)
+    total_count: int | None = Field(default=None, ge=0)
+    displayed_count: int | None = Field(default=None, ge=0)
     confidence: float = Field(default=1.0, ge=0, le=1)
 
 

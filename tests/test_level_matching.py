@@ -13,9 +13,17 @@ class LevelMatchingTests(unittest.TestCase):
         self.assertFalse(_level_matches("seventh floor", None))
 
     def test_matches_cross_language_contract_alias(self):
-        aliases = {"ground": ["ground floor", "קרקע", "קרקע מפלס 1.5"]}
+        aliases = {
+            "ground": ["ground floor", "begane grond", "קרקע", "קרקע מפלס 1.5"]
+        }
         self.assertTrue(_level_matches("ground floor", "קרקע", aliases))
         self.assertTrue(_level_matches("ground floor", "\u200fקרקע מפלס 1.5", aliases))
+        self.assertTrue(_level_matches("ground floor", "00 begane grond", aliases))
+        self.assertTrue(_level_matches("the ground floor", "00 begane grond", aliases))
+
+    def test_alias_matching_respects_word_boundaries(self):
+        aliases = {"ground": ["ground", "ground floor", "begane grond"]}
+        self.assertFalse(_level_matches("ground floor", "underground parking", aliases))
 
 
 if __name__ == "__main__":

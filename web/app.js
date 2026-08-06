@@ -5,6 +5,9 @@ const form = document.getElementById("chatForm");
 const input = document.getElementById("questionInput");
 const sendButton = document.getElementById("sendButton");
 const sidebar = document.getElementById("sidebar");
+const menuButton = document.getElementById("menuButton");
+const sidebarCloseButton = document.getElementById("sidebarCloseButton");
+const sidebarScrim = document.getElementById("sidebarScrim");
 let busy = false;
 
 const agentWorkflow = document.getElementById("agentWorkflow");
@@ -12,7 +15,7 @@ const agentRows = new Map();
 
 const agentDescriptions = {
   "BIM Supervisor": "Routing and final synthesis",
-  "BIM Query Agent": "Ontology + typed BIM tools",
+  "BIM Analyst": "Schema-grounded BIM query planning",
   "Verification Agent": "Independent evidence check"
 };
 
@@ -79,7 +82,8 @@ function addAssistantMessage(report) {
   const article = fragment.querySelector(".assistant-row");
   const copy = fragment.querySelector(".answer-copy");
   const meta = fragment.querySelector(".answer-meta");
-  copy.textContent = report.answer || "No answer was returned.";
+  const answer = report.answer || "No answer was returned.";
+  copy.textContent = answer;
 
   if (report.verification_status === "verified") {
     const label = document.createElement("div");
@@ -87,6 +91,32 @@ function addAssistantMessage(report) {
     label.innerHTML = `${icon("check")} Independently verified`;
     copy.appendChild(label);
   }
+
+  const detailedClaims = (report.claims || []).filter(
+    claim => claim.details?.length && !claim.details.every(item => answer.includes(item))
+  );
+  detailedClaims.forEach(claim => {
+    const card = document.createElement("details");
+    card.className = "result-details";
+    const summary = document.createElement("summary");
+    const shown = claim.displayed_count ?? claim.details.length;
+    const total = claim.total_count ?? shown;
+    const unit = claim.unit || "results";
+    summary.textContent = `View ${shown.toLocaleString()} of ${total.toLocaleString()} ${unit}`;
+    const list = document.createElement("ol");
+    claim.details.forEach(item => {
+      const row = document.createElement("li");
+      row.textContent = item;
+      list.appendChild(row);
+    });
+    card.append(summary, list);
+    if (total > shown) {
+      const note = document.createElement("p");
+      note.textContent = `${(total - shown).toLocaleString()} additional matching records are not displayed.`;
+      card.appendChild(note);
+    }
+    meta.appendChild(card);
+  });
 
   if (report.limitations?.length) {
     const card = document.createElement("div");
@@ -238,11 +268,25 @@ document.getElementById("newChatButton").addEventListener("click", () => {
   input.focus();
 });
 
-document.getElementById("menuButton").addEventListener("click", () => sidebar.classList.toggle("open"));
+function setSidebarOpen(open) {
+  sidebar.classList.toggle("open", open);
+  menuButton.setAttribute("aria-expanded", String(open));
+  menuButton.setAttribute("aria-label", open ? "Close project panel" : "Open project panel");
+}
+
+menuButton.addEventListener("click", () => setSidebarOpen(!sidebar.classList.contains("open")));
+sidebarCloseButton.addEventListener("click", () => setSidebarOpen(false));
+sidebarScrim.addEventListener("click", () => setSidebarOpen(false));
 document.addEventListener("click", event => {
   if (window.innerWidth <= 880 && sidebar.classList.contains("open") && !sidebar.contains(event.target) && !event.target.closest("#menuButton")) {
-    sidebar.classList.remove("open");
+    setSidebarOpen(false);
   }
+});
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape") setSidebarOpen(false);
+});
+window.addEventListener("resize", () => {
+  if (window.innerWidth > 880) setSidebarOpen(false);
 });
 
 async function loadHealth() {

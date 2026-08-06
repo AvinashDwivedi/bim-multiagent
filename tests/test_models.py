@@ -13,7 +13,7 @@ class ContractTests(unittest.TestCase):
         report = SupervisorReport(
             answer=claim.statement,
             claims=[claim],
-            agents_used=["BIM Query Agent", "Verification Agent"],
+            agents_used=["BIM Analyst", "Verification Agent"],
             verification_status="verified",
         )
         self.assertEqual(report.claims[0].value, 2)

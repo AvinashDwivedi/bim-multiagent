@@ -24,6 +24,26 @@ class NodeType(BaseModel):
     properties: list[str] = Field(default_factory=list)
 
 
+class QueryField(BaseModel):
+    property: str
+    data_type: Literal["string", "number"] = "string"
+    description: str
+    unit: str | None = None
+    ontology_kind: Literal["canonical_type", "ifc_class", "level"] | None = None
+
+
+class QueryEntity(BaseModel):
+    kind: Literal["records", "project_graph"] = "records"
+    description: str
+    node_type: str | None = None
+    identity_property: str | None = None
+    source_property: str | None = None
+    classification_source_property: str | None = None
+    classification_name_property: str | None = None
+    default_select: list[str] = Field(default_factory=list)
+    fields: dict[str, QueryField] = Field(default_factory=dict)
+
+
 class RelationshipType(BaseModel):
     name: str
     from_node: str
@@ -37,25 +57,13 @@ class AuthorizationPath(BaseModel):
     source_property: str
 
 
-class Capability(BaseModel):
-    description: str
-    executor: Literal["count_elements_by_type_and_level", "count_project_nodes"]
-    node_type: str | None = None
-    identity_property: str | None = None
-    source_property: str
-    type_property: str | None = None
-    level_property: str | None = None
-    relationships: list[str] = Field(default_factory=list)
-    source_scope_required: bool = True
-
-
 class GraphSchemaContract(BaseModel):
     version: int = Field(ge=1)
     level_aliases: dict[str, list[str]] = Field(default_factory=dict)
     node_types: dict[str, NodeType]
     relationship_types: dict[str, RelationshipType]
     authorization_path: AuthorizationPath
-    capabilities: dict[str, Capability]
+    query_entities: dict[str, QueryEntity]
 
     @model_validator(mode="after")
     def validate_references_and_identifiers(self) -> "GraphSchemaContract":
@@ -81,35 +89,36 @@ class GraphSchemaContract(BaseModel):
             if rel_key not in self.relationship_types:
                 raise ValueError(f"Authorization path references unknown relationship {rel_key!r}.")
         _assert_identifier(path.source_property)
-        for name, capability in self.capabilities.items():
-            _assert_identifier(name)
-            if capability.node_type is not None and capability.node_type not in self.node_types:
-                raise ValueError(f"Capability {name!r} references an unknown node type.")
-            for prop in (
-                capability.identity_property,
-                capability.source_property,
-                capability.type_property,
-                capability.level_property,
+        for entity_name, entity in self.query_entities.items():
+            _assert_identifier(entity_name)
+            if entity.kind == "records":
+                if not all((entity.node_type, entity.identity_property, entity.source_property)):
+                    raise ValueError(f"Record entity {entity_name!r} has an incomplete graph mapping.")
+                if entity.node_type not in self.node_types:
+                    raise ValueError(f"Entity {entity_name!r} references an unknown node type.")
+                _assert_property(entity.identity_property)
+                _assert_property(entity.source_property)
+            for quality_property in (
+                entity.classification_source_property,
+                entity.classification_name_property,
             ):
-                if prop:
-                    _assert_identifier(prop)
-            if capability.executor == "count_elements_by_type_and_level" and not all((
-                capability.node_type,
-                capability.identity_property,
-                capability.type_property,
-                capability.level_property,
-            )):
-                raise ValueError(f"Capability {name!r} is missing its element-count graph mapping.")
-            for rel_key in capability.relationships:
-                if rel_key not in self.relationship_types:
-                    raise ValueError(f"Capability {name!r} references unknown relationship {rel_key!r}.")
+                if quality_property:
+                    _assert_property(quality_property)
+            for field_name, field in entity.fields.items():
+                _assert_identifier(field_name)
+                _assert_property(field.property)
+            unknown_defaults = set(entity.default_select) - set(entity.fields)
+            if unknown_defaults:
+                raise ValueError(
+                    f"Entity {entity_name!r} has unknown default fields: {sorted(unknown_defaults)}"
+                )
         return self
 
-    def capability(self, name: str) -> Capability:
+    def query_entity(self, name: str) -> QueryEntity:
         try:
-            return self.capabilities[name]
+            return self.query_entities[name]
         except KeyError as exc:
-            raise KeyError(f"No registered BIM graph capability named {name!r}.") from exc
+            raise KeyError(f"No registered BIM query entity named {name!r}.") from exc
 
     def node(self, name: str) -> NodeType:
         return self.node_types[name]
@@ -126,6 +135,11 @@ class SchemaValidationReport:
 def _assert_identifier(value: str) -> None:
     if not _IDENTIFIER.fullmatch(value):
         raise ValueError(f"Unsafe Neo4j identifier in graph schema contract: {value!r}")
+
+
+def _assert_property(value: str) -> None:
+    if not value or "`" in value or any(ord(character) < 32 for character in value):
+        raise ValueError(f"Unsafe Neo4j property in graph schema contract: {value!r}")
 
 
 def load_graph_contract(path: str | Path | None = None) -> GraphSchemaContract:
@@ -155,7 +169,18 @@ def validate_live_schema(
         for node in contract.node_types.values()
         for prop in [*node.properties, node.identity_property]
         if prop
-    } | {contract.authorization_path.source_property}
+    } | {contract.authorization_path.source_property} | {
+        prop
+        for entity in contract.query_entities.values()
+        for prop in [
+            entity.identity_property,
+            entity.source_property,
+            entity.classification_source_property,
+            entity.classification_name_property,
+            *(field.property for field in entity.fields.values()),
+        ]
+        if prop
+    }
 
     if not cached:
         live_labels = {row["label"] for row in bim.query("CALL db.labels() YIELD label RETURN label")}

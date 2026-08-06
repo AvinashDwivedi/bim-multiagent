@@ -7,17 +7,17 @@ from agents import Agent, ModelSettings, RunHooks
 from . import prompts
 from .models import BimQueryReport, SupervisorReport, VerificationReport
 from .guardrails import (
+    query_failure_from_evidence,
+    query_matches_evidence,
     supervisor_matches_evidence,
     verification_failure_from_evidence,
     verification_matches_evidence,
 )
 from .tools import (
-    count_elements_by_type_and_level,
-    count_project_nodes,
-    read_evidence,
-    resolve_bim_term,
-    verify_element_count,
-    verify_project_node_count,
+    get_bim_query_catalog,
+    inspect_project_graph_structure,
+    query_bim,
+    verify_bim_evidence,
 )
 
 
@@ -41,19 +41,20 @@ def build_agent_registry(
     worker_model = worker_model or model
 
     query_agent = Agent(
-        name="BIM Query Agent",
+        name="BIM Analyst",
         instructions=prompts.QUERY,
         model=worker_model,
         model_settings=_settings("low"),
-        tools=[resolve_bim_term, count_project_nodes, count_elements_by_type_and_level],
+        tools=[get_bim_query_catalog, inspect_project_graph_structure, query_bim],
         output_type=BimQueryReport,
+        output_guardrails=[query_matches_evidence],
     )
     verifier = Agent(
         name="Verification Agent",
         instructions=prompts.VERIFIER,
         model=worker_model,
         model_settings=_settings("low"),
-        tools=[read_evidence, verify_project_node_count, verify_element_count],
+        tools=[verify_bim_evidence],
         output_type=VerificationReport,
         output_guardrails=[verification_matches_evidence],
     )
@@ -65,9 +66,10 @@ def build_agent_registry(
         tools=[
             query_agent.as_tool(
                 "query_bim",
-                "Resolve and answer a supported BIM question using typed project-scoped tools.",
-                max_turns=4,
+                "Answer a BIM question using general schema-grounded project queries.",
+                max_turns=6,
                 hooks=hooks,
+                failure_error_function=query_failure_from_evidence,
             ),
             verifier.as_tool(
                 "verify_bim_result",
