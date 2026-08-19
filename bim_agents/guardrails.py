@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 
-from agents import GuardrailFunctionOutput, RunContextWrapper, output_guardrail
-
-from .models import BimQueryReport, BimRunContext, Claim, SupervisorReport, VerificationReport
+from .models import (
+    BimQueryReport, BimRunContext, Claim, PipelineReport, SemanticCheck,
+    VerificationReport,
+)
 
 
 def _latest_verification(context: BimRunContext) -> tuple[str, dict] | None:
@@ -43,6 +44,10 @@ def _claim_signatures(claims: list[Claim]) -> list[tuple]:
     ]
 
 
+def _semantic_check_signatures(checks: list[SemanticCheck]) -> list[tuple[str, bool, str]]:
+    return [(check.name, check.passed, check.explanation) for check in checks]
+
+
 def _render_claim_answer(claim: Claim) -> str:
     if not claim.details:
         return claim.statement
@@ -78,7 +83,7 @@ def query_report_from_evidence(context: BimRunContext) -> BimQueryReport:
             limitations.extend(payload.get("limitations") or [])
         evidence_ids.append(evidence_id)
     if not claims:
-        limitations.append("The BIM Analyst produced no deterministic query evidence.")
+        limitations.append("The query stage produced no deterministic evidence.")
     return BimQueryReport(
         claims=_consolidate_claims(claims),
         evidence_ids=evidence_ids,
@@ -91,16 +96,21 @@ def verification_report_from_evidence(context: BimRunContext) -> VerificationRep
     if latest is None:
         return VerificationReport(
             status="insufficient_evidence",
-            limitations=["The Verification Agent produced no deterministic verification evidence."],
+            limitations=["The verifier produced no deterministic verification evidence."],
         )
     evidence_id, payload = latest
     limitations: list[str] = []
     claims: list[Claim] = []
     rejected: list[str] = []
+    semantic_checks: list[SemanticCheck] = []
     for check in payload.get("checks") or []:
         include_in_answer = (check.get("plan") or {}).get("include_in_answer", True)
         if include_in_answer:
             limitations.extend(check.get("limitations") or [])
+        semantic_checks.extend(
+            SemanticCheck.model_validate(item)
+            for item in check.get("semantic_checks") or []
+        )
         if check.get("verified") is True and include_in_answer:
             claims.append(_claim_from_payload(
                 {"claim": check.get("claim") or {}},
@@ -118,114 +128,43 @@ def verification_report_from_evidence(context: BimRunContext) -> VerificationRep
             status="verified",
             verified_claims=_consolidate_claims(claims),
             limitations=list(dict.fromkeys(limitations)),
+            semantic_checks=semantic_checks,
         )
     return VerificationReport(
         status="insufficient_evidence",
         rejected_claims=rejected or ["No independently reproducible BIM query result was produced."],
         limitations=list(dict.fromkeys(limitations)),
+        semantic_checks=semantic_checks,
     )
 
 
-def supervisor_report_from_evidence(context: BimRunContext) -> SupervisorReport:
+def pipeline_report_from_evidence(context: BimRunContext) -> PipelineReport:
     verification = verification_report_from_evidence(context)
+    limitations = list(dict.fromkeys(
+        verification.limitations + context.runtime_limitations
+    ))
+    investigation_trace = [
+        f"{artifact.producer}: {artifact.summary}"
+        for artifact in context.artifacts.values()
+    ]
     if verification.status == "verified" and verification.verified_claims:
         answer = "\n\n".join(_render_claim_answer(claim) for claim in verification.verified_claims)
-        return SupervisorReport(
+        return PipelineReport(
             answer=answer,
             claims=verification.verified_claims,
-            limitations=verification.limitations,
-            agents_used=["BIM Analyst", "Verification Agent"],
+            limitations=limitations,
+            stages_used=["Graph Inspector", "Schema Mapper", "Query Planner", "Cypher Query Handler", "Verifier"],
+            artifact_ids=list(context.artifacts),
+            investigation_trace=investigation_trace,
+            semantic_checks=verification.semantic_checks,
             verification_status="verified",
         )
-    return SupervisorReport(
+    return PipelineReport(
         answer="The BIM question could not be verified from the available scoped evidence.",
-        limitations=verification.limitations,
-        agents_used=["BIM Analyst", "Verification Agent"],
+        limitations=limitations,
+        stages_used=["Graph Inspector", "Schema Mapper", "Query Planner", "Cypher Query Handler", "Verifier"],
+        artifact_ids=list(context.artifacts),
+        investigation_trace=investigation_trace,
+        semantic_checks=verification.semantic_checks,
         verification_status="insufficient_evidence",
-    )
-
-
-@output_guardrail(name="query_matches_deterministic_evidence")
-def query_matches_evidence(
-    ctx: RunContextWrapper[BimRunContext], agent, output: BimQueryReport
-) -> GuardrailFunctionOutput:
-    expected = query_report_from_evidence(ctx.context)
-    valid = (
-        _claim_signatures(output.claims) == _claim_signatures(expected.claims)
-        and output.evidence_ids == expected.evidence_ids
-    )
-    return GuardrailFunctionOutput(
-        output_info={
-            "expected_claims": _claim_signatures(expected.claims),
-            "actual_claims": _claim_signatures(output.claims),
-        },
-        tripwire_triggered=not valid,
-    )
-
-
-async def query_failure_from_evidence(
-    ctx: RunContextWrapper[BimRunContext], error: Exception
-) -> str:
-    """Fall back to the deterministic query evidence if the analyst changes its result."""
-    return query_report_from_evidence(ctx.context).model_dump_json()
-
-
-@output_guardrail(name="verification_matches_deterministic_evidence")
-def verification_matches_evidence(
-    ctx: RunContextWrapper[BimRunContext], agent, output: VerificationReport
-) -> GuardrailFunctionOutput:
-    expected = verification_report_from_evidence(ctx.context)
-    output_claims = _claim_signatures(output.verified_claims)
-    expected_claims = _claim_signatures(expected.verified_claims)
-    valid = output.status == expected.status and output_claims == expected_claims
-    return GuardrailFunctionOutput(
-        output_info={
-            "expected_status": expected.status,
-            "expected_claims": expected_claims,
-            "actual_status": output.status,
-            "actual_claims": output_claims,
-        },
-        tripwire_triggered=not valid,
-    )
-
-
-async def verification_failure_from_evidence(
-    ctx: RunContextWrapper[BimRunContext], error: Exception
-) -> str:
-    """Fail closed to deterministic evidence if the verifier contradicts its own tool."""
-    return verification_report_from_evidence(ctx.context).model_dump_json()
-
-
-@output_guardrail(name="supervisor_matches_verified_evidence")
-def supervisor_matches_evidence(
-    ctx: RunContextWrapper[BimRunContext], agent, output: SupervisorReport
-) -> GuardrailFunctionOutput:
-    expected = verification_report_from_evidence(ctx.context)
-    expected_status = "verified" if expected.status == "verified" else "insufficient_evidence"
-    output_claims = _claim_signatures(output.claims)
-    expected_claims = _claim_signatures(expected.verified_claims)
-    valid = (
-        output.verification_status == expected_status
-        and (expected_status != "verified" or output_claims == expected_claims)
-        and (
-            expected_status != "verified"
-            or all(claim.statement in output.answer for claim in expected.verified_claims)
-        )
-        and (
-            expected_status != "verified"
-            or all(
-                detail in output.answer
-                for claim in expected.verified_claims
-                for detail in claim.details
-            )
-        )
-    )
-    return GuardrailFunctionOutput(
-        output_info={
-            "expected_status": expected_status,
-            "expected_claims": expected_claims,
-            "actual_status": output.verification_status,
-            "actual_claims": output_claims,
-        },
-        tripwire_triggered=not valid,
     )

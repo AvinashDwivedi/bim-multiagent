@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/assets/styles.css">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260819-1">
 </head>
 <body>
   <div class="app-shell">
@@ -47,8 +47,8 @@
 
       <section class="system-card">
         <div class="section-label">Answer workflow</div>
-        <ol class="agent-list" id="agentWorkflow">
-          <li class="workflow-empty"><span>·</span><div><strong>Waiting for a question</strong><small>Agents will appear in execution order</small></div></li>
+        <ol class="workflow-list" id="pipelineWorkflow">
+          <li class="workflow-empty"><span>·</span><div><strong>Waiting for a question</strong><small>Pipeline stages will appear here</small></div></li>
         </ol>
       </section>
 
@@ -128,6 +128,6 @@
     </article>
   </template>
 
-  <script src="/assets/app.js" defer></script>
+  <script src="/assets/app.js?v=20260819-2" defer></script>
 </body>
 </html>

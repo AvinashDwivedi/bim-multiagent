@@ -100,7 +100,7 @@ class GeneralQueryPlanTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             BimQueryPlan(entity="elements", operation="list", limit=1000)
 
-    def test_record_details_are_an_explicit_agent_choice(self):
+    def test_record_details_are_an_explicit_plan_choice(self):
         self.assertFalse(BimQueryPlan(entity="spaces", operation="count").include_details)
         self.assertTrue(
             BimQueryPlan(entity="spaces", operation="count", include_details=True).include_details

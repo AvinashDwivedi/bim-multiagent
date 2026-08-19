@@ -5,14 +5,14 @@ import asyncio
 import json
 import sys
 
-from .observability import BimRunHooks, configure_logging
+from .observability import PipelineEvents, configure_logging
 from .runtime import answer_bim_question
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Ask a supervised, project-scoped BIM question.")
+    parser = argparse.ArgumentParser(description="Run a project-scoped BIM calculation pipeline.")
     parser.add_argument("question", help="The BIM question to answer")
-    parser.add_argument("--timeout", type=float, default=None, help="Maximum total runtime in seconds (default: 180)")
+    parser.add_argument("--timeout", type=float, default=None, help="Maximum total runtime in seconds (default: 240)")
     parser.add_argument("--log-file", help="Also write detailed lifecycle logs to this file")
     parser.add_argument("--quiet", action="store_true", help="Hide progress logs")
     args = parser.parse_args()
@@ -22,7 +22,7 @@ def main() -> None:
             answer_bim_question(
                 args.question,
                 timeout_seconds=args.timeout,
-                hooks=BimRunHooks(logger),
+                hooks=PipelineEvents(logger),
             )
         )
     except Exception as exc:

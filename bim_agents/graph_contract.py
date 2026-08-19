@@ -14,7 +14,7 @@ from bim_context import BimContext
 
 DEFAULT_CONTRACT_PATH = Path(__file__).resolve().parent.parent / "graph_schema.yaml"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_VALIDATED: set[tuple[str, str, str, int]] = set()
+_VALIDATED: set[tuple[str, str, str, int, bool]] = set()
 _VALIDATION_LOCK = Lock()
 
 
@@ -184,25 +184,41 @@ def validate_live_schema(
     contract: GraphSchemaContract,
     *,
     use_cache: bool = True,
+    authorization_only: bool = False,
 ) -> SchemaValidationReport:
     cache_key = (
         bim.settings.neo4j_uri,
         bim.settings.neo4j_database,
         bim.settings.project_id,
         contract.version,
+        authorization_only,
     )
     with _VALIDATION_LOCK:
         cached = use_cache and cache_key in _VALIDATED
-    required_labels = {node.label for node in contract.node_types.values()}
-    required_relationships = {rel.name for rel in contract.relationship_types.values()}
+    if authorization_only:
+        path = contract.authorization_path
+        relationship_keys = path.relationships
+        node_keys = {path.start_node, path.source_node}
+        for key in relationship_keys:
+            node_keys.add(contract.relationship_types[key].from_node)
+            node_keys.add(contract.relationship_types[key].to_node)
+        nodes = [contract.node_types[key] for key in node_keys]
+        relationships = [contract.relationship_types[key] for key in relationship_keys]
+        entities: list[QueryEntity] = []
+    else:
+        nodes = list(contract.node_types.values())
+        relationships = list(contract.relationship_types.values())
+        entities = list(contract.query_entities.values())
+    required_labels = {node.label for node in nodes}
+    required_relationships = {rel.name for rel in relationships}
     required_properties = {
         prop
-        for node in contract.node_types.values()
+        for node in nodes
         for prop in [*node.properties, node.identity_property]
         if prop
     } | {contract.authorization_path.source_property} | {
         prop
-        for entity in contract.query_entities.values()
+        for entity in entities
         for prop in [
             entity.identity_property,
             entity.source_property,

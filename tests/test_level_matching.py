@@ -4,7 +4,7 @@ from bim_agents.tools import _level_matches
 
 
 class LevelMatchingTests(unittest.TestCase):
-    def test_matches_agent_normalized_and_numeric_level(self):
+    def test_matches_normalized_and_numeric_level(self):
         self.assertTrue(_level_matches("7", "Level 7"))
         self.assertTrue(_level_matches("7th floor", "Floor 07"))
 

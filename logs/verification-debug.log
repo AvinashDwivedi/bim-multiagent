@@ -1,0 +1,124 @@
+13:05:09 | INFO | run.start   | project=858ef0f0-454a-11f1-8957-1fe1b101e373 | sources=2 | supervisor_model=gpt-5.6-sol | worker_model=gpt-5.6-terra
+13:05:09 | INFO | schema.ok   | contract_version=3 | labels=4 | relationships=3 | properties=2
+13:05:10 | INFO | agent.start | BIM Supervisor | agent_start=1 | agent_invocation=1 | elapsed=6.6s
+13:05:12 | INFO | llm.start   | BIM Supervisor | llm_call=1 | elapsed=8.3s
+13:05:21 | ERROR | run.failed  | APIConnectionError: Connection error.
+13:05:21 | DEBUG | failure traceback
+Traceback (most recent call last):
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpx\_transports\default.py", line 101, in map_httpcore_exceptions
+    yield
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpx\_transports\default.py", line 394, in handle_async_request
+    resp = await self._pool.handle_async_request(req)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpcore\_async\connection_pool.py", line 256, in handle_async_request
+    raise exc from None
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpcore\_async\connection_pool.py", line 236, in handle_async_request
+    response = await connection.handle_async_request(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpcore\_async\http_proxy.py", line 288, in handle_async_request
+    connect_response = await self._connection.handle_async_request(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpcore\_async\connection.py", line 101, in handle_async_request
+    raise exc
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpcore\_async\connection.py", line 78, in handle_async_request
+    stream = await self._connect(request)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpcore\_async\connection.py", line 124, in _connect
+    stream = await self._network_backend.connect_tcp(**kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpcore\_backends\auto.py", line 31, in connect_tcp
+    return await self._backend.connect_tcp(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpcore\_backends\anyio.py", line 113, in connect_tcp
+    with map_exceptions(exc_map):
+         ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\contextlib.py", line 158, in __exit__
+    self.gen.throw(value)
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpcore\_exceptions.py", line 14, in map_exceptions
+    raise to_exc(exc) from exc
+httpcore.ConnectError: All connection attempts failed
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\openai\_base_client.py", line 1709, in request
+    response = await self._send_request(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\openai\_client.py", line 1097, in _send_request
+    response = await self._send_with_auth_retry(request, stream=stream, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\openai\_client.py", line 1075, in _send_with_auth_retry
+    response = await super()._send_request(request, stream=stream, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\openai\_base_client.py", line 1628, in _send_request
+    return await self._client.send(request, stream=stream, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpx\_client.py", line 1629, in send
+    response = await self._send_handling_auth(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpx\_client.py", line 1657, in _send_handling_auth
+    response = await self._send_handling_redirects(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpx\_client.py", line 1694, in _send_handling_redirects
+    response = await self._send_single_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpx\_client.py", line 1730, in _send_single_request
+    response = await transport.handle_async_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpx\_transports\default.py", line 393, in handle_async_request
+    with map_httpcore_exceptions():
+         ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\contextlib.py", line 158, in __exit__
+    self.gen.throw(value)
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpx\_transports\default.py", line 118, in map_httpcore_exceptions
+    raise mapped_exc(message) from exc
+httpx.ConnectError: All connection attempts failed
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\avina\Downloads\bim-multiagent\bim_agents\cli.py", line 21, in main
+    report = asyncio.run(
+             ^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\asyncio\runners.py", line 195, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 691, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "C:\Users\avina\Downloads\bim-multiagent\bim_agents\runtime.py", line 89, in answer_bim_question
+    result = await Runner.run(
+             ^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\agents\run.py", line 278, in run
+    return await runner.run(
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\agents\run.py", line 1322, in run
+    turn_result = await model_task
+                  ^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\agents\run_internal\run_loop.py", line 2007, in run_single_turn
+    new_response = await get_new_response(
+                   ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\agents\run_internal\run_loop.py", line 2128, in get_new_response
+    new_response = await get_response_with_retry(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\agents\run_internal\model_retry.py", line 446, in get_response_with_retry
+    response = await get_response()
+               ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\agents\models\openai_responses.py", line 499, in get_response
+    response = await self._fetch_response(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\agents\models\openai_responses.py", line 731, in _fetch_response
+    response = await client.responses.create(**create_kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\openai\resources\responses\responses.py", line 2866, in create
+    return await self._post(
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\openai\_base_client.py", line 1992, in post
+    return await self.request(cast_to, opts, stream=stream, stream_cls=stream_cls)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\avina\AppData\Local\Programs\Python\Python312\Lib\site-packages\openai\_base_client.py", line 1744, in request
+    raise APIConnectionError(request=request) from err
+openai.APIConnectionError: Connection error.

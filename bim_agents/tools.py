@@ -2,22 +2,34 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
 import re
 import unicodedata
+from dataclasses import dataclass
 from typing import Any, Literal
 from uuid import uuid4
 
-from agents import RunContextWrapper, function_tool
+from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from .graph_contract import QueryEntity, QueryField
-from .models import BimRunContext, Evidence
+from .cypher_handler import CypherQueryHandler
+from .models import BimRunContext, BimTaskContract, Evidence, RunArtifact
+from .schema_mapping import RegisteredSchemaMapping, SchemaMappingProposal
 
 
 Operation = Literal[
     "count", "list", "group_count", "group_summary", "distinct",
     "sum", "average", "minimum", "maximum"
 ]
+
+
+@dataclass(frozen=True)
+class PipelineContext:
+    """Small compatibility wrapper used by deterministic pipeline operations."""
+
+    context: BimRunContext
 FilterOperator = Literal[
     "equals", "not_equals", "contains", "starts_with", "in",
     "greater_than", "greater_or_equal", "less_than", "less_or_equal",
@@ -34,7 +46,12 @@ class BimFilter(BaseModel):
 
 class BimQueryPlan(BaseModel):
     entity: str
+    mapping_id: str = ""
     operation: Operation
+    distinct_by: Literal["identity"] = Field(
+        default="identity",
+        description="Deduplicate counts by the registered stable entity identity.",
+    )
     filters: list[BimFilter] = Field(default_factory=list)
     select: list[str] = Field(default_factory=list)
     metric: str = ""
@@ -50,6 +67,26 @@ class BimQueryPlan(BaseModel):
         default=True,
         description="False only for a supporting exploration query whose claim should not be rendered.",
     )
+
+
+def define_bim_task(
+    ctx: PipelineContext, contract: BimTaskContract
+) -> str:
+    """Register the supervisor's goal, constraints, open questions, and definition of done."""
+    if ctx.context.task_contract is not None:
+        raise ValueError("The BIM task contract has already been defined for this run.")
+    if not contract.goal.strip() or not contract.entity_concept.strip():
+        raise ValueError("The task goal and entity concept cannot be blank.")
+    ctx.context.task_contract = contract
+    artifact = RunArtifact(
+        artifact_id="task-contract",
+        kind="task_contract",
+        producer="Pipeline",
+        summary=contract.goal,
+        payload=contract.model_dump(mode="json"),
+    )
+    ctx.context.add_artifact(artifact)
+    return artifact.model_dump_json()
 
 
 def _json(value: Any) -> str:
@@ -308,6 +345,7 @@ def _project_graph_structure(
         "relationship_pattern_count": len(relationship_types),
         "unique_node_label_count": len(unique_node_labels),
         "unique_relationship_name_count": len(unique_relationship_names),
+        "trusted_scope_property": path.source_property,
         "scope_note": "Only nodes and relationships belonging to the authorized project are included.",
         "usage_note": (
             "Use these live names to select a contract-backed declarative query plan. "
@@ -324,6 +362,65 @@ def _record_mapping(ctx: BimRunContext, entity: QueryEntity) -> tuple[str, str, 
         entity.identity_property,
         entity.source_property,
     )
+
+
+def _entity_from_registered_mapping(
+    ctx: BimRunContext, plan: BimQueryPlan
+) -> tuple[QueryEntity, str | None]:
+    if not plan.mapping_id:
+        if plan.entity == "permit_knowledge":
+            # A compliance investigation must be able to prove that no scoped
+            # requirement records exist, even after another entity was mapped.
+            return ctx.graph_contract.query_entity(plan.entity), None
+        if len(ctx.schema_mappings) == 1:
+            plan.mapping_id = next(iter(ctx.schema_mappings))
+        else:
+            entity = ctx.graph_contract.query_entity(plan.entity)
+            if entity.kind == "records":
+                raise ValueError("Record queries require one unambiguous registered live schema mapping.")
+            return entity, None
+    registered = ctx.schema_mappings.get(plan.mapping_id)
+    if not isinstance(registered, RegisteredSchemaMapping):
+        raise ValueError(f"Unknown or expired schema mapping {plan.mapping_id!r}.")
+    proposal = registered.proposal
+    fields = {
+        field.semantic_name: QueryField(
+            property=field.property,
+            data_type=field.data_type,
+            unit=field.unit,
+            ontology_kind=field.ontology_kind,
+            description=f"Live-mapped field {field.semantic_name}.",
+        )
+        for field in proposal.fields
+    }
+    return QueryEntity(
+        kind="records",
+        description=f"Live-mapped {proposal.entity_name} records.",
+        node_type=None,
+        identity_property=proposal.identity_property,
+        source_property=proposal.source_property,
+        classification_source_property=proposal.classification_source_property,
+        classification_name_property=proposal.classification_name_property,
+        default_select=[name for name in ("object_id", "name", "ifc_class", "type", "level") if name in fields],
+        fields=fields,
+    ), proposal.label
+
+
+def _registered_match_clause(mapping: RegisteredSchemaMapping | None, label: str) -> str:
+    """Build a safe MATCH clause from a previously validated live relationship path."""
+    if not mapping or not mapping.proposal.relationship_path:
+        return f"MATCH (n:`{label}`)"
+    parts = [f"(p0:`{mapping.proposal.relationship_path[0].from_label}`)"]
+    for index, step in enumerate(mapping.proposal.relationship_path):
+        target = "n" if index == len(mapping.proposal.relationship_path) - 1 else f"p{index + 1}"
+        target_node = f"({target}:`{step.to_label}`)"
+        relationship = f"[:`{step.relationship_type}`]"
+        parts.append(
+            f"-{relationship}->{target_node}"
+            if step.direction == "outgoing"
+            else f"<-{relationship}-{target_node}"
+        )
+    return "MATCH " + "".join(parts)
 
 
 def _field(entity: QueryEntity, name: str) -> QueryField:
@@ -459,6 +556,31 @@ def _clean_value(value: Any) -> Any:
     if isinstance(value, str) and len(value) > 500:
         return value[:497] + "..."
     return value
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    if len(left) != len(right) or not left:
+        raise ValueError("Embedding vectors must have the same non-zero length.")
+    numerator = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    return numerator / (left_norm * right_norm) if left_norm and right_norm else 0.0
+
+
+def _rank_embedding_candidates(
+    query_embedding: list[float],
+    candidate_embeddings: list[list[float]],
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if len(candidate_embeddings) != len(candidates):
+        raise ValueError("Every semantic candidate requires one embedding.")
+    ranked = []
+    for candidate, embedding in zip(candidates, candidate_embeddings):
+        ranked.append({
+            **candidate,
+            "similarity": round(_cosine_similarity(query_embedding, embedding), 6),
+        })
+    return sorted(ranked, key=lambda item: (-item["similarity"], item["node_ref"]))
 
 
 def _format_filters(filters: list[dict[str, Any]]) -> str:
@@ -603,7 +725,9 @@ def _classification_limitations(
     return issues
 
 
-def _count_project_nodes(ctx: BimRunContext) -> dict[str, Any]:
+def _count_project_nodes(
+    ctx: BimRunContext, cypher: CypherQueryHandler | None = None
+) -> dict[str, Any]:
     path = ctx.graph_contract.authorization_path
     client = ctx.graph_contract.node(path.start_node)
     project = ctx.graph_contract.node("project")
@@ -612,7 +736,8 @@ def _count_project_nodes(ctx: BimRunContext) -> dict[str, Any]:
         raise RuntimeError("The graph contract is missing hierarchy identity properties.")
     client_project = ctx.graph_contract.relationship_types[path.relationships[0]]
     project_hub = ctx.graph_contract.relationship_types[path.relationships[1]]
-    rows = ctx.bim.query(
+    execute = cypher.execute if cypher is not None else ctx.bim.query
+    rows = execute(
         f"MATCH (c:`{client.label}` {{`{client.identity_property}`: $client_id}}) "
         f"-[:`{client_project.name}`]->"
         f"(p:`{project.label}` {{`{project.identity_property}`: $project_id}}) "
@@ -677,13 +802,40 @@ def _validate_plan(entity: QueryEntity, plan: BimQueryPlan) -> None:
 
 
 def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
-    entity = ctx.graph_contract.query_entity(plan.entity)
+    cypher = CypherQueryHandler(ctx.bim.query, ctx.scope.allowed_sources)
+    entity, live_label = _entity_from_registered_mapping(ctx, plan)
     entity_name = plan.entity.replace("_", " ")
     _validate_plan(entity, plan)
+    registered_mapping = ctx.schema_mappings.get(plan.mapping_id)
+    if isinstance(registered_mapping, RegisteredSchemaMapping):
+        for binding in registered_mapping.proposal.value_bindings:
+            selected_values = {_normalize(match.value) for match in binding.matches}
+            plan_values = {
+                _normalize(value)
+                for item in plan.filters
+                if item.field == binding.semantic_name
+                for value in _raw_filter_values(item)
+            }
+            if not selected_values.issubset(plan_values):
+                raise ValueError(
+                    f"The query plan must use the registered exact value binding for "
+                    f"{binding.user_concept!r} on semantic field {binding.semantic_name!r}."
+                )
     if entity.kind == "project_graph":
-        result = _count_project_nodes(ctx)
+        result = _count_project_nodes(ctx, cypher)
     else:
-        label, identity_property, source_property = _record_mapping(ctx, entity)
+        if live_label is None:
+            label, identity_property, source_property = _record_mapping(ctx, entity)
+        else:
+            if not entity.identity_property or not entity.source_property:
+                raise ValueError("The registered schema mapping is incomplete.")
+            label, identity_property, source_property = (
+                live_label, entity.identity_property, entity.source_property
+            )
+        match_clause = _registered_match_clause(
+            registered_mapping if isinstance(registered_mapping, RegisteredSchemaMapping) else None,
+            label,
+        )
         clauses, parameters, normalized_filters, limitations = _compile_filters(
             ctx, entity, label, source_property, plan.filters
         )
@@ -698,8 +850,8 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
         rows: list[dict[str, Any]]
         matched_count: int
         if plan.operation == "count":
-            rows = ctx.bim.query(
-                f"MATCH (n:`{label}`) WHERE {where} "
+            rows = cypher.execute(
+                f"{match_clause} WHERE {where} "
                 f"RETURN count(DISTINCT {identity}) AS count",
                 parameters,
             )
@@ -713,8 +865,8 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
                     f"n.`{_field(entity, name).property}` AS `{name}`" for name in selected
                 )
                 parameters["limit"] = plan.limit
-                rows = ctx.bim.query(
-                    f"MATCH (n:`{label}`) WHERE {where} RETURN {projections} "
+                rows = cypher.execute(
+                    f"{match_clause} WHERE {where} RETURN {projections} "
                     f"ORDER BY {identity} ASC LIMIT $limit",
                     parameters,
                 )
@@ -750,8 +902,8 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
             projections = ", ".join(
                 f"n.`{_field(entity, name).property}` AS `{name}`" for name in selected
             )
-            count_rows = ctx.bim.query(
-                f"MATCH (n:`{label}`) WHERE {where} RETURN count(DISTINCT {identity}) AS count",
+            count_rows = cypher.execute(
+                f"{match_clause} WHERE {where} RETURN count(DISTINCT {identity}) AS count",
                 parameters,
             )
             matched_count = int(count_rows[0].get("count") or 0) if count_rows else 0
@@ -762,8 +914,8 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
             order_fields.append(f"{identity} ASC")
             order = " ORDER BY " + ", ".join(order_fields)
             parameters["limit"] = plan.limit
-            rows = ctx.bim.query(
-                f"MATCH (n:`{label}`) WHERE {where} RETURN {projections}"
+            rows = cypher.execute(
+                f"{match_clause} WHERE {where} RETURN {projections}"
                 f"{order} LIMIT $limit",
                 parameters,
             )
@@ -793,16 +945,16 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
             group = _field(entity, plan.group_by)
             metric = _field(entity, plan.metric)
             parameters["limit"] = plan.limit
-            totals = ctx.bim.query(
-                f"MATCH (n:`{label}`) WHERE {where} AND n.`{group.property}` IS NOT NULL "
+            totals = cypher.execute(
+                f"{match_clause} WHERE {where} AND n.`{group.property}` IS NOT NULL "
                 f"RETURN count(DISTINCT n.`{group.property}`) AS total_groups, "
                 f"count(DISTINCT {identity}) AS total_records",
                 parameters,
             )
             total_groups = int(totals[0].get("total_groups") or 0) if totals else 0
             matched_count = int(totals[0].get("total_records") or 0) if totals else 0
-            rows = ctx.bim.query(
-                f"MATCH (n:`{label}`) WHERE {where} AND n.`{group.property}` IS NOT NULL "
+            rows = cypher.execute(
+                f"{match_clause} WHERE {where} AND n.`{group.property}` IS NOT NULL "
                 f"RETURN n.`{group.property}` AS value, count(DISTINCT {identity}) AS count, "
                 f"sum(toFloat(n.`{metric.property}`)) AS metric_value, "
                 f"count(n.`{metric.property}`) AS metric_records "
@@ -857,8 +1009,8 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
             }
         elif plan.operation in {"group_count", "distinct"}:
             group = _field(entity, plan.group_by)
-            totals = ctx.bim.query(
-                f"MATCH (n:`{label}`) WHERE {where} AND n.`{group.property}` IS NOT NULL "
+            totals = cypher.execute(
+                f"{match_clause} WHERE {where} AND n.`{group.property}` IS NOT NULL "
                 f"RETURN count(DISTINCT n.`{group.property}`) AS total_groups, "
                 f"count(DISTINCT {identity}) AS total_records",
                 parameters,
@@ -866,8 +1018,8 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
             total_groups = int(totals[0].get("total_groups") or 0) if totals else 0
             total_records = int(totals[0].get("total_records") or 0) if totals else 0
             parameters["limit"] = plan.limit
-            rows = ctx.bim.query(
-                f"MATCH (n:`{label}`) WHERE {where} AND n.`{group.property}` IS NOT NULL "
+            rows = cypher.execute(
+                f"{match_clause} WHERE {where} AND n.`{group.property}` IS NOT NULL "
                 f"RETURN n.`{group.property}` AS value, count(DISTINCT {identity}) AS count "
                 "ORDER BY count DESC, value LIMIT $limit",
                 parameters,
@@ -892,8 +1044,8 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
             function_name = {
                 "sum": "sum", "average": "avg", "minimum": "min", "maximum": "max"
             }[plan.operation]
-            rows = ctx.bim.query(
-                f"MATCH (n:`{label}`) WHERE {where} AND n.`{metric.property}` IS NOT NULL "
+            rows = cypher.execute(
+                f"{match_clause} WHERE {where} AND n.`{metric.property}` IS NOT NULL "
                 f"RETURN {function_name}(toFloat(n.`{metric.property}`)) AS value, "
                 f"count(n.`{metric.property}`) AS matched_records",
                 parameters,
@@ -930,34 +1082,611 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
     ).hexdigest()
     result["graph_contract_version"] = ctx.graph_contract.version
     result["capability"] = "general_bim_query"
+    result["cypher_executions"] = cypher.audit_log()
     return result
 
 
-@function_tool
-def get_bim_query_catalog(ctx: RunContextWrapper[BimRunContext]) -> str:
+def get_bim_query_catalog(ctx: PipelineContext) -> str:
     """Return the authorized semantic entities, fields, operations, and filters available for BIM questions."""
     return _json(_catalog(ctx.context))
 
 
-@function_tool
 def inspect_project_graph_structure(
-    ctx: RunContextWrapper[BimRunContext],
+    ctx: PipelineContext,
     sample_limit: int = 3,
     include_properties: bool = False,
     focus: str = "",
 ) -> str:
     """Fetch distinct project node signatures and relationship patterns with bounded names and properties."""
-    return _json(_project_graph_structure(
+    result = _project_graph_structure(
         ctx.context,
         sample_limit=sample_limit,
         include_properties=include_properties,
         focus=focus,
+    )
+    ctx.context.schema_discovery["project_graph_structure"] = result
+    if "graph-discovery" not in ctx.context.artifacts:
+        ctx.context.add_artifact(RunArtifact(
+            artifact_id="graph-discovery",
+            kind="graph_discovery",
+            producer="Graph Inspector",
+            summary=(
+                f"Inspected {result['unique_node_label_count']} node labels and "
+                f"{result['relationship_pattern_count']} relationship patterns."
+            ),
+            payload=result,
+        ))
+    return _json(result)
+
+
+def _observed_node_type(ctx: BimRunContext, label: str) -> dict[str, Any]:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", label):
+        raise ValueError("Live labels must be safe Neo4j identifiers.")
+    inventory = _queryable_node_inventory(ctx)
+    matches = [item for item in inventory["node_types"] if label in item["labels"]]
+    if not matches:
+        raise ValueError(f"Label {label!r} was not observed in the authorized project.")
+    return max(matches, key=lambda item: item["node_count"])
+
+
+def _queryable_node_inventory(ctx: BimRunContext) -> dict[str, Any]:
+    cache_key = "queryable_node_inventory_v1"
+    cached = ctx.schema_discovery.get(cache_key)
+    if isinstance(cached, dict):
+        return cached
+    source_property = ctx.graph_contract.authorization_path.source_property
+    rows = ctx.bim.query(
+        f"MATCH (n) WHERE n.`{source_property}` IN $allowed_sources "
+        "RETURN labels(n) AS labels, count(n) AS node_count, "
+        "collect(DISTINCT keys(n)) AS property_key_groups, "
+        "collect(DISTINCT coalesce(n.name, n.long_name, n.id))[0..3] AS sample_names "
+        "ORDER BY node_count DESC LIMIT 40",
+        {"allowed_sources": ctx.scope.allowed_sources},
+    )
+    node_types = []
+    for row in rows:
+        node_types.append({
+            "labels": sorted(str(value) for value in row.get("labels") or []),
+            "node_count": int(row.get("node_count") or 0),
+            "properties": sorted({
+                str(key)
+                for group in row.get("property_key_groups") or []
+                for key in (group or [])
+            }),
+            "sample_names": [str(value) for value in row.get("sample_names") or []],
+        })
+    result = {
+        "project_id": ctx.scope.project_id,
+        "trusted_scope_property": source_property,
+        "node_types": node_types,
+        "scope": "authorized project only",
+    }
+    ctx.schema_discovery[cache_key] = result
+    return result
+
+
+def inspect_queryable_node_types(ctx: PipelineContext) -> str:
+    """Return a compact cached inventory of authorized node labels, properties, counts, and names."""
+    return _json(_queryable_node_inventory(ctx.context))
+
+
+def profile_project_properties(
+    ctx: PipelineContext,
+    label: str,
+    properties: list[str],
+    sample_limit: int = 5,
+) -> str:
+    """Profile bounded values and cardinality for observed properties on one authorized live label."""
+    node_type = _observed_node_type(ctx.context, label)
+    observed = set(node_type["properties"])
+    requested = list(dict.fromkeys(properties))
+    if not requested or len(requested) > 8:
+        raise ValueError("Profile between one and eight properties per call.")
+    unknown = set(requested) - observed
+    if unknown:
+        raise ValueError(f"Properties were not observed on {label!r}: {sorted(unknown)}")
+    if any("`" in prop or any(ord(ch) < 32 for ch in prop) for prop in requested):
+        raise ValueError("Live property names contain unsafe characters.")
+    sample_limit = max(1, min(sample_limit, 10))
+    cache_key = "property_profile:" + hashlib.sha256(
+        _json([label, requested, sample_limit]).encode("utf-8")
+    ).hexdigest()
+    cached = ctx.context.schema_discovery.get(cache_key)
+    if isinstance(cached, dict):
+        return _json(cached)
+    source_property = ctx.context.graph_contract.authorization_path.source_property
+    profiles = []
+    for property_name in requested:
+        rows = ctx.context.bim.query(
+            f"MATCH (n:`{label}`) WHERE n.`{source_property}` IN $allowed_sources "
+            f"RETURN count(n) AS node_count, count(n.`{property_name}`) AS populated_count, "
+            f"count(DISTINCT n.`{property_name}`) AS distinct_count, "
+            f"collect(DISTINCT n.`{property_name}`)[0..$sample_limit] AS sample_values",
+            {"allowed_sources": ctx.context.scope.allowed_sources, "sample_limit": sample_limit},
+        )
+        row = rows[0] if rows else {}
+        profiles.append({
+            "property": property_name,
+            "node_count": int(row.get("node_count") or 0),
+            "populated_count": int(row.get("populated_count") or 0),
+            "distinct_count": int(row.get("distinct_count") or 0),
+            "sample_values": [_clean_value(value) for value in row.get("sample_values") or []],
+        })
+    result = {"label": label, "profiles": profiles, "scope": "authorized project only"}
+    ctx.context.schema_discovery[cache_key] = result
+    return _json(result)
+
+
+def semantic_search_project_nodes(
+    ctx: PipelineContext,
+    query: str,
+    label: str,
+    name_properties: list[str],
+    top_k: int = 5,
+    candidate_limit: int = 200,
+) -> str:
+    """Rank authorized live nodes by embedding similarity over their labels and observed name fields."""
+    if not query.strip():
+        raise ValueError("Semantic node search requires a non-empty concept.")
+    node_type = _observed_node_type(ctx.context, label)
+    observed = set(node_type["properties"])
+    properties = list(dict.fromkeys(name_properties))
+    if not properties or len(properties) > 6:
+        raise ValueError("Choose between one and six observed name properties.")
+    unknown = set(properties) - observed
+    if unknown:
+        raise ValueError(f"Name properties were not observed on {label!r}: {sorted(unknown)}")
+    if any("`" in prop or any(ord(ch) < 32 for ch in prop) for prop in properties):
+        raise ValueError("Live property names contain unsafe characters.")
+    top_k = max(1, min(top_k, 20))
+    candidate_limit = max(top_k, min(candidate_limit, 500))
+    source_property = ctx.context.graph_contract.authorization_path.source_property
+    model = os.getenv("BIM_EMBEDDING_MODEL", "text-embedding-3-small")
+    cache_key = "semantic_nodes:" + hashlib.sha256(
+        _json([query, label, properties, top_k, candidate_limit, model]).encode("utf-8")
+    ).hexdigest()
+    cached = ctx.context.schema_discovery.get(cache_key)
+    if isinstance(cached, dict):
+        return _json(cached)
+    rows = ctx.context.bim.query(
+        f"MATCH (n:`{label}`) WHERE n.`{source_property}` IN $allowed_sources "
+        "RETURN elementId(n) AS node_ref, labels(n) AS labels, "
+        "[property IN $name_properties | n[property]] AS name_values "
+        "ORDER BY node_ref LIMIT $candidate_limit",
+        {
+            "allowed_sources": ctx.context.scope.allowed_sources,
+            "name_properties": properties,
+            "candidate_limit": candidate_limit,
+        },
+    )
+    candidates = []
+    texts = []
+    for row in rows:
+        labels = [str(value) for value in row.get("labels") or []]
+        values = [str(value)[:200] for value in row.get("name_values") or [] if value not in (None, "")]
+        text_value = "type: " + ", ".join(labels) + "; name: " + " | ".join(values)
+        candidate = {
+            "node_ref": str(row.get("node_ref") or ""),
+            "labels": labels,
+            "name_values": values,
+            "embedding_text": text_value,
+        }
+        candidates.append(candidate)
+        texts.append(text_value)
+    if not candidates:
+        return _json({"query": query, "matches": [], "scope": "authorized project only"})
+    response = OpenAI().embeddings.create(model=model, input=[query, *texts], encoding_format="float")
+    vectors = [list(item.embedding) for item in response.data]
+    if len(vectors) != len(candidates) + 1:
+        raise RuntimeError("Embedding provider returned an incomplete result set.")
+    ranked = _rank_embedding_candidates(vectors[0], vectors[1:], candidates)[:top_k]
+    result = {
+        "query": query,
+        "label": label,
+        "name_properties": properties,
+        "embedding_model": model,
+        "candidate_count": len(candidates),
+        "matches": ranked,
+        "scope": "authorized project only",
+    }
+    ctx.context.schema_discovery[cache_key] = result
+    return _json(result)
+
+
+def _project_property_candidates(ctx: BimRunContext, label: str) -> list[dict[str, Any]]:
+    cache_key = f"property_candidates:{label}"
+    cached = ctx.schema_discovery.get(cache_key)
+    if isinstance(cached, list):
+        return cached
+    node_type = _observed_node_type(ctx, label)
+    properties = list(node_type["properties"])[:60]
+    if not properties:
+        return []
+    source_property = ctx.graph_contract.authorization_path.source_property
+    rows = ctx.bim.query(
+        f"MATCH (n:`{label}`) WHERE n.`{source_property}` IN $allowed_sources "
+        "UNWIND $properties AS property "
+        "RETURN property, count(n) AS node_count, count(n[property]) AS populated_count, "
+        "count(DISTINCT n[property]) AS distinct_count, "
+        "collect(DISTINCT n[property])[0..$sample_limit] AS sample_values "
+        "ORDER BY property",
+        {
+            "allowed_sources": ctx.scope.allowed_sources,
+            "properties": properties,
+            "sample_limit": 6,
+        },
+    )
+    candidates = []
+    for row in rows:
+        property_name = str(row.get("property") or "")
+        sample_values = [
+            str(value)[:160] for value in row.get("sample_values") or [] if value not in (None, "")
+        ]
+        node_count = int(row.get("node_count") or 0)
+        populated_count = int(row.get("populated_count") or 0)
+        distinct_count = int(row.get("distinct_count") or 0)
+        embedding_text = (
+            f"property: {property_name}; samples: {' | '.join(sample_values)}; "
+            f"populated: {populated_count}/{node_count}; distinct: {distinct_count}"
+        )
+        candidates.append({
+            "node_ref": property_name,
+            "property": property_name,
+            "node_count": node_count,
+            "populated_count": populated_count,
+            "distinct_count": distinct_count,
+            "sample_values": sample_values,
+            "embedding_text": embedding_text,
+        })
+    ctx.schema_discovery[cache_key] = candidates
+    return candidates
+
+
+def semantic_search_project_properties(
+    ctx: PipelineContext,
+    label: str,
+    concepts: list[str],
+    top_k: int = 8,
+) -> str:
+    """Rank observed live properties for semantic roles using names, values, and cardinality context."""
+    requested_concepts = [concept.strip() for concept in concepts if concept.strip()]
+    if not requested_concepts or len(requested_concepts) > 6:
+        raise ValueError("Search between one and six semantic property concepts.")
+    top_k = max(1, min(top_k, 15))
+    candidates = _project_property_candidates(ctx.context, label)
+    if not candidates:
+        return _json({"label": label, "matches_by_concept": {}, "scope": "authorized project only"})
+    model = os.getenv("BIM_EMBEDDING_MODEL", "text-embedding-3-small")
+    similarity_threshold = float(os.getenv("BIM_SCHEMA_SIMILARITY_THRESHOLD", "0.35"))
+    if not -1.0 <= similarity_threshold <= 1.0:
+        raise ValueError("BIM_SCHEMA_SIMILARITY_THRESHOLD must be between -1 and 1.")
+    cache_key = "semantic_properties:" + hashlib.sha256(
+        _json([label, requested_concepts, top_k, model, similarity_threshold]).encode("utf-8")
+    ).hexdigest()
+    cached = ctx.context.schema_discovery.get(cache_key)
+    if isinstance(cached, dict):
+        return _json(cached)
+    texts = [candidate["embedding_text"] for candidate in candidates]
+    response = OpenAI().embeddings.create(
+        model=model,
+        input=[*requested_concepts, *texts],
+        encoding_format="float",
+    )
+    vectors = [list(item.embedding) for item in response.data]
+    expected = len(requested_concepts) + len(candidates)
+    if len(vectors) != expected:
+        raise RuntimeError("Embedding provider returned an incomplete result set.")
+    candidate_vectors = vectors[len(requested_concepts):]
+    matches = {}
+    for concept, vector in zip(requested_concepts, vectors[:len(requested_concepts)]):
+        ranked = _rank_embedding_candidates(vector, candidate_vectors, candidates)[:top_k]
+        matches[concept] = [
+            {**item, "meets_threshold": item["similarity"] >= similarity_threshold}
+            for item in ranked
+        ]
+    result = {
+        "label": label,
+        "embedding_model": model,
+        "property_count": len(candidates),
+        "similarity_threshold": similarity_threshold,
+        "matches_by_concept": matches,
+        "scope": "authorized project only",
+    }
+    ctx.context.schema_discovery[cache_key] = result
+    return _json(result)
+
+
+def semantic_search_property_values(
+    ctx: PipelineContext,
+    label: str,
+    property: str,
+    concepts: list[str],
+    top_k: int = 12,
+    value_limit: int = 300,
+) -> str:
+    """Rank exact stored values of an observed property against user concepts in project scope."""
+    node_type = _observed_node_type(ctx.context, label)
+    if property not in set(node_type["properties"]):
+        raise ValueError(f"Property {property!r} was not observed on {label!r}.")
+    if "`" in property or any(ord(ch) < 32 for ch in property):
+        raise ValueError("Live property names contain unsafe characters.")
+    requested_concepts = [concept.strip() for concept in concepts if concept.strip()]
+    if not requested_concepts or len(requested_concepts) > 6:
+        raise ValueError("Search between one and six value concepts.")
+    top_k = max(1, min(top_k, 20))
+    value_limit = max(top_k, min(value_limit, 500))
+    model = os.getenv("BIM_EMBEDDING_MODEL", "text-embedding-3-small")
+    similarity_threshold = float(os.getenv("BIM_SCHEMA_SIMILARITY_THRESHOLD", "0.35"))
+    if not -1.0 <= similarity_threshold <= 1.0:
+        raise ValueError("BIM_SCHEMA_SIMILARITY_THRESHOLD must be between -1 and 1.")
+    cache_key = "semantic_values:" + hashlib.sha256(
+        _json([label, property, requested_concepts, top_k, value_limit, model, similarity_threshold]).encode("utf-8")
+    ).hexdigest()
+    cached = ctx.context.schema_discovery.get(cache_key)
+    if isinstance(cached, dict):
+        return _json(cached)
+    source_property = ctx.context.graph_contract.authorization_path.source_property
+    rows = ctx.context.bim.query(
+        f"MATCH (n:`{label}`) WHERE n.`{source_property}` IN $allowed_sources "
+        f"AND n.`{property}` IS NOT NULL "
+        f"RETURN DISTINCT n.`{property}` AS value ORDER BY toString(value) LIMIT $value_limit",
+        {"allowed_sources": ctx.context.scope.allowed_sources, "value_limit": value_limit},
+    )
+    candidates = []
+    for row in rows:
+        value = str(row.get("value"))[:300]
+        candidates.append({
+            "node_ref": value,
+            "value": value,
+            "embedding_text": f"stored value: {value}",
+        })
+    if not candidates:
+        result = {
+            "label": label,
+            "property": property,
+            "similarity_threshold": similarity_threshold,
+            "matches_by_concept": {},
+            "scope": "authorized project only",
+        }
+        ctx.context.schema_discovery[cache_key] = result
+        return _json(result)
+    response = OpenAI().embeddings.create(
+        model=model,
+        input=[*requested_concepts, *[item["embedding_text"] for item in candidates]],
+        encoding_format="float",
+    )
+    vectors = [list(item.embedding) for item in response.data]
+    if len(vectors) != len(requested_concepts) + len(candidates):
+        raise RuntimeError("Embedding provider returned an incomplete result set.")
+    candidate_vectors = vectors[len(requested_concepts):]
+    matches = {}
+    for concept, vector in zip(requested_concepts, vectors[:len(requested_concepts)]):
+        ranked = _rank_embedding_candidates(vector, candidate_vectors, candidates)[:top_k]
+        matches[concept] = [
+            {**item, "meets_threshold": item["similarity"] >= similarity_threshold}
+            for item in ranked
+        ]
+    result = {
+        "label": label,
+        "property": property,
+        "embedding_model": model,
+        "similarity_threshold": similarity_threshold,
+        "candidate_count": len(candidates),
+        "matches_by_concept": matches,
+        "scope": "authorized project only",
+    }
+    ctx.context.schema_discovery[cache_key] = result
+    return _json(result)
+
+
+def register_schema_mapping(
+    ctx: PipelineContext, proposal: SchemaMappingProposal
+) -> str:
+    """Validate and register a semantic mapping observed in the authorized project."""
+    structure = ctx.context.schema_discovery.get("project_graph_structure")
+    if not isinstance(structure, dict):
+        raise ValueError(
+            "Inspect project graph structure, including nodes and relationships, before registering a mapping."
+        )
+    node_type = _observed_node_type(ctx.context, proposal.label)
+    if proposal.relationship_path:
+        patterns = structure.get("relationship_types") or []
+        previous_label = proposal.relationship_path[0].from_label
+        for step in proposal.relationship_path:
+            if any(
+                re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", identifier) is None
+                for identifier in (step.from_label, step.relationship_type, step.to_label)
+            ):
+                raise ValueError("Relationship paths contain an unsafe label or relationship type.")
+            if step.from_label != previous_label:
+                raise ValueError("The proposed relationship path must be contiguous.")
+            if step.direction == "outgoing":
+                observed = any(
+                    step.relationship_type == item.get("type")
+                    and step.from_label in (item.get("from_labels") or [])
+                    and step.to_label in (item.get("to_labels") or [])
+                    for item in patterns
+                )
+            else:
+                observed = any(
+                    step.relationship_type == item.get("type")
+                    and step.from_label in (item.get("to_labels") or [])
+                    and step.to_label in (item.get("from_labels") or [])
+                    for item in patterns
+                )
+            if not observed:
+                raise ValueError(
+                    f"Relationship {step.from_label!r} {step.relationship_type!r} "
+                    f"{step.to_label!r} with direction {step.direction!r} was not observed."
+                )
+            previous_label = step.to_label
+        if previous_label != proposal.label:
+            raise ValueError("The relationship path must end at the mapped entity label.")
+    observed = set(node_type["properties"])
+    required = {
+        proposal.identity_property,
+        proposal.source_property,
+        *(field.property for field in proposal.fields),
+    }
+    for optional in (proposal.classification_source_property, proposal.classification_name_property):
+        if optional:
+            required.add(optional)
+    unknown = required - observed
+    if unknown:
+        raise ValueError(f"The proposed properties were not observed: {sorted(unknown)}")
+    if any("`" in prop or any(ord(ch) < 32 for ch in prop) for prop in required):
+        raise ValueError("The proposed properties contain unsafe characters.")
+    trusted_source = ctx.context.graph_contract.authorization_path.source_property
+    if proposal.source_property != trusted_source:
+        raise ValueError("The mapping must use the trusted authorization source property.")
+    semantic_names = [field.semantic_name for field in proposal.fields]
+    if len(semantic_names) != len(set(semantic_names)):
+        raise ValueError("Mapped semantic field names must be unique.")
+    fields_by_name = {field.semantic_name: field for field in proposal.fields}
+    for binding in proposal.value_bindings:
+        field = fields_by_name.get(binding.semantic_name)
+        if field is None or field.property != binding.property:
+            raise ValueError(
+                f"Value binding {binding.semantic_name!r} must reference its mapped semantic field."
+            )
+    required_evidence = {
+        "identity": proposal.identity_property,
+        **{
+            binding.semantic_name: binding.property
+            for binding in proposal.value_bindings
+        },
+    }
+    supplied_evidence = {item.semantic_name: item for item in proposal.match_evidence}
+    missing_evidence = set(required_evidence) - set(supplied_evidence)
+    if missing_evidence:
+        raise ValueError(f"Semantic similarity evidence is required for: {sorted(missing_evidence)}")
+    semantic_results = [
+        value for key, value in ctx.context.schema_discovery.items()
+        if key.startswith("semantic_properties:") and isinstance(value, dict)
+    ]
+    for semantic_name, property_name in required_evidence.items():
+        evidence = supplied_evidence[semantic_name]
+        if evidence.property != property_name:
+            raise ValueError(f"Similarity evidence for {semantic_name!r} names a different property.")
+        verified_match = None
+        verified_threshold = None
+        for result in semantic_results:
+            concept_matches = (result.get("matches_by_concept") or {}).get(evidence.concept) or []
+            match = next((item for item in concept_matches if item.get("property") == property_name), None)
+            if match is not None:
+                verified_match = match
+                verified_threshold = float(result.get("similarity_threshold", 0.35))
+                break
+        if verified_match is None:
+            raise ValueError(f"No live semantic-search evidence supports {semantic_name!r}.")
+        verified_similarity = float(verified_match.get("similarity") or 0.0)
+        if abs(verified_similarity - evidence.similarity) > 1e-6:
+            raise ValueError(f"Reported similarity for {semantic_name!r} does not match live evidence.")
+        if verified_similarity < verified_threshold:
+            raise ValueError(
+                f"Semantic match for {semantic_name!r} scored {verified_similarity:.3f}, below "
+                f"the required threshold {verified_threshold:.3f}."
+            )
+    semantic_value_results = [
+        value for key, value in ctx.context.schema_discovery.items()
+        if key.startswith("semantic_values:") and isinstance(value, dict)
+    ]
+    for binding in proposal.value_bindings:
+        verified_result = next(
+            (
+                result for result in semantic_value_results
+                if result.get("label") == proposal.label
+                and result.get("property") == binding.property
+                and binding.user_concept in (result.get("matches_by_concept") or {})
+            ),
+            None,
+        )
+        if verified_result is None:
+            raise ValueError(f"No live value-search evidence supports {binding.user_concept!r}.")
+        available_matches = {
+            str(item.get("value")): item
+            for item in verified_result["matches_by_concept"][binding.user_concept]
+        }
+        threshold = float(verified_result.get("similarity_threshold", 0.35))
+        for selected in binding.matches:
+            match = available_matches.get(selected.value)
+            if match is None:
+                raise ValueError(f"Stored value {selected.value!r} was not returned by semantic search.")
+            similarity = float(match.get("similarity") or 0.0)
+            if abs(similarity - selected.similarity) > 1e-6:
+                raise ValueError(f"Reported value similarity for {selected.value!r} was altered.")
+            if similarity < threshold:
+                raise ValueError(
+                    f"Stored value {selected.value!r} scored {similarity:.3f}, below the "
+                    f"required threshold {threshold:.3f}."
+                )
+    digest_input = {
+        "project_id": ctx.context.scope.project_id,
+        "proposal": proposal.model_dump(mode="json"),
+    }
+    mapping_id = "mapping-" + hashlib.sha256(
+        _json(digest_input).encode("utf-8")
+    ).hexdigest()[:12]
+    existing = ctx.context.schema_mappings.get(mapping_id)
+    if isinstance(existing, RegisteredSchemaMapping):
+        return existing.model_dump_json()
+    pending_mapping = RegisteredSchemaMapping(
+        mapping_id="pending",
+        proposal=proposal,
+        node_count=1,
+        populated_identity_count=1,
+        distinct_identity_count=1,
+    )
+    match_clause = _registered_match_clause(pending_mapping, proposal.label)
+    rows = ctx.context.bim.query(
+        f"{match_clause} WHERE n.`{proposal.source_property}` IN $allowed_sources "
+        f"RETURN count(DISTINCT n) AS node_count, "
+        f"count(DISTINCT CASE WHEN n.`{proposal.identity_property}` IS NOT NULL THEN n END) AS populated_count, "
+        f"count(DISTINCT n.`{proposal.identity_property}`) AS distinct_count",
+        {"allowed_sources": ctx.context.scope.allowed_sources},
+    )
+    row = rows[0] if rows else {}
+    node_count = int(row.get("node_count") or 0)
+    populated = int(row.get("populated_count") or 0)
+    distinct = int(row.get("distinct_count") or 0)
+    if not node_count:
+        raise ValueError("The proposed entity has no authorized project records.")
+    if populated != node_count or distinct != node_count:
+        raise ValueError("The proposed identity property must be populated and unique for every record.")
+    for field in proposal.fields:
+        if field.data_type != "number":
+            continue
+        numeric_rows = ctx.context.bim.query(
+            f"{match_clause} WHERE n.`{proposal.source_property}` IN $allowed_sources "
+            f"RETURN count(DISTINCT CASE WHEN n.`{field.property}` IS NOT NULL THEN n END) AS populated_count, "
+            f"count(DISTINCT CASE WHEN toFloat(n.`{field.property}`) IS NOT NULL THEN n END) AS numeric_count",
+            {"allowed_sources": ctx.context.scope.allowed_sources},
+        )
+        numeric_row = numeric_rows[0] if numeric_rows else {}
+        if int(numeric_row.get("populated_count") or 0) != int(numeric_row.get("numeric_count") or 0):
+            raise ValueError(f"Mapped numeric field {field.semantic_name!r} contains nonnumeric values.")
+    registered = RegisteredSchemaMapping(
+        mapping_id=mapping_id,
+        proposal=proposal,
+        node_count=node_count,
+        populated_identity_count=populated,
+        distinct_identity_count=distinct,
+    )
+    ctx.context.schema_mappings[mapping_id] = registered
+    ctx.context.add_artifact(RunArtifact(
+        artifact_id=mapping_id,
+        kind="mapping",
+        producer="Schema Mapper",
+        summary=f"Mapped {proposal.entity_name} to live label {proposal.label}.",
+        payload=registered.model_dump(mode="json"),
     ))
+    return registered.model_dump_json()
 
 
-@function_tool
-def query_bim(ctx: RunContextWrapper[BimRunContext], plan: BimQueryPlan) -> str:
+def query_bim(ctx: PipelineContext, plan: BimQueryPlan) -> str:
     """Execute one validated, project-scoped declarative BIM query plan; raw Cypher is never accepted."""
+    if ctx.context.task_contract is None:
+        raise ValueError("The pipeline must define the BIM task contract before querying.")
     result = _execute_plan(ctx.context, plan)
     evidence_id = f"query-{uuid4().hex[:10]}"
     ctx.context.add_evidence(Evidence(
@@ -965,6 +1694,23 @@ def query_bim(ctx: RunContextWrapper[BimRunContext], plan: BimQueryPlan) -> str:
         kind="query",
         summary=result["claim"]["statement"],
         payload=_json(result),
+    ))
+    ctx.context.add_artifact(RunArtifact(
+        artifact_id=f"plan-{evidence_id}",
+        kind="query_plan",
+        producer="Query Planner",
+        summary=result["claim"]["statement"],
+        payload={"evidence_id": evidence_id, **result},
+    ))
+    ctx.context.add_artifact(RunArtifact(
+        artifact_id=f"cypher-{evidence_id}",
+        kind="cypher_query",
+        producer="Cypher Query Handler",
+        summary=f"Executed {len(result.get('cypher_executions') or [])} read-only Cypher calculation(s).",
+        payload={
+            "evidence_id": evidence_id,
+            "executions": result.get("cypher_executions") or [],
+        },
     ))
     return _json({"evidence_id": evidence_id, **result})
 
@@ -983,14 +1729,115 @@ def _verify_query_evidence(
         evidence = context.evidence[evidence_id]
         original = json.loads(evidence.payload)
         rerun = _execute_plan(context, BimQueryPlan.model_validate(original["plan"]))
+        plan = BimQueryPlan.model_validate(rerun["plan"])
+        registered = context.schema_mappings.get(plan.mapping_id)
+        replay_ok = rerun["result_digest"] == original.get("result_digest")
+        scope_ok = bool(context.scope.allowed_sources)
+        identity_ok = True
+        binding_ok = True
+        identity_explanation = "The contract-backed entity defines a distinct identity property."
+        binding_explanation = "No registered live value bindings apply to this plan."
+        if isinstance(registered, RegisteredSchemaMapping):
+            identity_ok = (
+                registered.node_count == registered.populated_identity_count
+                == registered.distinct_identity_count
+            )
+            identity_explanation = (
+                f"{registered.distinct_identity_count} of {registered.node_count} records have "
+                "populated, unique identities."
+            )
+            missing_bindings: list[str] = []
+            for binding in registered.proposal.value_bindings:
+                selected = {_normalize(match.value) for match in binding.matches}
+                supplied = {
+                    _normalize(value)
+                    for item in plan.filters
+                    if item.field == binding.semantic_name
+                    for value in _raw_filter_values(item)
+                }
+                if not selected.issubset(supplied):
+                    missing_bindings.append(binding.user_concept)
+            binding_ok = not missing_bindings
+            binding_explanation = (
+                "Every live-mapped user constraint is present with its exact stored value."
+                if binding_ok else f"Missing exact bindings for: {', '.join(missing_bindings)}."
+            )
+        counting_unit_ok = True
+        counting_unit_explanation = "The contract-backed identity defines the record counting unit."
+        boundary_ok = all(
+            item.operator in {"equals", "in"}
+            for item in plan.filters
+            if _normalize(item.field) in {"level", "floor", "storey", "story"}
+        )
+        boundary_explanation = (
+            "Level constraints use exact values, so ground cannot match underground."
+            if boundary_ok else "A level constraint uses a non-exact operator."
+        )
+        source_dedup_ok = identity_ok and plan.distinct_by == "identity"
+        source_dedup_explanation = (
+            "The query counts the globally unique identity across all authorized sources."
+            if source_dedup_ok else "Cross-source identity deduplication is not established."
+        )
+        classification_ok = True
+        classification_explanation = "No mapped classification field applies to this plan."
+        if isinstance(registered, RegisteredSchemaMapping):
+            counting_unit_ok = bool(
+                registered.proposal.counting_unit.strip()
+                and registered.proposal.counting_unit_evidence.strip()
+            )
+            counting_unit_explanation = (
+                f"One distinct identity represents {registered.proposal.counting_unit}: "
+                f"{registered.proposal.counting_unit_evidence}"
+                if counting_unit_ok else
+                "The mapping does not prove whether one identity is the requested entity or a child record."
+            )
+            classification_fields = {
+                field.semantic_name for field in registered.proposal.fields
+                if field.ontology_kind in {"canonical_type", "ifc_class"}
+            }
+            if classification_fields:
+                classification_ok = (
+                    plan.group_by in classification_fields
+                    or any(
+                        item.field in classification_fields and item.operator in {"equals", "in"}
+                        for item in plan.filters
+                    )
+                )
+                classification_explanation = (
+                    "Classification is either grouped explicitly or constrained by an exact mapped value."
+                    if classification_ok else
+                    "The plan neither groups by nor exactly constrains the mapped entity classification."
+                )
+        semantic_checks = [
+            {"name": "replay_stability", "passed": replay_ok,
+             "explanation": "The rerun result digest matches the original." if replay_ok
+             else "The rerun result digest differs from the original."},
+            {"name": "authorized_scope", "passed": scope_ok,
+             "explanation": f"Execution is restricted to {len(context.scope.allowed_sources)} authorized source(s)."},
+            {"name": "identity_integrity", "passed": identity_ok,
+             "explanation": identity_explanation},
+            {"name": "constraint_binding", "passed": binding_ok,
+             "explanation": binding_explanation},
+            {"name": "counting_unit", "passed": counting_unit_ok,
+             "explanation": counting_unit_explanation},
+            {"name": "boundary_exactness", "passed": boundary_ok,
+             "explanation": boundary_explanation},
+            {"name": "source_deduplication", "passed": source_dedup_ok,
+             "explanation": source_dedup_explanation},
+            {"name": "classification_purity", "passed": classification_ok,
+             "explanation": classification_explanation},
+            {"name": "constraint_coverage", "passed": binding_ok,
+             "explanation": binding_explanation},
+        ]
         checks.append({
             "evidence_id": evidence_id,
-            "verified": rerun["result_digest"] == original.get("result_digest"),
+            "verified": all(check["passed"] for check in semantic_checks),
             "expected_digest": original.get("result_digest"),
             "actual_digest": rerun["result_digest"],
             "claim": rerun["claim"],
             "limitations": rerun.get("limitations", []),
             "plan": rerun["plan"],
+            "semantic_checks": semantic_checks,
         })
     return {
         "verified": bool(checks) and all(check.get("verified") is True for check in checks),
@@ -1000,17 +1847,53 @@ def _verify_query_evidence(
     }
 
 
-@function_tool
-def verify_bim_evidence(
-    ctx: RunContextWrapper[BimRunContext], evidence_ids: list[str]
-) -> str:
-    """Independently rerun saved general BIM query plans and compare their complete result digests."""
-    result = _verify_query_evidence(ctx.context, evidence_ids)
+def ensure_bim_verification(context: BimRunContext) -> str | None:
+    """Record deterministic verification when query evidence exists but the reviewer did not finish."""
+    existing = next(
+        (
+            evidence_id for evidence_id, evidence in reversed(list(context.evidence.items()))
+            if evidence.kind == "verification"
+        ),
+        None,
+    )
+    if existing is not None:
+        return existing
+    query_ids = [
+        evidence_id for evidence_id, evidence in context.evidence.items()
+        if evidence.kind == "query"
+    ]
+    if not query_ids:
+        return None
+    result = _verify_query_evidence(context, query_ids)
     verification_id = f"verification-{uuid4().hex[:10]}"
-    ctx.context.add_evidence(Evidence(
+    context.add_evidence(Evidence(
         evidence_id=verification_id,
         kind="verification",
-        summary=f"Independent verification of {len(result['checks'])} general BIM query result(s)",
+        summary=f"Runtime verification of {len(result['checks'])} general BIM query result(s)",
         payload=_json(result),
     ))
+    context.add_artifact(RunArtifact(
+        artifact_id=f"review-{verification_id}",
+        kind="semantic_review",
+        producer="Verifier",
+        summary=f"Reviewed {len(result['checks'])} query artifact(s).",
+        payload={"verification_evidence_id": verification_id, **result},
+    ))
+    return verification_id
+
+
+def verify_bim_evidence(
+    ctx: PipelineContext, evidence_ids: list[str]
+) -> str:
+    """Independently rerun saved general BIM query plans and compare their complete result digests."""
+    verification_id = ensure_bim_verification(ctx.context)
+    if verification_id is None:
+        return _json({
+            "evidence_id": None,
+            "verified": False,
+            "checks": [],
+            "requested_evidence_ids": evidence_ids,
+            "verified_evidence_ids": [],
+        })
+    result = json.loads(ctx.context.evidence[verification_id].payload)
     return _json({"evidence_id": verification_id, **result})

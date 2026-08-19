@@ -37,7 +37,7 @@
 #     concept        — a cross-cutting / vocabulary concept (vertical circulation,
 #       room-level words) with no single canonical_type of its own.
 #   label            — human description.
-#   aliases          — user/agent words, ANY language → routing + query resolution.
+#   aliases          — user words, ANY language → routing + query resolution.
 #   functions        — canonical_type slugs this concept counts (default: [<slug>]).
 #   ifc_classes      — (element_class) exact IFC leaf types (object_type values).
 #   gebiedstype      — (space_function) Dutch MiniBIM pset values that map here.

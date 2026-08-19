@@ -5,26 +5,27 @@ from dataclasses import dataclass
 from agents import Agent, ModelSettings, RunHooks
 
 from . import prompts
-from .models import BimQueryReport, SupervisorReport, VerificationReport
-from .guardrails import (
-    query_failure_from_evidence,
-    query_matches_evidence,
-    supervisor_matches_evidence,
-    verification_failure_from_evidence,
-    verification_matches_evidence,
+from .agent_tools import (
+    create_task_contract,
+    inspect_graph_structure,
+    inspect_node_inventory,
+    profile_node_properties,
+    register_schema_mapping,
+    replay_and_verify,
+    search_nodes,
+    search_properties,
+    search_property_values,
+    submit_query_plan,
 )
-from .tools import (
-    get_bim_query_catalog,
-    inspect_project_graph_structure,
-    query_bim,
-    verify_bim_evidence,
-)
+from .models import BimQueryReport, PipelineReport, VerificationReport
+from .schema_mapping import SchemaMappingReport
 
 
 @dataclass(frozen=True)
 class BimAgentRegistry:
     supervisor: Agent
-    query_agent: Agent
+    graph_explorer: Agent
+    query_planner: Agent
     verifier: Agent
 
 
@@ -38,48 +39,64 @@ def build_agent_registry(
     worker_model: str | None = None,
     hooks: RunHooks | None = None,
 ) -> BimAgentRegistry:
-    worker_model = worker_model or model
-
-    query_agent = Agent(
-        name="BIM Analyst",
-        instructions=prompts.QUERY,
-        model=worker_model,
-        model_settings=_settings("low"),
-        tools=[get_bim_query_catalog, inspect_project_graph_structure, query_bim],
-        output_type=BimQueryReport,
-        output_guardrails=[query_matches_evidence],
-    )
-    verifier = Agent(
-        name="Verification Agent",
-        instructions=prompts.VERIFIER,
-        model=worker_model,
-        model_settings=_settings("low"),
-        tools=[verify_bim_evidence],
-        output_type=VerificationReport,
-        output_guardrails=[verification_matches_evidence],
-    )
-    supervisor = Agent(
-        name="BIM Supervisor",
-        instructions=prompts.SUPERVISOR,
-        model=model,
+    worker = worker_model or model
+    explorer = Agent(
+        name="Graph Explorer",
+        instructions=prompts.GRAPH_EXPLORER,
+        model=worker,
         model_settings=_settings("low"),
         tools=[
-            query_agent.as_tool(
-                "query_bim",
-                "Answer a BIM question using general schema-grounded project queries.",
-                max_turns=6,
-                hooks=hooks,
-                failure_error_function=query_failure_from_evidence,
-            ),
-            verifier.as_tool(
-                "verify_bim_result",
-                "Independently verify candidate BIM claims.",
-                max_turns=3,
-                hooks=hooks,
-                failure_error_function=verification_failure_from_evidence,
-            ),
+            inspect_graph_structure,
+            inspect_node_inventory,
+            profile_node_properties,
+            search_nodes,
+            search_properties,
+            search_property_values,
+            register_schema_mapping,
         ],
-        output_type=SupervisorReport,
-        output_guardrails=[supervisor_matches_evidence],
+        output_type=SchemaMappingReport,
     )
-    return BimAgentRegistry(supervisor=supervisor, query_agent=query_agent, verifier=verifier)
+    planner = Agent(
+        name="Query Planner",
+        instructions=prompts.QUERY_PLANNER,
+        model=worker,
+        model_settings=_settings("low"),
+        tools=[
+            explorer.as_tool(
+                "explore_graph",
+                "Inspect live Neo4j and register the schema mapping needed for this task.",
+                max_turns=10,
+                hooks=hooks,
+            ),
+            submit_query_plan,
+        ],
+        output_type=BimQueryReport,
+    )
+    verifier = Agent(
+        name="Verifier",
+        instructions=prompts.VERIFIER,
+        model=worker,
+        model_settings=_settings("low"),
+        tools=[replay_and_verify],
+        output_type=VerificationReport,
+    )
+    supervisor = Agent(
+        name="Supervisor",
+        instructions=prompts.SUPERVISOR,
+        model=model,
+        model_settings=_settings("high"),
+        tools=[
+            create_task_contract,
+            inspect_graph_structure,
+            inspect_node_inventory,
+            profile_node_properties,
+            search_nodes,
+            search_properties,
+            search_property_values,
+            register_schema_mapping,
+            submit_query_plan,
+            replay_and_verify,
+        ],
+        output_type=PipelineReport,
+    )
+    return BimAgentRegistry(supervisor, explorer, planner, verifier)

@@ -15,7 +15,7 @@ from starlette.routing import Route
 from bim_context import BimContext, Settings
 
 from .graph_contract import load_graph_contract, validate_live_schema
-from .observability import BimRunHooks, configure_logging
+from .observability import PipelineEvents, configure_logging
 from .runtime import answer_bim_question
 
 
@@ -31,14 +31,14 @@ class ChatRequest(BaseModel):
 
 
 async def index(request: Request) -> FileResponse:
-    return FileResponse(WEB_DIR / "index.html")
+    return FileResponse(WEB_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 async def asset(request: Request) -> FileResponse:
     filename = request.path_params["filename"]
     if filename not in {"styles.css", "app.js"}:
         return JSONResponse({"detail": "Asset not found."}, status_code=404)
-    return FileResponse(WEB_DIR / filename)
+    return FileResponse(WEB_DIR / filename, headers={"Cache-Control": "no-cache"})
 
 
 async def health(request: Request) -> JSONResponse:
@@ -52,7 +52,7 @@ async def health(request: Request) -> JSONResponse:
                 project_id=bim.settings.project_id,
             )
             summary = bim.get_project_summary(contract)
-            validate_live_schema(bim, contract)
+            validate_live_schema(bim, contract, authorization_only=True)
             return {
                 "status": "ok",
                 "project_id": bim.settings.project_id,
@@ -73,14 +73,12 @@ async def health(request: Request) -> JSONResponse:
 async def chat(request: Request) -> JSONResponse:
     try:
         payload = ChatRequest.model_validate(await request.json())
-        report = await answer_bim_question(payload.question, hooks=BimRunHooks(logger))
+        logger.info("chat.request | mode=json | chars=%d", len(payload.question))
+        report = await answer_bim_question(payload.question, hooks=PipelineEvents(logger))
         return JSONResponse(report.model_dump(mode="json"))
     except Exception as exc:
         logger.error("chat.failed | %s: %s", type(exc).__name__, exc)
-        return JSONResponse(
-            {"detail": f"{type(exc).__name__}: {exc}"},
-            status_code=500,
-        )
+        return JSONResponse({"detail": "The BIM workflow could not complete."}, status_code=500)
 
 
 async def chat_stream(request: Request) -> StreamingResponse:
@@ -89,6 +87,7 @@ async def chat_stream(request: Request) -> StreamingResponse:
         payload = ChatRequest.model_validate(await request.json())
     except Exception:
         return JSONResponse({"detail": "A valid question is required."}, status_code=400)
+    logger.info("chat.request | mode=stream | chars=%d", len(payload.question))
 
     queue: asyncio.Queue[dict] = asyncio.Queue()
 
@@ -99,15 +98,12 @@ async def chat_stream(request: Request) -> StreamingResponse:
         try:
             report = await answer_bim_question(
                 payload.question,
-                hooks=BimRunHooks(logger, event_sink=publish),
+                hooks=PipelineEvents(logger, event_sink=publish),
             )
             await queue.put({"type": "result", "report": report.model_dump(mode="json")})
         except Exception as exc:
             logger.error("chat.stream.failed | %s: %s", type(exc).__name__, exc)
-            await queue.put({
-                "type": "error",
-                "message": f"{type(exc).__name__}: {exc}",
-            })
+            await queue.put({"type": "error", "message": "The BIM workflow could not complete."})
 
     task = asyncio.create_task(execute())
 

@@ -10,51 +10,76 @@ const sidebarCloseButton = document.getElementById("sidebarCloseButton");
 const sidebarScrim = document.getElementById("sidebarScrim");
 let busy = false;
 
-const agentWorkflow = document.getElementById("agentWorkflow");
-const agentRows = new Map();
+const pipelineWorkflow = document.getElementById("pipelineWorkflow") || document.getElementById("agentWorkflow");
+const pipelineRows = new Map();
 
-const agentDescriptions = {
-  "BIM Supervisor": "Routing and final synthesis",
-  "BIM Analyst": "Schema-grounded BIM query planning",
-  "Verification Agent": "Independent evidence check"
-};
-
-function resetAgentWorkflow() {
-  agentRows.clear();
-  agentWorkflow.innerHTML = '<li class="workflow-empty"><span>·</span><div><strong>Waiting for a question</strong><small>Agents will appear in execution order</small></div></li>';
+function resetPipelineWorkflow() {
+  pipelineRows.clear();
+  if (!pipelineWorkflow) return;
+  pipelineWorkflow.innerHTML = '<li class="workflow-empty"><span>·</span><div><strong>Waiting for a question</strong><small>Pipeline stages will appear here</small></div></li>';
 }
 
-function startAgent(event) {
-  agentWorkflow.querySelector(".workflow-empty")?.remove();
+function showPipelineStage(event) {
+  pipelineWorkflow.querySelector(".workflow-empty")?.remove();
   const row = document.createElement("li");
   row.className = "active";
-  row.dataset.eventId = event.id;
+  row.dataset.eventId = event.stage;
   const number = document.createElement("span");
-  number.textContent = event.sequence;
+  number.textContent = pipelineRows.size + 1;
   const content = document.createElement("div");
   const name = document.createElement("strong");
-  name.textContent = event.agent;
+  name.textContent = event.agent || event.stage.replaceAll("_", " ");
   const detail = document.createElement("small");
-  detail.textContent = agentDescriptions[event.agent] || "Specialist agent";
+  detail.textContent = event.tool
+    ? `${event.stage.replaceAll("_", " ")}: ${event.tool.replaceAll("_", " ")}`
+    : `${event.stage.replaceAll("_", " ")} · ${Number(event.elapsed_seconds).toFixed(1)}s`;
   content.append(name, detail);
   row.append(number, content);
-  agentWorkflow.appendChild(row);
-  agentRows.set(event.id, row);
+  pipelineWorkflow.appendChild(row);
+  pipelineRows.set(event.stage, row);
+  row.classList.remove("active");
+  row.classList.add("done");
   row.scrollIntoView({ block: "nearest", behavior: "smooth" });
 }
 
-function endAgent(event) {
-  const row = agentRows.get(event.id);
-  if (!row) return;
-  row.classList.remove("active", "tool-active");
-  row.classList.add("done");
-  row.querySelector("small").textContent += ` · ${Number(event.elapsed_seconds).toFixed(1)}s`;
-}
-
-function markTool(event, active) {
-  const candidates = [...agentRows.values()].reverse();
-  const row = candidates.find(item => item.classList.contains("active") && item.querySelector("strong").textContent === event.agent);
-  row?.classList.toggle("tool-active", active);
+// Lifecycle-aware renderer: one row per invocation, updated as its tools run.
+function renderWorkflowEvent(event) {
+  if (!pipelineWorkflow) return;
+  if (event.stage === "pipeline_start" || event.stage === "pipeline_end") return;
+  const key = event.event_id || `${event.agent || "pipeline"}-${event.sequence || event.stage}`;
+  let row = pipelineRows.get(key);
+  if (!row) {
+    pipelineWorkflow.querySelector(".workflow-empty")?.remove();
+    row = document.createElement("li");
+    row.className = "active";
+    row.dataset.eventId = key;
+    const number = document.createElement("span");
+    number.textContent = event.sequence || pipelineRows.size + 1;
+    const content = document.createElement("div");
+    const name = document.createElement("strong");
+    name.textContent = event.agent || "Pipeline";
+    const detail = document.createElement("small");
+    detail.textContent = "Starting…";
+    content.append(name, detail);
+    row.append(number, content);
+    pipelineWorkflow.appendChild(row);
+    pipelineRows.set(key, row);
+  }
+  const detail = row.querySelector("small");
+  if (event.stage === "tool_start") {
+    row.classList.add("tool-active");
+    detail.textContent = `Using ${event.tool.replaceAll("_", " ")}…`;
+  } else if (event.stage === "tool_end") {
+    row.classList.remove("tool-active");
+    detail.textContent = `Completed ${event.tool.replaceAll("_", " ")}`;
+  } else if (event.stage === "llm_start") {
+    detail.textContent = "Reasoning…";
+  } else if (event.stage === "agent_end") {
+    row.classList.remove("active", "tool-active");
+    row.classList.add("done");
+    detail.textContent = `Completed · ${Number(event.elapsed_seconds).toFixed(1)}s`;
+  }
+  row.scrollIntoView({ block: "nearest", behavior: "smooth" });
 }
 
 function scrollToBottom() {
@@ -132,6 +157,21 @@ function addAssistantMessage(report) {
     meta.appendChild(card);
   }
 
+  if (report.investigation_trace?.length) {
+    const card = document.createElement("details");
+    card.className = "result-details investigation-trace";
+    const summary = document.createElement("summary");
+    summary.textContent = `View investigation trace (${report.investigation_trace.length} steps)`;
+    const list = document.createElement("ol");
+    report.investigation_trace.forEach(item => {
+      const step = document.createElement("li");
+      step.textContent = item;
+      list.appendChild(step);
+    });
+    card.append(summary, list);
+    meta.appendChild(card);
+  }
+
   const evidenceIds = [...new Set((report.claims || []).flatMap(claim => claim.evidence_ids || []))];
   if (evidenceIds.length) {
     const card = document.createElement("div");
@@ -171,16 +211,17 @@ function setBusy(value) {
 
 async function askQuestion(question) {
   if (busy || !question.trim()) return;
-  welcomePanel.classList.add("hidden");
+  welcomePanel?.classList.add("hidden");
   addUserMessage(question.trim());
   input.value = "";
   input.style.height = "auto";
   setBusy(true);
-  resetAgentWorkflow();
+  resetPipelineWorkflow();
   const typingRow = addTypingMessage();
   const status = typingRow.querySelector(".typing-status");
 
   try {
+    status.textContent = "Sending question to the BIM server…";
     const response = await fetch("/api/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -203,16 +244,11 @@ async function askQuestion(question) {
       for (const line of lines) {
         if (!line.trim()) continue;
         const event = JSON.parse(line);
-        if (event.type === "agent_start") {
-          startAgent(event);
-          status.textContent = `${event.agent} is working…`;
-        } else if (event.type === "agent_end") {
-          endAgent(event);
-        } else if (event.type === "tool_start") {
-          markTool(event, true);
-          status.textContent = `${event.agent} is using ${event.tool.replaceAll("_", " ")}…`;
-        } else if (event.type === "tool_end") {
-          markTool(event, false);
+        if (event.type === "pipeline_stage") {
+          renderWorkflowEvent(event);
+          status.textContent = event.agent
+            ? `${event.agent}: ${event.tool?.replaceAll("_", " ") || event.stage.replaceAll("_", " ")}…`
+            : `${event.stage.replaceAll("_", " ")}…`;
         } else if (event.type === "result") {
           finalReport = event.report;
         } else if (event.type === "error") {
@@ -243,6 +279,18 @@ form.addEventListener("submit", event => {
   askQuestion(input.value);
 });
 
+window.addEventListener("error", event => {
+  console.error("BIM web client error", event.error || event.message);
+  const activeStatus = document.querySelector(".typing-status");
+  if (activeStatus) activeStatus.textContent = `Browser error: ${event.message}`;
+});
+
+window.addEventListener("unhandledrejection", event => {
+  console.error("BIM web client promise error", event.reason);
+  const activeStatus = document.querySelector(".typing-status");
+  if (activeStatus) activeStatus.textContent = `Request error: ${event.reason?.message || event.reason}`;
+});
+
 input.addEventListener("keydown", event => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
@@ -264,7 +312,7 @@ document.getElementById("newChatButton").addEventListener("click", () => {
   if (busy) return;
   messages.replaceChildren();
   welcomePanel.classList.remove("hidden");
-  resetAgentWorkflow();
+  resetPipelineWorkflow();
   input.focus();
 });
 

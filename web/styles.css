@@ -73,22 +73,21 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round
 .project-stats strong, .project-stats span { display: block; }
 .project-stats strong { font: 700 13px Manrope; }
 .project-stats span { margin-top: 2px; color: #789187; font-size: 9px; }
-.agent-list { min-height: 0; display: flex; flex: 1 1 auto; flex-direction: column; gap: 14px; margin: 16px 0 0; padding: 1px 8px 8px 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: #4a685d transparent; list-style: none; }
-.agent-list::-webkit-scrollbar, .conversation::-webkit-scrollbar { width: 8px; }
-.agent-list::-webkit-scrollbar-thumb { border-radius: 99px; background: #3b594e; }
+.workflow-list { min-height: 0; display: flex; flex: 1 1 auto; flex-direction: column; gap: 14px; margin: 16px 0 0; padding: 1px 8px 8px 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: #4a685d transparent; list-style: none; }
+.workflow-list::-webkit-scrollbar, .conversation::-webkit-scrollbar { width: 8px; }
+.workflow-list::-webkit-scrollbar-thumb { border-radius: 99px; background: #3b594e; }
 .conversation::-webkit-scrollbar-thumb { border: 2px solid #fff; border-radius: 99px; background: #bdcbc5; }
-.agent-list li { display: flex; align-items: center; gap: 10px; opacity: .55; transition: .25s ease; }
-.agent-list li.active, .agent-list li.done { opacity: 1; }
-.agent-list li.failed { opacity: 1; }
-.agent-list li > span { width: 25px; height: 25px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid rgba(255,255,255,.14); border-radius: 50%; color: #829b90; font-size: 10px; }
-.agent-list li.active > span { border-color: #3bc58f; color: #3bc58f; box-shadow: 0 0 0 4px rgba(59,197,143,.08); animation: breathe 1.4s infinite; }
-.agent-list li.done > span { color: #d9fff0; background: var(--green); border-color: var(--green); }
-.agent-list li.failed > span { color: #fff; background: var(--red); border-color: var(--red); }
-.agent-list li.tool-active small::after { content: " · using tool"; color: #5cc79d; }
-.agent-list .workflow-empty { opacity: .4; }
-.agent-list strong, .agent-list small { display: block; }
-.agent-list strong { font-size: 12px; line-height: 1.25; }
-.agent-list small { margin-top: 3px; color: #8ca69b; font-size: 10px; line-height: 1.35; }
+.workflow-list li { display: flex; align-items: center; gap: 10px; opacity: .55; transition: .25s ease; }
+.workflow-list li.active, .workflow-list li.done { opacity: 1; }
+.workflow-list li.failed { opacity: 1; }
+.workflow-list li > span { width: 25px; height: 25px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid rgba(255,255,255,.14); border-radius: 50%; color: #829b90; font-size: 10px; }
+.workflow-list li.active > span { border-color: #3bc58f; color: #3bc58f; box-shadow: 0 0 0 4px rgba(59,197,143,.08); animation: breathe 1.4s infinite; }
+.workflow-list li.done > span { color: #d9fff0; background: var(--green); border-color: var(--green); }
+.workflow-list li.failed > span { color: #fff; background: var(--red); border-color: var(--red); }
+.workflow-list .workflow-empty { opacity: .4; }
+.workflow-list strong, .workflow-list small { display: block; }
+.workflow-list strong { font-size: 12px; line-height: 1.25; }
+.workflow-list small { margin-top: 3px; color: #8ca69b; font-size: 10px; line-height: 1.35; }
 .sidebar-footer { display: flex; align-items: center; gap: 9px; flex: 0 0 auto; margin-top: 0; padding: 12px 4px 0; border-top: 1px solid rgba(255,255,255,.08); color: #789187; font-size: 10px; }
 .sidebar-footer svg { width: 17px; color: #4eb88f; }
 .sidebar-close { display: none; width: 34px; height: 34px; margin-left: auto; border: 1px solid rgba(255,255,255,.12); border-radius: 9px; color: #dcebe5; background: rgba(255,255,255,.06); }
@@ -210,7 +209,7 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round
   .project-card { padding: 13px; }
   .project-stats { margin-top: 10px; }
   .system-card { padding: 13px; }
-  .agent-list { margin-top: 11px; gap: 10px; }
+  .workflow-list { margin-top: 11px; gap: 10px; }
   .sidebar-footer { padding-top: 8px; }
 }
 

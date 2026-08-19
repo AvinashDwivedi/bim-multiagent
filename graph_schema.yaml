@@ -20,7 +20,7 @@ level_aliases:
     - קומה א
 
 # Declarative contract between canonical BIM meaning and its Neo4j representation.
-# Agents never invent these labels, properties, or relationships.
+# The pipeline never invents these labels, properties, or relationships.
 node_types:
   client:
     label: Client
@@ -85,7 +85,7 @@ authorization_path:
   source_node: ifc_project
   source_property: source
 
-# General, declarative query surface. Agents use these semantic field names and never
+# General, declarative query surface. Planning uses these semantic field names and never
 # receive permission to invent a label, property, relationship, or Cypher fragment.
 query_entities:
   spaces:
