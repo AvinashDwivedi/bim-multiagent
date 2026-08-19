@@ -55,7 +55,6 @@ async def health(request: Request) -> JSONResponse:
             validate_live_schema(bim, contract, authorization_only=True)
             return {
                 "status": "ok",
-                "project_id": bim.settings.project_id,
                 "source_count": len(summary.get("allowed_sources") or []),
                 "element_count": summary.get("element_count", 0),
                 "contract_version": contract.version,

@@ -1796,17 +1796,25 @@ def _verify_query_evidence(
                 if field.ontology_kind in {"canonical_type", "ifc_class"}
             }
             if classification_fields:
-                classification_ok = (
-                    plan.group_by in classification_fields
-                    or any(
-                        item.field in classification_fields and item.operator in {"equals", "in"}
+                requested_classification_fields = {
+                    binding.semantic_name
+                    for binding in registered.proposal.value_bindings
+                    if binding.semantic_name in classification_fields
+                }
+                classification_ok = not requested_classification_fields or all(
+                    any(
+                        item.field == semantic_name
+                        and item.operator in {"equals", "in", "is_missing"}
                         for item in plan.filters
                     )
+                    for semantic_name in requested_classification_fields
                 )
                 classification_explanation = (
-                    "Classification is either grouped explicitly or constrained by an exact mapped value."
+                    "No specific classification was requested; the query retains the mapped entity scope."
+                    if not requested_classification_fields else
+                    "Every requested classification uses an exact mapped boundary."
                     if classification_ok else
-                    "The plan neither groups by nor exactly constrains the mapped entity classification."
+                    "A requested classification is not constrained by its exact mapped boundary."
                 )
         semantic_checks = [
             {"name": "replay_stability", "passed": replay_ok,
@@ -1849,19 +1857,20 @@ def _verify_query_evidence(
 
 def ensure_bim_verification(context: BimRunContext) -> str | None:
     """Record deterministic verification when query evidence exists but the reviewer did not finish."""
+    query_ids = [
+        evidence_id for evidence_id, evidence in context.evidence.items()
+        if evidence.kind == "query"
+    ]
     existing = next(
         (
             evidence_id for evidence_id, evidence in reversed(list(context.evidence.items()))
             if evidence.kind == "verification"
+            and set(json.loads(evidence.payload).get("verified_evidence_ids") or []) == set(query_ids)
         ),
         None,
     )
     if existing is not None:
         return existing
-    query_ids = [
-        evidence_id for evidence_id, evidence in context.evidence.items()
-        if evidence.kind == "query"
-    ]
     if not query_ids:
         return None
     result = _verify_query_evidence(context, query_ids)
@@ -1880,6 +1889,27 @@ def ensure_bim_verification(context: BimRunContext) -> str | None:
         payload={"verification_evidence_id": verification_id, **result},
     ))
     return verification_id
+
+
+def ensure_compliance_evidence(context: BimRunContext) -> str | None:
+    """Ensure a compliance question has an explicit scoped requirements-availability query."""
+    for evidence_id, evidence in context.evidence.items():
+        if evidence.kind != "query":
+            continue
+        payload = json.loads(evidence.payload)
+        if (payload.get("plan") or {}).get("entity") == "permit_knowledge":
+            return evidence_id
+    if context.task_contract is None:
+        return None
+    return json.loads(query_bim(
+        PipelineContext(context),
+        BimQueryPlan(
+            entity="permit_knowledge",
+            operation="list",
+            select=["name", "summary", "knowledge"],
+            limit=20,
+        ),
+    ))["evidence_id"]
 
 
 def verify_bim_evidence(

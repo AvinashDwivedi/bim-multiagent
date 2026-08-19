@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+from typing import Any
 
 from agents import MaxTurnsExceeded, Runner, trace
 
@@ -12,7 +14,45 @@ from .guardrails import pipeline_report_from_evidence
 from .models import BimRunContext, PipelineReport, ProjectScope
 from .observability import AgentRunHooks, PipelineEvents
 from .registry import build_agent_registry
-from .tools import ensure_bim_verification
+from .tools import ensure_bim_verification, ensure_compliance_evidence
+
+
+def _redact_text(value: str, sensitive_values: list[str]) -> str:
+    redacted = value
+    for secret in sensitive_values:
+        if secret and len(secret) >= 8:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    redacted = re.sub(
+        r"(?i)\b(client_id|project_id|neo4j_uri|neo4j_username|neo4j_password|openai_api_key)\s*[:=]\s*[^\s,;]+",
+        r"\1=[REDACTED]",
+        redacted,
+    )
+    return redacted
+
+
+def _redact_value(value: Any, sensitive_values: list[str]) -> Any:
+    if isinstance(value, str):
+        return _redact_text(value, sensitive_values)
+    if isinstance(value, list):
+        return [_redact_value(item, sensitive_values) for item in value]
+    if isinstance(value, dict):
+        return {key: _redact_value(item, sensitive_values) for key, item in value.items()}
+    return value
+
+
+def redact_pipeline_report(report: PipelineReport, settings: Settings) -> PipelineReport:
+    """Remove configured identifiers and credentials from all user-visible report fields."""
+    sensitive_values = [
+        settings.client_id,
+        settings.project_id,
+        settings.neo4j_uri,
+        settings.neo4j_username,
+        settings.neo4j_password,
+        os.getenv("OPENAI_API_KEY", ""),
+    ]
+    return PipelineReport.model_validate(
+        _redact_value(report.model_dump(mode="json"), sensitive_values)
+    )
 
 
 async def answer_bim_question(
@@ -62,12 +102,11 @@ async def answer_bim_question(
         )
         scoped_input = (
             f"Question: {question}\n"
-            f"Project scope: client_id={settings.client_id}, project_id={settings.project_id}.\n"
-            "Use only authorized project sources."
+            "Use only the configured authorized BIM scope. Do not expose scope identifiers or credentials."
         )
         events.stage("pipeline_start", question=question)
         timeout = timeout_seconds or float(os.getenv("BIM_RUN_TIMEOUT_SECONDS", "240"))
-        with trace("BIM graph-to-Cypher answer", metadata={"project_id": settings.project_id}):
+        with trace("BIM graph-to-Cypher answer", metadata={"authorized_scope": True}):
             async with asyncio.timeout(timeout):
                 try:
                     await Runner.run(
@@ -83,9 +122,13 @@ async def answer_bim_question(
                         "evidence was still independently verified."
                     )
                     events.stage("turn_limit_reached")
+        if re.search(r"\b(compliance|comply|compliant|requirement|requirements)\b", question, re.I):
+            evidence_id = ensure_compliance_evidence(context)
+            if evidence_id:
+                events.stage("compliance_evidence", evidence_id=evidence_id)
         ensure_bim_verification(context)
         report = pipeline_report_from_evidence(context)
         events.stage("pipeline_end", verification_status=report.verification_status)
-        return report
+        return redact_pipeline_report(report, settings)
     finally:
         bim.close()

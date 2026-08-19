@@ -18,6 +18,10 @@ Every response includes an ordered `investigation_trace` built from trusted runt
 the inspection, mapping, query, and verification milestones without exposing prompts, credentials, or
 private model reasoning.
 
+Before a report leaves the runtime, every user-visible field is recursively redacted against the
+configured scope identifiers, database URI and username/password, and API key. The health endpoint also
+returns operational counts only; it does not expose scope identifiers.
+
 The agent has no shell, filesystem-write, or raw database-query tool. It never supplies executable
 Cypher. The Cypher Query Handler owns compilation and rejects mutating or unscoped statements.
 

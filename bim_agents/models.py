@@ -107,6 +107,13 @@ class PipelineReport(BaseModel):
     verification_status: Literal["verified", "insufficient_evidence", "conflict"]
 
 
+class InvestigationCompletion(BaseModel):
+    """Small agent-loop terminator; the runtime builds the authoritative report."""
+
+    status: Literal["ready_for_verification", "insufficient_evidence"]
+    evidence_ids: list[str] = Field(default_factory=list)
+
+
 @dataclass
 class BimRunContext:
     """Trusted state shared by one BIM pipeline run."""

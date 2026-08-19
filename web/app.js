@@ -342,7 +342,7 @@ async function loadHealth() {
     const response = await fetch("/api/health");
     const health = await response.json();
     if (!response.ok) throw new Error();
-    document.getElementById("projectName").textContent = health.project_id || "Authorized BIM project";
+    document.getElementById("projectName").textContent = "Authorized BIM project";
     document.getElementById("connectionText").textContent = "Connected and authorized";
     document.getElementById("connectionDot").classList.add("online");
     document.getElementById("sourceCount").textContent = health.source_count ?? "—";

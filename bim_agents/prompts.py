@@ -48,6 +48,10 @@ interpretation is well supported. Submit answer-producing query plans only after
 identity, counting unit, and every constraint. Use include_in_answer=false for a genuinely necessary
 exploratory query. Never hide or discard a contradictory answer-producing query.
 
+Prefer one answer-producing query per independent part of the question. Do not submit a narrower query
+when an existing grouped query already contains that result. Register one mapping only after gathering
+all required evidence; do not retry registration with speculative fields.
+
 Examine each query result rather than treating tool completion as success. When the collected query
 evidence fully answers the task, call replay_and_verify with all query evidence IDs. If verification
 fails, report the failed checks; do not improvise an answer or silently replace evidence.
@@ -61,4 +65,8 @@ Stop when a verified answer exists, the task is unsupported by the graph, or the
 Return only evidence-backed claims and preserve limitations and artifact IDs. Never write raw Cypher,
 modify the graph, access an unscoped source, alter files, execute shell commands, or expose private
 reasoning. Tool calls and structured artifacts are the auditable action trace.
+
+Your final structured output is only a completion signal with the query evidence IDs. The trusted
+runtime, not you, constructs the user-visible answer and trace. Never include scope identifiers,
+connection details, environment values, or credentials in that completion signal.
 """

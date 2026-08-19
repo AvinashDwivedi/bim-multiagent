@@ -19,7 +19,7 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(index.headers["cache-control"], "no-cache")
             self.assertEqual(asset.headers["cache-control"], "no-cache")
             self.assertIn('id="pipelineWorkflow"', index.text)
-            self.assertIn('/assets/app.js?v=20260819-2', index.text)
+            self.assertIn('/assets/app.js?v=20260819-3', index.text)
             self.assertIn('fetch("/api/chat/stream"', asset.text)
             self.assertIn("report.investigation_trace", asset.text)
             self.assertEqual(client.get("/assets/unknown.js").status_code, 404)
@@ -42,6 +42,7 @@ class WebAppTests(unittest.TestCase):
             response = client.get("/api/health")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["source_count"], 1)
+        self.assertNotIn("project_id", response.json())
         validate.assert_called_once_with(fake_bim, contract, authorization_only=True)
 
     def test_stream_emits_lifecycle_event_then_result(self):

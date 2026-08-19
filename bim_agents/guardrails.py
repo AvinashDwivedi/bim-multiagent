@@ -117,13 +117,24 @@ def verification_report_from_evidence(context: BimRunContext) -> VerificationRep
                 [str(check.get("evidence_id")), evidence_id],
             ))
         else:
+            failed_checks = [
+                item.get("name", "unknown_check")
+                for item in check.get("semantic_checks") or []
+                if item.get("passed") is not True
+            ]
             rejected.append(
-                f"Query evidence {check.get('evidence_id')} did not reproduce the same result digest."
+                f"Query evidence {check.get('evidence_id')} was rejected"
+                + (f" by: {', '.join(failed_checks)}." if failed_checks else ".")
             )
-    if payload.get("verified") is True and claims:
+    if claims:
         limitations.append(
-            "Every result is restricted to the configured client, project, and authorized BIM sources."
+            "Every displayed result is restricted to the configured authorized BIM scope."
         )
+        if rejected:
+            limitations.append(
+                "Some supporting query evidence failed verification and was omitted: "
+                + " ".join(rejected)
+            )
         return VerificationReport(
             status="verified",
             verified_claims=_consolidate_claims(claims),

@@ -17,7 +17,7 @@ from .agent_tools import (
     search_property_values,
     submit_query_plan,
 )
-from .models import BimQueryReport, PipelineReport, VerificationReport
+from .models import BimQueryReport, InvestigationCompletion, VerificationReport
 from .schema_mapping import SchemaMappingReport
 
 
@@ -97,6 +97,6 @@ def build_agent_registry(
             submit_query_plan,
             replay_and_verify,
         ],
-        output_type=PipelineReport,
+        output_type=InvestigationCompletion,
     )
     return BimAgentRegistry(supervisor, explorer, planner, verifier)

@@ -46,3 +46,35 @@ compliance or non-compliance.
   requires a classification filter for a function schedule.
 - The investigator prompt now requires separate BIM-fact and requirement-evidence checks for compliance
   questions and prohibits treating missing requirements as compliant or non-compliant.
+
+## Production rerun supplied by the user
+
+The rerun successfully found 10 function groups covering 380 ground-floor records, then issued two
+additional classification diagnostics. It ended as insufficient evidence after the verifier reviewed all
+three query artifacts.
+
+Root causes:
+
+1. No `permit_knowledge` query was produced, so the compliance half of the task had no requirements evidence.
+2. The explicit `regulatory usage function is missing` diagnostic was rejected by classification-purity
+   verification because `is_missing` was not recognized as an exact classification boundary.
+3. Verification had already run before a deterministic compliance evidence check could be added.
+
+Additional remediation:
+
+- Compliance/requirements wording now triggers a deterministic, authorized `permit_knowledge` availability
+  query before the final verification pass.
+- An explicit `is_missing` classification filter is accepted as a valid diagnostic boundary.
+- Cached verification is reused only when it covers the complete current set of query evidence; adding a
+  requirements query forces a fresh replay of every query.
+
+## Updated live verification
+
+After restarting the port-8000 service, the exact question completed with `verification_status=verified`.
+All four query artifacts passed replay, authorization, identity, constraint, counting-unit, boundary,
+deduplication, classification, and coverage checks. The requirements query again found zero scoped permit
+knowledge records, so the correct compliance conclusion remains “cannot be assessed.”
+
+The updated run took 144.4 seconds, used 12 model calls and 24 tool calls, and returned no scope IDs,
+connection details, usernames, passwords, or API keys. Remaining optimization work is to reduce repeated
+mapping attempts and supporting diagnostic queries; these no longer affect correctness.
