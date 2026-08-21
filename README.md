@@ -63,3 +63,35 @@ python -m bim_agents.webapp
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+## Evaluation
+
+Create a JSON dataset as a list of question/reference-answer records:
+
+```json
+[
+  {
+    "question": "How many apartments are on the ground floor?",
+    "answer": "There are 5 apartments on the ground floor."
+  }
+]
+```
+
+A single `{question, answer}` object, `{ "cases": [...] }`, and a simple
+`{ "question text": "answer text" }` mapping are also accepted.
+
+Run semantic evaluation and save the full report:
+
+```powershell
+python -m bim_agents.evaluator eval-cases.json --output eval-report.json --timeout 360
+```
+
+For deterministic normalized exact matching without a grader model:
+
+```powershell
+python -m bim_agents.evaluator eval-cases.json --judge-mode exact
+```
+
+The report includes the expected and actual answer, pipeline status, latency, exact-match flag,
+semantic correctness/completeness/groundedness scores, pass/fail result, errors, pass rate, and average
+score. Evaluation is sequential by default to avoid overloading the BIM and model services.

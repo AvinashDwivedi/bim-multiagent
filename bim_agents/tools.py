@@ -21,7 +21,7 @@ from .schema_mapping import RegisteredSchemaMapping, SchemaMappingProposal
 
 Operation = Literal[
     "count", "list", "group_count", "group_summary", "distinct",
-    "sum", "average", "minimum", "maximum"
+    "sum", "average", "minimum", "maximum", "maximum_group_sum"
 ]
 
 
@@ -156,7 +156,7 @@ def _resolve_canonical_type(ctx: BimRunContext, term: str) -> tuple[str, dict[st
 def _catalog(ctx: BimRunContext) -> dict[str, Any]:
     common_operations = [
         "count", "list", "group_count", "group_summary", "distinct",
-        "sum", "average", "minimum", "maximum"
+        "sum", "average", "minimum", "maximum", "maximum_group_sum"
     ]
     entities: dict[str, Any] = {}
     for name, entity in ctx.graph_contract.query_entities.items():
@@ -183,6 +183,7 @@ def _catalog(ctx: BimRunContext) -> dict[str, Any]:
         "rules": {
             "group_count_and_distinct": "set group_by",
             "group_summary": "set group_by and a numeric metric; returns count and summed metric per group",
+            "maximum_group_sum": "set group_by and a numeric metric; returns the group with the largest summed metric",
             "numeric_aggregates": "set metric to a numeric field",
             "list": "select fields or use the entity defaults",
             "planning": "select the entity, fields, operation, and whether record details help answer the question",
@@ -368,17 +369,18 @@ def _entity_from_registered_mapping(
     ctx: BimRunContext, plan: BimQueryPlan
 ) -> tuple[QueryEntity, str | None]:
     if not plan.mapping_id:
-        if plan.entity == "permit_knowledge":
-            # A compliance investigation must be able to prove that no scoped
-            # requirement records exist, even after another entity was mapped.
-            return ctx.graph_contract.query_entity(plan.entity), None
-        if len(ctx.schema_mappings) == 1:
-            plan.mapping_id = next(iter(ctx.schema_mappings))
-        else:
+        try:
+            # Versioned contract entities are already trusted semantic mappings.
+            # The compiler still validates fields and enforces source scope.
             entity = ctx.graph_contract.query_entity(plan.entity)
-            if entity.kind == "records":
-                raise ValueError("Record queries require one unambiguous registered live schema mapping.")
             return entity, None
+        except KeyError:
+            if len(ctx.schema_mappings) == 1:
+                plan.mapping_id = next(iter(ctx.schema_mappings))
+            else:
+                raise ValueError(
+                    "Unknown record entities require one unambiguous registered live schema mapping."
+                )
     registered = ctx.schema_mappings.get(plan.mapping_id)
     if not isinstance(registered, RegisteredSchemaMapping):
         raise ValueError(f"Unknown or expired schema mapping {plan.mapping_id!r}.")
@@ -780,11 +782,11 @@ def _validate_plan(entity: QueryEntity, plan: BimQueryPlan) -> None:
         return
     for item in plan.filters:
         _field(entity, item.field)
-    if plan.operation in {"group_count", "group_summary", "distinct"}:
+    if plan.operation in {"group_count", "group_summary", "maximum_group_sum", "distinct"}:
         if not plan.group_by:
             raise ValueError(f"{plan.operation} requires group_by.")
         _field(entity, plan.group_by)
-    if plan.operation == "group_summary":
+    if plan.operation in {"group_summary", "maximum_group_sum"}:
         if not plan.metric:
             raise ValueError("group_summary requires a numeric metric.")
         if _field(entity, plan.metric).data_type != "number":
@@ -941,10 +943,10 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
                 "total_count": matched_count,
                 "displayed_count": len(details),
             }
-        elif plan.operation == "group_summary":
+        elif plan.operation in {"group_summary", "maximum_group_sum"}:
             group = _field(entity, plan.group_by)
             metric = _field(entity, plan.metric)
-            parameters["limit"] = plan.limit
+            parameters["limit"] = 1 if plan.operation == "maximum_group_sum" else plan.limit
             totals = cypher.execute(
                 f"{match_clause} WHERE {where} AND n.`{group.property}` IS NOT NULL "
                 f"RETURN count(DISTINCT n.`{group.property}`) AS total_groups, "
@@ -958,7 +960,7 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
                 f"RETURN n.`{group.property}` AS value, count(DISTINCT {identity}) AS count, "
                 f"sum(toFloat(n.`{metric.property}`)) AS metric_value, "
                 f"count(n.`{metric.property}`) AS metric_records "
-                "ORDER BY count DESC, value LIMIT $limit",
+                "ORDER BY metric_value DESC, value LIMIT $limit",
                 parameters,
             )
 
@@ -981,7 +983,17 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
             level_filter = next(
                 (item for item in normalized_filters if item["field"] == "level"), None
             )
-            if is_function_schedule:
+            if plan.operation == "maximum_group_sum" and rows:
+                winner = rows[0]
+                metric_value = _display_number(winner.get("metric_value"))
+                unit_text = f" {metric.unit}" if metric.unit else ""
+                headline = (
+                    f"The maximum summed {plan.metric.replace('_', ' ')} by "
+                    f"{plan.group_by.replace('_', ' ')} is {metric_value}{unit_text} "
+                    f"at {winner.get('value')}."
+                )
+                detail_rows = []
+            elif is_function_schedule:
                 location = ""
                 if level_filter:
                     requested = (level_filter.get("requested_values") or ["requested level"])[0]
@@ -998,8 +1010,8 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
                 statement += "\n- " + "\n- ".join(detail_rows)
             claim = {
                 "statement": statement,
-                "value": total_groups,
-                "unit": f"{plan.group_by.replace('_', ' ')} groups",
+                "value": winner.get("metric_value") if plan.operation == "maximum_group_sum" and rows else total_groups,
+                "unit": metric.unit if plan.operation == "maximum_group_sum" else f"{plan.group_by.replace('_', ' ')} groups",
                 "basis": (
                     f"Distinct {label}.{identity_property} counts and summed "
                     f"{label}.{metric.property} values grouped by {group.property}."

@@ -1,0 +1,50 @@
+[
+  {
+    "question": "what is the 6th floor area size?",
+    "answer": "The sixth floor has Area: 586.25 m²"
+  },
+  {
+    "question": "what type of functions are in ground floor and does it comply with the requirements?",
+    "answer": "There are 10 types of functions on the ground floor (00 begane grond):\n              - Parking: 355 spaces, covering 297.36 m².\n              - Technical Room: 6 spaces, covering 241.76 m².\n              - Apartment: 5 spaces, covering 198.38 m².\n              - Circulation: 3 spaces, covering 176.27 m².\n              - Retail: 3 spaces, covering 498.1 m².\n              - Amenity: 2 spaces, covering 211.7 m².\n              - Bicycle Storage: 2 spaces, covering 931.34 m².\n              - Storage: 2 spaces, covering 12.95 m².\n              - Horeca: 1 space, covering 260.53 m².\n              - Residential Zone: 1 space, covering 234.34 m².\n              "
+  },
+  {
+    "question": "are there apartments in ground floor?",
+    "answer": "Yes. There are 5 apartments on the ground floor."
+  },
+  {
+    "question": "how many apartments on 7th floor?",
+    "answer": "There are 8 apartments on the seventh floor."
+  },
+  {
+    "question": "How many middle-segment and free sector residential apartments are there?",
+    "answer": "There are 100 apartments in which 5 ground floor apartments that are duplex."
+  },
+  {
+    "question": "whats the height of the building and does it comply with the requirements?",
+    "answer": "The acctual building height is approximately 38.0 m, but the passed height was 41.0 m. As the building reach only 12 floors out of 13 floors."
+  },
+  {
+    "question": "What are the various section heights of the building?",
+    "answer": "11 m, 14m, 38 m"
+  },
+  {
+    "question": "What is the tower's maximum floor area?",
+    "answer": "586.25 m²"
+  },
+  {
+    "question": "What is the opening percentage of the tower facade?",
+    "answer": "Approximately 45%"
+  },
+  {
+    "question": "Whats the ground floor space height?",
+    "answer": "In different elements the ground floor spaces have different heights. The lowest height is 2.5 m then 5.0 m and the highest height is 8.0 m."
+  },
+  {
+    "question": "Are there homes in the model that are smaller than 50m² gross floor area?",
+    "answer": "Er zijn 5 woningen in het BIM-model die kleiner zijn dan 50m² GO.\n\n              - IfcSpace 28 28\n              - Type: Duplex\n              - Oppervlakte: 39.67 m²\n              - Segment: MSH (middenhuur)\n              - Locatie: 00 begane grond\n              - Eigenaar: Belegger\n              - Kamertype: Loftwoning\n\n              - IfcSpace 29 29\n              - Type: Duplex\n              - Oppervlakte: 39.67 m²\n              - Segment: MSH (middenhuur)\n              - Locatie: 00 begane grond\n              - Eigenaar: Belegger\n              - Kamertype: Loftwoning\n\n              - IfcSpace 30 30\n              - Type: Duplex\n              - Oppervlakte: 39.67 m²\n              - Segment: MSH (middenhuur)\n              - Locatie: 00 begane grond\n              - Eigenaar: Belegger\n              - Kamertype: Loftwoning\n\n              - IfcSpace 31 31\n              - Type: Duplex\n              - Oppervlakte: 39.67 m²\n              - Segment: MSH (middenhuur)\n              - Locatie: 00 begane grond\n              - Eigenaar: Belegger\n              - Kamertype: Loftwoning\n\n              - IfcSpace 32 32\n              - Type: Duplex\n              - Oppervlakte: 39.67 m²\n              - Segment: MSH (middenhuur)\n              - Locatie: 00 begane grond\n              - Eigenaar: Belegger\n              - Kamertype: Loftwoning\n              "
+  },
+  {
+    "question": "How many units are in the building and how many on the ground floor?",
+    "answer": "There are 100 modelled apartment units in the building, of which 5 are on the ground floor."
+  }
+]

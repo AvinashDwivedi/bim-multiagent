@@ -50,6 +50,11 @@ node_types:
     identity_property: object_id
     properties: [object_id, source, IFCtype, name, canonical_type, canonical_level, canonical_area_m2]
 
+  ifc_storey:
+    label: IfcBuildingStorey
+    identity_property: GlobalID
+    properties: [GlobalID, source, name, canonical_level, placement_z]
+
   canonical_measure:
     label: CanonicalMeasure
     identity_property: id
@@ -124,6 +129,31 @@ query_entities:
         data_type: number
         unit: m²
         description: Canonical space area in square metres when modelled.
+      area_basis:
+        property: Bepalingsmethode
+        description: Measurement basis such as BVO (gross), GO, NVO, or VVO.
+
+  levels:
+    kind: records
+    description: Building storeys and their reference elevations; elevations are not heights.
+    node_type: ifc_storey
+    identity_property: GlobalID
+    source_property: source
+    default_select: [name, level, elevation_m]
+    fields:
+      name:
+        property: name
+        description: Storey name.
+      level:
+        property: canonical_level
+        description: Canonical storey designation.
+        ontology_kind: level
+      elevation_m:
+        property: placement_z
+        data_type: number
+        unit: m
+        description: Storey reference elevation in metres; not a height or clear-height measurement.
+
   elements:
     kind: records
     description: Physical and spatial IFC products in the authorized BIM model.

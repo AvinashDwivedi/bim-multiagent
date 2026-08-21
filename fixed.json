@@ -1,0 +1,54 @@
+[
+  {
+    "question": "what is the 6th floor area size?",
+    "answer": "The sixth floor has 635.358 m² of BVO (gross floor area) and 472.516 m² of GO area, for 1,107.874 m² across all modelled area bases. The basis must be stated rather than combining these as one unqualified floor-area measurement."
+  },
+  {
+    "question": "what type of functions are in ground floor and does it comply with the requirements?",
+    "answer": "There are 10 types of functions on the ground floor (00 begane grond):\n              - Parking: 355 spaces, covering 297.36 m².\n              - Technical Room: 6 spaces, covering 241.76 m².\n              - Apartment: 5 spaces, covering 198.38 m².\n              - Circulation: 3 spaces, covering 176.27 m².\n              - Retail: 3 spaces, covering 498.1 m².\n              - Amenity: 2 spaces, covering 211.7 m².\n              - Bicycle Storage: 2 spaces, covering 931.34 m².\n              - Storage: 2 spaces, covering 12.95 m².\n              - Horeca: 1 space, covering 260.53 m².\n              - Residential Zone: 1 space, covering 234.34 m².\n              "
+  },
+  {
+    "question": "are there apartments in ground floor?",
+    "answer": "Yes. There are 5 apartments on the ground floor."
+  },
+  {
+    "question": "how many apartments on 7th floor?",
+    "answer": "There are 8 apartments on the seventh floor."
+  },
+  {
+    "question": "How many middle-segment and free sector residential apartments are there?",
+    "answer": "There are 105 apartments classified with the MSH middle-segment code. No apartment has a separate explicit free-sector segment classification in the available model, so a distinct free-sector count cannot be established."
+  },
+  {
+    "question": "whats the height of the building and does it comply with the requirements?",
+    "answer": "The building height and compliance cannot be assessed because no trusted building-height metric or applicable project-scoped requirement records are available. Storey reference elevations must not be reported as building height."
+  },
+  {
+    "question": "What are the various section heights of the building?",
+    "answer": "The section heights cannot be assessed because no trusted section-height metric is modelled. Storey reference elevations are not section heights."
+  },
+  {
+    "question": "What is the tower's maximum floor area?",
+    "answer": "The tower's maximum floor area cannot be assessed safely because the tower scope is not explicitly represented in the model and the requested floor-area basis is unspecified."
+  },
+  {
+    "question": "What is the opening percentage of the tower facade?",
+    "answer": "The facade opening percentage cannot be assessed because the model has neither a trusted opening-percentage metric nor compatible opening-area and total facade-area measurements."
+  },
+  {
+    "question": "Whats the ground floor space height?",
+    "answer": "The ground-floor space height cannot be assessed because no trusted clear-height or space-height metric is modelled. Storey reference elevation is not space height."
+  },
+  {
+    "question": "How high is the model and is this allowed according to the documents?",
+    "answer": "The model height and whether it is allowed cannot be assessed because no trusted model-height metric is available for comparison. Storey reference elevations are not model height, and no applicable scoped requirement can support an allowance conclusion."
+  },
+  {
+    "question": "Are there homes in the model that are smaller than 50m² gross floor area?",
+    "answer": "Er zijn 5 woningen in het BIM-model die kleiner zijn dan 50m² GO.\n\n              - IfcSpace 28 28\n              - Type: Duplex\n              - Oppervlakte: 39.67 m²\n              - Segment: MSH (middenhuur)\n              - Locatie: 00 begane grond\n              - Eigenaar: Belegger\n              - Kamertype: Loftwoning\n\n              - IfcSpace 29 29\n              - Type: Duplex\n              - Oppervlakte: 39.67 m²\n              - Segment: MSH (middenhuur)\n              - Locatie: 00 begane grond\n              - Eigenaar: Belegger\n              - Kamertype: Loftwoning\n\n              - IfcSpace 30 30\n              - Type: Duplex\n              - Oppervlakte: 39.67 m²\n              - Segment: MSH (middenhuur)\n              - Locatie: 00 begane grond\n              - Eigenaar: Belegger\n              - Kamertype: Loftwoning\n\n              - IfcSpace 31 31\n              - Type: Duplex\n              - Oppervlakte: 39.67 m²\n              - Segment: MSH (middenhuur)\n              - Locatie: 00 begane grond\n              - Eigenaar: Belegger\n              - Kamertype: Loftwoning\n\n              - IfcSpace 32 32\n              - Type: Duplex\n              - Oppervlakte: 39.67 m²\n              - Segment: MSH (middenhuur)\n              - Locatie: 00 begane grond\n              - Eigenaar: Belegger\n              - Kamertype: Loftwoning\n              "
+  },
+  {
+    "question": "How many units are in the building and how many on the ground floor?",
+    "answer": "There are 105 modelled apartment units in the building, of which 5 are on the ground floor."
+  }
+]

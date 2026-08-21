@@ -223,7 +223,7 @@ class DynamicSchemaMappingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "registered exact value binding"):
             _execute_plan(context, plan)
 
-    def test_single_registered_mapping_is_authoritative_over_plan_display_name(self):
+    def test_contract_entity_is_preferred_without_explicit_mapping_id(self):
         mapping = RegisteredSchemaMapping(
             mapping_id="mapping-only",
             proposal=SchemaMappingProposal(
@@ -250,9 +250,9 @@ class DynamicSchemaMappingTests(unittest.TestCase):
 
         entity, label = _entity_from_registered_mapping(context, plan)
 
-        self.assertEqual(plan.mapping_id, "mapping-only")
-        self.assertEqual(label, "ObservedSpace")
-        self.assertEqual(entity.identity_property, "space_key")
+        self.assertEqual(plan.mapping_id, "")
+        self.assertIsNone(label)
+        self.assertEqual(entity.identity_property, "object_id")
 
 
 if __name__ == "__main__":

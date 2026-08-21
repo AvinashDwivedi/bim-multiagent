@@ -55,6 +55,41 @@ def redact_pipeline_report(report: PipelineReport, settings: Settings) -> Pipeli
     )
 
 
+def _capability_gap(question: str, contract) -> str | None:
+    """Fail fast when a requested derived metric has no trusted query representation."""
+    text = question.casefold()
+    fields = {
+        field_name.casefold()
+        for entity in contract.query_entities.values()
+        for field_name in entity.fields
+    }
+    if ("opening percentage" in text or "facade percentage" in text or "façade percentage" in text):
+        if not ({"opening_area_m2", "facade_area_m2"} <= fields or "opening_percentage" in fields):
+            return (
+                "The façade opening percentage is not assessable: the trusted BIM query contract has "
+                "neither a modelled opening percentage nor compatible opening-area and façade-area metrics."
+            )
+    requested_height_fields: set[str] = set()
+    label = ""
+    # A building "section height" commonly means the absolute height/elevation of
+    # a massing section (for example a roof or setback), not a clear or
+    # floor-to-floor height.  Let the investigator resolve that meaning against
+    # section/roof elements and the trusted level elevations instead of rejecting
+    # the question before any graph inspection occurs.
+    if "space height" in text or "clear height" in text:
+        requested_height_fields = {"space_height_m", "clear_height_m"}
+        label = "space height"
+    elif "how high" in text or "model height" in text or "building height" in text:
+        requested_height_fields = {"model_height_m", "building_height_m"}
+        label = "model height"
+    if requested_height_fields and not (requested_height_fields & fields):
+        return (
+            f"The requested {label} cannot be assessed because no corresponding trusted height metric "
+            "is modelled. Storey reference elevations, where present, are not treated as heights."
+        )
+    return None
+
+
 async def answer_bim_question(
     question: str,
     *,
@@ -94,6 +129,17 @@ async def answer_bim_question(
             max_agent_starts=int(os.getenv("BIM_MAX_AGENT_STARTS", "30")),
             max_starts_per_agent=int(os.getenv("BIM_MAX_STARTS_PER_AGENT", "6")),
         )
+        capability_gap = _capability_gap(question, contract)
+        if capability_gap:
+            report = PipelineReport(
+                answer=capability_gap,
+                limitations=[capability_gap],
+                stages_used=["Capability Guard"],
+                investigation_trace=[f"Capability Guard: {capability_gap}"],
+                verification_status="insufficient_evidence",
+            )
+            events.stage("capability_gap")
+            return redact_pipeline_report(report, settings)
         run_hooks = AgentRunHooks(events)
         registry = build_agent_registry(
             model or os.getenv("BIM_AGENT_MODEL", "gpt-5.6-sol"),
@@ -109,13 +155,19 @@ async def answer_bim_question(
         with trace("BIM graph-to-Cypher answer", metadata={"authorized_scope": True}):
             async with asyncio.timeout(timeout):
                 try:
-                    await Runner.run(
+                    run_result = await Runner.run(
                         registry.supervisor,
                         scoped_input,
                         context=context,
                         max_turns=int(os.getenv("BIM_SUPERVISOR_MAX_TURNS", "24")),
                         hooks=run_hooks,
                     )
+                    completion = run_result.final_output
+                    context.completion_status = getattr(completion, "status", None)
+                    if getattr(completion, "status", None) == "insufficient_evidence":
+                        context.runtime_limitations.extend(
+                            str(item) for item in getattr(completion, "limitations", []) if str(item).strip()
+                        )
                 except MaxTurnsExceeded:
                     context.runtime_limitations.append(
                         "The investigation reached its configured turn limit; any completed query "

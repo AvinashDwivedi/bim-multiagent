@@ -159,7 +159,15 @@ def pipeline_report_from_evidence(context: BimRunContext) -> PipelineReport:
         for artifact in context.artifacts.values()
     ]
     if verification.status == "verified" and verification.verified_claims:
-        answer = "\n\n".join(_render_claim_answer(claim) for claim in verification.verified_claims)
+        verified_answer = "\n\n".join(
+            _render_claim_answer(claim) for claim in verification.verified_claims
+        )
+        if context.completion_status == "insufficient_evidence" and context.runtime_limitations:
+            answer = "\n\n".join(context.runtime_limitations + ["Verified diagnostic facts:\n" + verified_answer])
+            status = "insufficient_evidence"
+        else:
+            answer = verified_answer
+            status = "verified"
         return PipelineReport(
             answer=answer,
             claims=verification.verified_claims,
@@ -168,7 +176,7 @@ def pipeline_report_from_evidence(context: BimRunContext) -> PipelineReport:
             artifact_ids=list(context.artifacts),
             investigation_trace=investigation_trace,
             semantic_checks=verification.semantic_checks,
-            verification_status="verified",
+            verification_status=status,
         )
     return PipelineReport(
         answer="The BIM question could not be verified from the available scoped evidence.",

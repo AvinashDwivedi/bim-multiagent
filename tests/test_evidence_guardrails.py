@@ -266,6 +266,35 @@ class EvidenceGuardrailTests(unittest.TestCase):
 
         self.assertIn("turn limit", " ".join(report.limitations))
 
+    def test_measurement_gap_leads_with_not_assessable_diagnostic(self):
+        context = BimRunContext(
+            bim=object(),
+            scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+            completion_status="insufficient_evidence",
+            runtime_limitations=["Gross floor area is not assessable from the modelled basis."],
+        )
+        context.add_evidence(Evidence(
+            evidence_id="verification-basis-gap",
+            kind="verification",
+            summary="verified diagnostic",
+            payload=json.dumps({
+                "verified": True,
+                "checks": [{
+                    "evidence_id": "query-bvo",
+                    "verified": True,
+                    "claim": {"statement": "There are 0 BVO apartment records.", "value": 0, "basis": "test"},
+                    "semantic_checks": [],
+                }],
+            }),
+        ))
+
+        report = pipeline_report_from_evidence(context)
+
+        self.assertEqual(report.verification_status, "insufficient_evidence")
+        self.assertTrue(report.answer.startswith("Gross floor area is not assessable"))
+        self.assertIn("Verified diagnostic facts", report.answer)
+
     def test_compliance_evidence_is_added_when_requirements_query_is_missing(self):
         context = BimRunContext(
             bim=object(),

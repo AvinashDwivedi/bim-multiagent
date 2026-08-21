@@ -31,7 +31,7 @@ class BimTaskContract(BaseModel):
     goal: str
     operation: Literal[
         "count", "count_distinct", "list", "group_count", "group_summary", "distinct",
-        "sum", "average", "minimum", "maximum", "project_graph_count",
+        "sum", "average", "minimum", "maximum", "maximum_group_sum", "project_graph_count",
     ]
     entity_concept: str
     constraints: list[TaskConstraint] = Field(default_factory=list)
@@ -112,6 +112,7 @@ class InvestigationCompletion(BaseModel):
 
     status: Literal["ready_for_verification", "insufficient_evidence"]
     evidence_ids: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
 
 
 @dataclass
@@ -136,6 +137,7 @@ class BimRunContext:
     max_agent_starts: int = 30
     max_starts_per_agent: int = 6
     runtime_limitations: list[str] = field(default_factory=list)
+    completion_status: Literal["ready_for_verification", "insufficient_evidence"] | None = None
     _lock: RLock = field(default_factory=RLock, repr=False)
 
     def add_evidence(self, item: Evidence) -> None:

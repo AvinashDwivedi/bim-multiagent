@@ -8,6 +8,7 @@ from . import prompts
 from .agent_tools import (
     create_task_contract,
     inspect_graph_structure,
+    inspect_query_capabilities,
     inspect_node_inventory,
     profile_node_properties,
     register_schema_mapping,
@@ -87,6 +88,7 @@ def build_agent_registry(
         model_settings=_settings("high"),
         tools=[
             create_task_contract,
+            inspect_query_capabilities,
             inspect_graph_structure,
             inspect_node_inventory,
             profile_node_properties,

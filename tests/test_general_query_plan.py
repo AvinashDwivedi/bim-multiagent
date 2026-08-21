@@ -35,6 +35,16 @@ class GeneralQueryPlanTests(unittest.TestCase):
         )
         _validate_plan(self.contract.query_entity(plan.entity), plan)
 
+    def test_accepts_maximum_summed_area_by_level_with_gross_basis(self):
+        plan = BimQueryPlan(
+            entity="spaces",
+            operation="maximum_group_sum",
+            group_by="level",
+            metric="area_m2",
+            filters=[BimFilter(field="area_basis", operator="equals", value="BVO")],
+        )
+        _validate_plan(self.contract.query_entity(plan.entity), plan)
+
     def test_group_summary_requires_numeric_metric(self):
         plan = BimQueryPlan(
             entity="spaces",

@@ -21,8 +21,13 @@ class GraphContractTests(unittest.TestCase):
         spaces = contract.query_entity("spaces")
         self.assertEqual(contract.node(spaces.node_type).label, "IfcSpace")
         self.assertEqual(spaces.fields["type"].ontology_kind, "canonical_type")
+        self.assertEqual(spaces.fields["area_basis"].property, "Bepalingsmethode")
         self.assertNotIn("segment", spaces.fields)
         self.assertIn("object_id", spaces.default_select)
+
+        levels = contract.query_entity("levels")
+        self.assertEqual(contract.node(levels.node_type).label, "IfcBuildingStorey")
+        self.assertEqual(levels.fields["elevation_m"].property, "placement_z")
 
         graph = contract.query_entity("project_graph")
         self.assertEqual(graph.kind, "project_graph")

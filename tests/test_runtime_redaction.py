@@ -2,10 +2,30 @@ import unittest
 
 from bim_context import Settings
 from bim_agents.models import Claim, PipelineReport
-from bim_agents.runtime import redact_pipeline_report
+from bim_agents.graph_contract import load_graph_contract
+from bim_agents.runtime import _capability_gap, redact_pipeline_report
 
 
 class RuntimeRedactionTests(unittest.TestCase):
+    def test_capability_gap_does_not_conflate_elevation_with_height(self):
+        contract = load_graph_contract()
+        self.assertIsNone(_capability_gap(
+            "What are the various section heights of the building?", contract
+        ))
+        self.assertIn("cannot be assessed", _capability_gap(
+            "Whats the ground floor space height?", contract
+        ))
+        self.assertIn("not treated as heights", _capability_gap(
+            "How high is the model?", contract
+        ))
+
+    def test_capability_gap_requires_both_facade_ratio_operands(self):
+        gap = _capability_gap(
+            "What is the opening percentage of the tower facade?",
+            load_graph_contract(),
+        )
+        self.assertIn("opening-area and façade-area", gap)
+
     def test_removes_scope_ids_and_credentials_from_every_report_field(self):
         settings = Settings(
             neo4j_uri="neo4j+s://private.example",

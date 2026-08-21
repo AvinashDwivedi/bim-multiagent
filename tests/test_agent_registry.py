@@ -36,6 +36,7 @@ class AgentRegistryTests(unittest.TestCase):
             tool_names,
             {
                 "create_task_contract",
+                "inspect_query_capabilities",
                 "inspect_graph_structure",
                 "inspect_node_inventory",
                 "profile_node_properties",

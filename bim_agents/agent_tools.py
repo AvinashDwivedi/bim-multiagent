@@ -9,6 +9,7 @@ from .tools import (
     PipelineContext,
     define_bim_task as _define_bim_task,
     inspect_project_graph_structure as _inspect_graph,
+    get_bim_query_catalog as _get_catalog,
     inspect_queryable_node_types as _inspect_nodes,
     profile_project_properties as _profile_properties,
     query_bim as _query_bim,
@@ -30,6 +31,12 @@ def create_task_contract(
 ) -> str:
     """Create the question's operation, constraints, open questions, and success criteria."""
     return _define_bim_task(_ctx(ctx), contract)
+
+
+@function_tool
+def inspect_query_capabilities(ctx: RunContextWrapper[BimRunContext]) -> str:
+    """Inspect trusted contract-backed entities, fields, operations, and measurement semantics."""
+    return _get_catalog(_ctx(ctx))
 
 
 @function_tool
