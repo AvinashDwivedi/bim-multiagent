@@ -12,6 +12,8 @@ from .runtime import answer_bim_question
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a project-scoped BIM calculation pipeline.")
     parser.add_argument("question", help="The BIM question to answer")
+    parser.add_argument("--client-id", help="Client UUID for this request (overrides BIM_CLIENT_ID)")
+    parser.add_argument("--project-id", help="Project UUID for this request (overrides BIM_PROJECT_ID)")
     parser.add_argument("--timeout", type=float, default=None, help="Maximum total runtime in seconds (default: 240)")
     parser.add_argument("--log-file", help="Also write detailed lifecycle logs to this file")
     parser.add_argument("--quiet", action="store_true", help="Hide progress logs")
@@ -21,6 +23,8 @@ def main() -> None:
         report = asyncio.run(
             answer_bim_question(
                 args.question,
+                client_id=args.client_id,
+                project_id=args.project_id,
                 timeout_seconds=args.timeout,
                 hooks=PipelineEvents(logger),
             )

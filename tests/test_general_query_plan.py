@@ -25,6 +25,17 @@ class GeneralQueryPlanTests(unittest.TestCase):
         )
         _validate_plan(self.contract.query_entity(plan.entity), plan)
 
+    def test_accepts_distinct_physical_dwelling_identity(self):
+        contract = load_graph_contract(
+            client_id="653fbe80-e4c5-11ed-95e8-fdb8a484b2c4",
+            project_id="858ef0f0-454a-11f1-8957-1fe1b101e373",
+        )
+        plan = BimQueryPlan(
+            entity="spaces", operation="count_distinct", group_by="dwelling_unit_number",
+            filters=[BimFilter(field="type", operator="equals", value="apartment")],
+        )
+        _validate_plan(contract.query_entity("spaces"), plan)
+
     def test_accepts_space_function_group_summary(self):
         plan = BimQueryPlan(
             entity="spaces",
@@ -34,6 +45,23 @@ class GeneralQueryPlanTests(unittest.TestCase):
             filters=[BimFilter(field="level", operator="equals", value="ground floor")],
         )
         _validate_plan(self.contract.query_entity(plan.entity), plan)
+
+    def test_accepts_multi_dimensional_group_summary(self):
+        plan = BimQueryPlan(
+            entity="elements", operation="multi_group_summary",
+            group_by_fields=["ifc_class", "level"], metric="area_m2",
+            role="answer_producing", answer_key="area_by_class_and_level",
+            satisfies=["class", "level", "total area"],
+        )
+        _validate_plan(self.contract.query_entity(plan.entity), plan)
+
+    def test_multi_grouping_rejects_duplicate_dimensions(self):
+        plan = BimQueryPlan(
+            entity="elements", operation="multi_group_count",
+            group_by_fields=["ifc_class", "ifc_class"],
+        )
+        with self.assertRaisesRegex(ValueError, "duplicates"):
+            _validate_plan(self.contract.query_entity(plan.entity), plan)
 
     def test_accepts_maximum_summed_area_by_level_with_gross_basis(self):
         plan = BimQueryPlan(

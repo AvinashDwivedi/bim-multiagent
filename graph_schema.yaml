@@ -48,7 +48,7 @@ node_types:
   ifc_space:
     label: IfcSpace
     identity_property: object_id
-    properties: [object_id, source, IFCtype, name, canonical_type, canonical_level, canonical_area_m2]
+    properties: [object_id, source, IFCtype, name, canonical_type, canonical_level, canonical_area_m2, placement_z]
 
   ifc_storey:
     label: IfcBuildingStorey
@@ -101,7 +101,7 @@ query_entities:
     source_property: source
     classification_source_property: function_source_term
     classification_name_property: name
-    default_select: [object_id, ifc_class, name, type, level]
+    default_select: [object_id, ifc_class, name, type, level, area_m2, area_basis, elevation_m]
     fields:
       object_id:
         property: object_id
@@ -132,6 +132,11 @@ query_entities:
       area_basis:
         property: Bepalingsmethode
         description: Measurement basis such as BVO (gross), GO, NVO, or VVO.
+      elevation_m:
+        property: placement_z
+        data_type: number
+        unit: m
+        description: Revit/IFC placement elevation above project datum; a geometric position, not automatically a space height.
 
   levels:
     kind: records

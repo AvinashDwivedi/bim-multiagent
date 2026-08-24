@@ -12,10 +12,10 @@ class RuntimeRedactionTests(unittest.TestCase):
         self.assertIsNone(_capability_gap(
             "What are the various section heights of the building?", contract
         ))
-        self.assertIn("cannot be assessed", _capability_gap(
+        self.assertIn("vertical positions", _capability_gap(
             "Whats the ground floor space height?", contract
         ))
-        self.assertIn("not treated as heights", _capability_gap(
+        self.assertIsNone(_capability_gap(
             "How high is the model?", contract
         ))
 

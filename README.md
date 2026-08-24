@@ -52,6 +52,15 @@ and verification finish.
 python -m bim_agents.cli "How many apartments are on the ground floor?"
 ```
 
+For request-scoped execution, pass both scope UUIDs explicitly. These values select authorization,
+graph-schema overlays, and project knowledge for this request instead of using the `.env` scope:
+
+```powershell
+python -m bim_agents.cli "How many apartments are there?" `
+  --client-id 653fbe80-e4c5-11ed-95e8-fdb8a484b2c4 `
+  --project-id 858ef0f0-454a-11f1-8957-1fe1b101e373
+```
+
 ## Web application
 
 ```powershell

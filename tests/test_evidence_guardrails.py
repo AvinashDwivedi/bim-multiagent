@@ -228,6 +228,58 @@ class EvidenceGuardrailTests(unittest.TestCase):
         self.assertEqual(report.claims[0].value, 10)
         self.assertIn("omitted", " ".join(report.limitations))
 
+    def test_conflicting_answer_key_values_are_not_rendered(self):
+        context = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+        )
+        plans = [
+            BimQueryPlan(entity="elements", operation="count", answer_key="switch_count"),
+            BimQueryPlan(entity="elements", operation="count", answer_key="switch_count"),
+        ]
+        context.add_evidence(Evidence(
+            evidence_id="verification-conflict", kind="verification", summary="conflict",
+            payload=json.dumps({"checks": [
+                {"evidence_id": f"q-{value}", "verified": True,
+                 "plan": plan.model_dump(mode="json"),
+                 "claim": {"statement": f"{value} switches", "value": value,
+                           "unit": "switches", "basis": "test"}, "semantic_checks": []}
+                for value, plan in zip((21, 37), plans)
+            ]}),
+        ))
+        report = pipeline_report_from_evidence(context)
+        self.assertEqual(report.verification_status, "insufficient_evidence")
+        self.assertNotIn("21 switches", report.answer)
+        self.assertIn("Conflicting", " ".join(report.limitations))
+
+    def test_missing_required_output_marks_partial_answer_insufficient(self):
+        context = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+            task_contract=BimTaskContract(
+                goal="Tray schedule", operation="group_summary", entity_concept="cable trays",
+                required_outputs=["type", "width", "material availability"],
+                success_criteria=["All requested dimensions are verified"],
+            ),
+        )
+        plan = BimQueryPlan(
+            entity="elements", operation="group_count", group_by="type",
+            answer_key="tray_types", satisfies=["type"],
+        )
+        context.add_evidence(Evidence(
+            evidence_id="verification-partial-required", kind="verification", summary="partial",
+            payload=json.dumps({"checks": [{
+                "evidence_id": "q-types", "verified": True,
+                "plan": plan.model_dump(mode="json"),
+                "claim": {"statement": "Two tray types.", "value": 2, "basis": "test"},
+                "semantic_checks": [],
+            }]}),
+        ))
+        report = pipeline_report_from_evidence(context)
+        self.assertEqual(report.verification_status, "insufficient_evidence")
+        self.assertIn("Two tray types", report.answer)
+        self.assertIn("material availability", " ".join(report.limitations))
+
     def test_pipeline_report_exposes_ordered_artifact_trace(self):
         context = BimRunContext(
             bim=object(),

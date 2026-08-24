@@ -54,6 +54,16 @@ def _render_claim_answer(claim: Claim) -> str:
     return claim.statement + "\n\n- " + "\n\n- ".join(claim.details)
 
 
+def _is_answer_plan(plan: dict) -> bool:
+    """Honor explicit evidence roles while retaining legacy include_in_answer plans."""
+    if plan.get("include_in_answer") is False:
+        return False
+    role = plan.get("role")
+    if role is not None:
+        return role == "answer_producing"
+    return plan.get("include_in_answer", True) is True
+
+
 def _consolidate_claims(claims: list[Claim]) -> list[Claim]:
     """Collapse duplicate conclusions, retaining the version with the richer details."""
     consolidated: dict[tuple, Claim] = {}
@@ -77,7 +87,7 @@ def query_report_from_evidence(context: BimRunContext) -> BimQueryReport:
         if evidence.kind != "query":
             continue
         payload = json.loads(evidence.payload)
-        include_in_answer = (payload.get("plan") or {}).get("include_in_answer", True)
+        include_in_answer = _is_answer_plan(payload.get("plan") or {})
         if include_in_answer:
             claims.append(_claim_from_payload(payload, [evidence_id]))
             limitations.extend(payload.get("limitations") or [])
@@ -103,8 +113,11 @@ def verification_report_from_evidence(context: BimRunContext) -> VerificationRep
     claims: list[Claim] = []
     rejected: list[str] = []
     semantic_checks: list[SemanticCheck] = []
+    verified_entries: list[tuple[Claim, dict]] = []
+    satisfied_outputs: set[str] = set()
     for check in payload.get("checks") or []:
-        include_in_answer = (check.get("plan") or {}).get("include_in_answer", True)
+        plan = check.get("plan") or {}
+        include_in_answer = _is_answer_plan(plan)
         if include_in_answer:
             limitations.extend(check.get("limitations") or [])
         semantic_checks.extend(
@@ -112,11 +125,13 @@ def verification_report_from_evidence(context: BimRunContext) -> VerificationRep
             for item in check.get("semantic_checks") or []
         )
         if check.get("verified") is True and include_in_answer:
-            claims.append(_claim_from_payload(
+            claim = _claim_from_payload(
                 {"claim": check.get("claim") or {}},
                 [str(check.get("evidence_id")), evidence_id],
-            ))
-        else:
+            )
+            verified_entries.append((claim, plan))
+            satisfied_outputs.update(str(item) for item in plan.get("satisfies") or [])
+        elif include_in_answer:
             failed_checks = [
                 item.get("name", "unknown_check")
                 for item in check.get("semantic_checks") or []
@@ -126,6 +141,31 @@ def verification_report_from_evidence(context: BimRunContext) -> VerificationRep
                 f"Query evidence {check.get('evidence_id')} was rejected"
                 + (f" by: {', '.join(failed_checks)}." if failed_checks else ".")
             )
+    conflicts: set[str] = set()
+    by_answer_key: dict[str, set[tuple]] = {}
+    for claim, plan in verified_entries:
+        answer_key = str(plan.get("answer_key") or "").strip()
+        if answer_key:
+            by_answer_key.setdefault(answer_key, set()).add((str(claim.value), claim.unit))
+    conflicts = {key for key, values in by_answer_key.items() if len(values) > 1}
+    if conflicts:
+        limitations.append(
+            "Conflicting verified values were produced for: " + ", ".join(sorted(conflicts)) + "."
+        )
+    for claim, plan in verified_entries:
+        answer_key = str(plan.get("answer_key") or "").strip()
+        if answer_key in conflicts:
+            rejected.append(
+                f"Conflicting verified values were produced for atomic answer {answer_key!r}."
+            )
+        else:
+            claims.append(claim)
+    required_outputs = set(context.task_contract.required_outputs if context.task_contract else [])
+    missing_outputs = sorted(required_outputs - satisfied_outputs)
+    if missing_outputs:
+        limitations.append(
+            "The investigation did not verify every required output: " + ", ".join(missing_outputs) + "."
+        )
     if claims:
         limitations.append(
             "Every displayed result is restricted to the configured authorized BIM scope."
@@ -136,7 +176,7 @@ def verification_report_from_evidence(context: BimRunContext) -> VerificationRep
                 + " ".join(rejected)
             )
         return VerificationReport(
-            status="verified",
+            status="insufficient_evidence" if conflicts or missing_outputs else "verified",
             verified_claims=_consolidate_claims(claims),
             limitations=list(dict.fromkeys(limitations)),
             semantic_checks=semantic_checks,
@@ -158,11 +198,13 @@ def pipeline_report_from_evidence(context: BimRunContext) -> PipelineReport:
         f"{artifact.producer}: {artifact.summary}"
         for artifact in context.artifacts.values()
     ]
-    if verification.status == "verified" and verification.verified_claims:
+    if verification.verified_claims:
         verified_answer = "\n\n".join(
             _render_claim_answer(claim) for claim in verification.verified_claims
         )
-        if context.completion_status == "insufficient_evidence" and context.runtime_limitations:
+        if verification.status != "verified" or (
+            context.completion_status == "insufficient_evidence" and context.runtime_limitations
+        ):
             answer = "\n\n".join(context.runtime_limitations + ["Verified diagnostic facts:\n" + verified_answer])
             status = "insufficient_evidence"
         else:
@@ -176,6 +218,7 @@ def pipeline_report_from_evidence(context: BimRunContext) -> PipelineReport:
             artifact_ids=list(context.artifacts),
             investigation_trace=investigation_trace,
             semantic_checks=verification.semantic_checks,
+            failure_categories=list(dict.fromkeys(context.failure_categories)),
             verification_status=status,
         )
     return PipelineReport(
@@ -185,5 +228,6 @@ def pipeline_report_from_evidence(context: BimRunContext) -> PipelineReport:
         artifact_ids=list(context.artifacts),
         investigation_trace=investigation_trace,
         semantic_checks=verification.semantic_checks,
+        failure_categories=list(dict.fromkeys(context.failure_categories)),
         verification_status="insufficient_evidence",
     )

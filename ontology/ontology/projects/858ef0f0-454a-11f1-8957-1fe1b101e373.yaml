@@ -1,0 +1,65 @@
+# Project-scoped BIM query knowledge for this Revit model. These are interpretation
+# rules over observed graph fields and quantities, not global IFC assumptions.
+bim_query_knowledge:
+  facts:
+    middle_and_free_sector_apartments:
+      value: 70
+      unit: apartments
+      statement: There are 70 residential apartments in the combined middle-segment and free-sector project scope.
+      basis: Curated project-program requirement; distinct from raw Revit space-record counts.
+
+  area_plan:
+    floor_plate_basis: BVO
+    floor_plate_type: residential_zone
+    semantics: >-
+      A BVO residential-zone record represents the residential floor plate. Other
+      area-plan records can overlap it and must not be added to that plate.
+
+  massing_sections:
+    calculation: section_heights
+    slab_label: IfcSlab
+    predefined_type_property: PredefinedType
+    predefined_type_value: ROOF
+    quantity_set: Qto_SlabBaseQuantities
+    area_quantity: GrossArea
+    primary_plate_min_largest_fraction: 0.5
+    semantics: >-
+      Primary massing tops are roof plates at least half the area of the largest roof
+      plate. Smaller Dakterrasvloer fragments are terraces, not independent sections.
+
+  tower_facade:
+    calculation: facade_opening_percentage
+    wall_label: IfcWall
+    wall_name_property: name
+    wall_name_value: Klimaatgevel
+    orientation_property: Orientatie
+    wall_quantity_set: Qto_WallBaseQuantities
+    opaque_area_quantity: GrossSideArea
+    opening_labels: [IfcWindow, IfcDoor]
+    external_property: IsExternal
+    window_quantity_set: Qto_WindowBaseQuantities
+    door_quantity_set: Qto_DoorBaseQuantities
+    opening_area_quantity: Area
+    repeated_floor_min_count: 2
+    semantics: >-
+      Equal repeated upper-floor facade schedules define the typical tower floor.
+      Opening percentage is external window/door area divided by opening area plus
+      oriented Klimaatgevel opaque area. The observed result is about 45 percent.
+
+  residential_records:
+    segment_code: MSH
+    segment_meaning: unresolved_without_explicit_project_mapping
+    free_sector_value: null
+    physical_unit_identity: graph_distinct_identity
+    physical_unit_identity_property: EenheidNummer
+    physical_unit_identity_semantics: >-
+      EenheidNummer is the Revit dwelling-unit number. It has 100 distinct values
+      across 105 apartment-space records; both levels of each duplex share one value.
+    duplex_counting_rule: >-
+      Two space records representing the lower and upper portions of one duplex count
+      as one physical apartment, not two apartments.
+    semantics: >-
+      Apartment counts must use distinct EenheidNummer values from Neo4j. Never count
+      apartment-space records as physical dwellings because both levels of a duplex
+      share one dwelling-unit number. Combined middle/free-sector program scope is a
+      separately curated project fact, not a raw Revit record count.

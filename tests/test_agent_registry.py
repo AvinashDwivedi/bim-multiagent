@@ -37,6 +37,7 @@ class AgentRegistryTests(unittest.TestCase):
             {
                 "create_task_contract",
                 "inspect_query_capabilities",
+                "inspect_project_knowledge",
                 "inspect_graph_structure",
                 "inspect_node_inventory",
                 "profile_node_properties",
@@ -45,6 +46,8 @@ class AgentRegistryTests(unittest.TestCase):
                 "search_property_values",
                 "register_schema_mapping",
                 "submit_query_plan",
+                "submit_project_knowledge_query",
+                "submit_geometry_query",
                 "replay_and_verify",
             },
         )

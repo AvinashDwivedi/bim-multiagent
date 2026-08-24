@@ -119,6 +119,17 @@ def _merge_measure(base: dict, overlay: dict) -> dict:
     return out
 
 
+def _merge_nested_map(base: dict, overlay: dict) -> dict:
+    """Recursively merge scoped BIM query knowledge; lower layers replace values."""
+    out = copy.deepcopy(base or {})
+    for key, value in (overlay or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _merge_nested_map(out[key], value)
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
+
+
 def _merge_named_map(result: dict, section: str, overlay_section: dict, merge_fn):
     """Merge a top-level slug->dict section (concepts / permit_measures). New slugs add
     wholesale; existing slugs merge via merge_fn."""
@@ -147,6 +158,10 @@ def _merge_layer(result: dict, layer: dict, band: int):
     _merge_named_map(result, "permit_measures", layer.get("permit_measures"), _merge_measure)
     _merge_term_map(result, "room_labels", layer.get("room_labels"))
     _merge_term_map(result, "materials", layer.get("materials"))
+    if layer.get("bim_query_knowledge"):
+        result["bim_query_knowledge"] = _merge_nested_map(
+            result.get("bim_query_knowledge") or {}, layer["bim_query_knowledge"]
+        )
     # `version` stays the global identity; overlays never change it.
 
 
@@ -179,6 +194,7 @@ class ConceptOntology:
         # CP-PM4: project-level permit measures (mirror of bim_tools._MEASURE_SYNONYMS +
         # chunker_bim._PERMIT_MEASURE_EXTRACT + the two _*_measure_for_level helpers).
         self.permit_measures: dict[str, dict] = dict(data.get("permit_measures") or {})
+        self.bim_query_knowledge: dict[str, dict] = dict(data.get("bim_query_knowledge") or {})
         # CP-S3: Hebrew 2D-plan room labels (slug -> exact label terms). Consumed by
         # chunker_bim._extract_room_label_nodes via classify_room_label().
         self.room_labels: dict[str, list[str]] = dict(data.get("room_labels") or {})

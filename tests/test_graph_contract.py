@@ -22,6 +22,7 @@ class GraphContractTests(unittest.TestCase):
         self.assertEqual(contract.node(spaces.node_type).label, "IfcSpace")
         self.assertEqual(spaces.fields["type"].ontology_kind, "canonical_type")
         self.assertEqual(spaces.fields["area_basis"].property, "Bepalingsmethode")
+        self.assertEqual(spaces.fields["elevation_m"].property, "placement_z")
         self.assertNotIn("segment", spaces.fields)
         self.assertIn("object_id", spaces.default_select)
 

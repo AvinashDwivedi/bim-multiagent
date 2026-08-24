@@ -6,13 +6,18 @@ from .models import BimRunContext, BimTaskContract
 from .schema_mapping import SchemaMappingProposal
 from .tools import (
     BimQueryPlan,
+    GeometryQueryPlan,
+    KnowledgeQueryPlan,
     PipelineContext,
     define_bim_task as _define_bim_task,
     inspect_project_graph_structure as _inspect_graph,
     get_bim_query_catalog as _get_catalog,
+    get_project_knowledge_catalog as _get_project_knowledge,
     inspect_queryable_node_types as _inspect_nodes,
     profile_project_properties as _profile_properties,
     query_bim as _query_bim,
+    query_project_knowledge as _query_project_knowledge,
+    query_project_geometry as _query_project_geometry,
     register_schema_mapping as _register_mapping,
     semantic_search_project_nodes as _search_nodes,
     semantic_search_project_properties as _search_properties,
@@ -37,6 +42,28 @@ def create_task_contract(
 def inspect_query_capabilities(ctx: RunContextWrapper[BimRunContext]) -> str:
     """Inspect trusted contract-backed entities, fields, operations, and measurement semantics."""
     return _get_catalog(_ctx(ctx))
+
+
+@function_tool
+def inspect_project_knowledge(ctx: RunContextWrapper[BimRunContext]) -> str:
+    """Inspect interpretation rules and curated facts for the active client/project only."""
+    return _get_project_knowledge(_ctx(ctx))
+
+
+@function_tool
+def submit_project_knowledge_query(
+    ctx: RunContextWrapper[BimRunContext], plan: KnowledgeQueryPlan
+) -> str:
+    """Retrieve one exact curated active-project fact as verifiable evidence."""
+    return _query_project_knowledge(_ctx(ctx), plan)
+
+
+@function_tool
+def submit_geometry_query(
+    ctx: RunContextWrapper[BimRunContext], plan: GeometryQueryPlan
+) -> str:
+    """Calculate a metric from scoped Revit geometry and project interpretation rules."""
+    return _query_project_geometry(_ctx(ctx), plan)
 
 
 @function_tool

@@ -46,14 +46,20 @@ class WebAppTests(unittest.TestCase):
         validate.assert_called_once_with(fake_bim, contract, authorization_only=True)
 
     def test_stream_emits_lifecycle_event_then_result(self):
-        async def answer(question, hooks):
+        async def answer(question, hooks, client_id=None, project_id=None):
             hooks.stage("agent_start", agent="Supervisor", event_id="agent-1", sequence=1)
+            self.assertEqual(client_id, "653fbe80-e4c5-11ed-95e8-fdb8a484b2c4")
+            self.assertEqual(project_id, "858ef0f0-454a-11f1-8957-1fe1b101e373")
             return PipelineReport(answer="Five.", verification_status="verified")
 
         with patch("bim_agents.webapp.answer_bim_question", side_effect=answer):
             with TestClient(app) as client:
                 response = client.post(
-                    "/api/chat/stream", json={"question": "How many apartments?"}
+                    "/api/chat/stream", json={
+                        "question": "How many apartments?",
+                        "client_id": "653fbe80-e4c5-11ed-95e8-fdb8a484b2c4",
+                        "project_id": "858ef0f0-454a-11f1-8957-1fe1b101e373",
+                    }
                 )
         self.assertEqual(response.status_code, 200)
         events = [json.loads(line) for line in response.text.splitlines()]

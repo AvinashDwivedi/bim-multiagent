@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from uuid import UUID
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,15 +23,28 @@ class Settings:
     query_timeout_seconds: float = 20.0
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(
+        cls, *, client_id: str | None = None, project_id: str | None = None
+    ) -> "Settings":
         load_dotenv()
+
+        if (client_id is None) != (project_id is None):
+            raise ValueError("client_id and project_id must be supplied together.")
+        selected_client_id = os.getenv("BIM_CLIENT_ID") if client_id is None else client_id
+        selected_project_id = os.getenv("BIM_PROJECT_ID") if project_id is None else project_id
+        for name, value in (("client_id", selected_client_id), ("project_id", selected_project_id)):
+            if value:
+                try:
+                    UUID(value)
+                except ValueError as exc:
+                    raise ValueError(f"{name} must be a UUID.") from exc
 
         required = {
             "NEO4J_URI": os.getenv("NEO4J_URI"),
             "NEO4J_USERNAME": os.getenv("NEO4J_USERNAME"),
             "NEO4J_PASSWORD": os.getenv("NEO4J_PASSWORD"),
-            "BIM_CLIENT_ID": os.getenv("BIM_CLIENT_ID"),
-            "BIM_PROJECT_ID": os.getenv("BIM_PROJECT_ID"),
+            "BIM_CLIENT_ID": selected_client_id,
+            "BIM_PROJECT_ID": selected_project_id,
         }
 
         missing = [name for name, value in required.items() if not value]
@@ -140,7 +154,26 @@ class BimContext:
             cypher,
             parameters,
         )
-        return [row["source"] for row in rows if row.get("source")]
+        sources = [row["source"] for row in rows if row.get("source")]
+        if sources:
+            return sources
+
+        # Some Revit ingests stamp the scope directly on IfcProject but do not
+        # create BIMHub-[:CONTAINS]->IfcProject. Retain the same fail-closed
+        # authorization semantics by requiring both exact request UUIDs on the
+        # configured source label before accepting its source identifier.
+        source_node = graph_contract.node(path.source_node)
+        direct_rows = self.query(
+            f"MATCH (source:`{source_node.label}`) "
+            "WHERE source.client_id = $client_id AND source.project_id = $project_id "
+            f"AND source.`{path.source_property}` IS NOT NULL "
+            f"RETURN DISTINCT source.`{path.source_property}` AS source ORDER BY source",
+            {
+                "client_id": self.settings.client_id,
+                "project_id": self.settings.project_id,
+            },
+        )
+        return [row["source"] for row in direct_rows if row.get("source")]
 
     def get_project_summary(self, graph_contract: Any) -> dict[str, Any]:
         """Return a small, safely scoped BIM-model summary."""

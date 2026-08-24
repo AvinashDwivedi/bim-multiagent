@@ -28,6 +28,8 @@ logger = configure_logging(
 
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=1000)
+    client_id: str | None = None
+    project_id: str | None = None
 
 
 async def index(request: Request) -> FileResponse:
@@ -73,7 +75,10 @@ async def chat(request: Request) -> JSONResponse:
     try:
         payload = ChatRequest.model_validate(await request.json())
         logger.info("chat.request | mode=json | chars=%d", len(payload.question))
-        report = await answer_bim_question(payload.question, hooks=PipelineEvents(logger))
+        report = await answer_bim_question(
+            payload.question, client_id=payload.client_id, project_id=payload.project_id,
+            hooks=PipelineEvents(logger),
+        )
         return JSONResponse(report.model_dump(mode="json"))
     except Exception as exc:
         logger.error("chat.failed | %s: %s", type(exc).__name__, exc)
@@ -97,6 +102,8 @@ async def chat_stream(request: Request) -> StreamingResponse:
         try:
             report = await answer_bim_question(
                 payload.question,
+                client_id=payload.client_id,
+                project_id=payload.project_id,
                 hooks=PipelineEvents(logger, event_sink=publish),
             )
             await queue.put({"type": "result", "report": report.model_dump(mode="json")})

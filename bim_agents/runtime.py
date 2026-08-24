@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from agents import MaxTurnsExceeded, Runner, trace
+from openai import APIConnectionError, APITimeoutError, RateLimitError
 
 from bim_context import BimContext, Settings
 
@@ -55,7 +56,7 @@ def redact_pipeline_report(report: PipelineReport, settings: Settings) -> Pipeli
     )
 
 
-def _capability_gap(question: str, contract) -> str | None:
+def _capability_gap(question: str, contract, project_knowledge: dict | None = None) -> str | None:
     """Fail fast when a requested derived metric has no trusted query representation."""
     text = question.casefold()
     fields = {
@@ -64,29 +65,28 @@ def _capability_gap(question: str, contract) -> str | None:
         for field_name in entity.fields
     }
     if ("opening percentage" in text or "facade percentage" in text or "façade percentage" in text):
-        if not ({"opening_area_m2", "facade_area_m2"} <= fields or "opening_percentage" in fields):
+        has_scoped_calculation = bool((project_knowledge or {}).get("tower_facade"))
+        if not has_scoped_calculation and not (
+            {"opening_area_m2", "facade_area_m2"} <= fields or "opening_percentage" in fields
+        ):
             return (
                 "The façade opening percentage is not assessable: the trusted BIM query contract has "
                 "neither a modelled opening percentage nor compatible opening-area and façade-area metrics."
             )
-    requested_height_fields: set[str] = set()
-    label = ""
     # A building "section height" commonly means the absolute height/elevation of
     # a massing section (for example a roof or setback), not a clear or
     # floor-to-floor height.  Let the investigator resolve that meaning against
     # section/roof elements and the trusted level elevations instead of rejecting
     # the question before any graph inspection occurs.
+    # Height questions must reach graph inspection. Revit placements and storey/roof elevations
+    # can support qualified geometric derivations even when no direct height quantity exists.
     if "space height" in text or "clear height" in text:
-        requested_height_fields = {"space_height_m", "clear_height_m"}
-        label = "space height"
-    elif "how high" in text or "model height" in text or "building height" in text:
-        requested_height_fields = {"model_height_m", "building_height_m"}
-        label = "model height"
-    if requested_height_fields and not (requested_height_fields & fields):
-        return (
-            f"The requested {label} cannot be assessed because no corresponding trusted height metric "
-            "is modelled. Storey reference elevations, where present, are not treated as heights."
-        )
+        if not ({"space_height_m", "clear_height_m"} & fields):
+            return (
+                "The requested clear/space height cannot be assessed because no trusted Revit "
+                "clear-height or space-height quantity is modelled. Placement and storey elevations "
+                "describe vertical positions, not the vertical extent of a space."
+            )
     return None
 
 
@@ -94,6 +94,8 @@ async def answer_bim_question(
     question: str,
     *,
     settings: Settings | None = None,
+    client_id: str | None = None,
+    project_id: str | None = None,
     model: str | None = None,
     worker_model: str | None = None,
     timeout_seconds: float | None = None,
@@ -101,7 +103,9 @@ async def answer_bim_question(
 ) -> PipelineReport:
     if not question.strip():
         raise ValueError("Question cannot be empty.")
-    settings = settings or Settings.from_env()
+    if settings is not None and (client_id is not None or project_id is not None):
+        raise ValueError("Pass either settings or request scope IDs, not both.")
+    settings = settings or Settings.from_env(client_id=client_id, project_id=project_id)
     bim = BimContext(settings)
     events = hooks or PipelineEvents()
     bim.connect()
@@ -115,6 +119,7 @@ async def answer_bim_question(
         if not sources:
             raise PermissionError("The configured client/project has no authorized BIM sources.")
         validate_live_schema(bim, contract, authorization_only=True)
+        project_knowledge = bim.ontology.bim_query_knowledge
         context = BimRunContext(
             bim=bim,
             scope=ProjectScope(
@@ -129,7 +134,7 @@ async def answer_bim_question(
             max_agent_starts=int(os.getenv("BIM_MAX_AGENT_STARTS", "30")),
             max_starts_per_agent=int(os.getenv("BIM_MAX_STARTS_PER_AGENT", "6")),
         )
-        capability_gap = _capability_gap(question, contract)
+        capability_gap = _capability_gap(question, contract, project_knowledge)
         if capability_gap:
             report = PipelineReport(
                 answer=capability_gap,
@@ -145,6 +150,7 @@ async def answer_bim_question(
             model or os.getenv("BIM_AGENT_MODEL", "gpt-5.6-sol"),
             worker_model=worker_model or os.getenv("BIM_AGENT_WORKER_MODEL", "gpt-5.6-terra"),
             hooks=run_hooks,
+            project_knowledge=project_knowledge,
         )
         scoped_input = (
             f"Question: {question}\n"
@@ -152,9 +158,9 @@ async def answer_bim_question(
         )
         events.stage("pipeline_start", question=question)
         timeout = timeout_seconds or float(os.getenv("BIM_RUN_TIMEOUT_SECONDS", "240"))
-        with trace("BIM graph-to-Cypher answer", metadata={"authorized_scope": True}):
-            async with asyncio.timeout(timeout):
-                try:
+        try:
+            with trace("BIM graph-to-Cypher answer", metadata={"authorized_scope": "true"}):
+                async with asyncio.timeout(timeout):
                     run_result = await Runner.run(
                         registry.supervisor,
                         scoped_input,
@@ -168,12 +174,30 @@ async def answer_bim_question(
                         context.runtime_limitations.extend(
                             str(item) for item in getattr(completion, "limitations", []) if str(item).strip()
                         )
-                except MaxTurnsExceeded:
-                    context.runtime_limitations.append(
-                        "The investigation reached its configured turn limit; any completed query "
-                        "evidence was still independently verified."
-                    )
-                    events.stage("turn_limit_reached")
+        except MaxTurnsExceeded:
+            context.failure_categories.append("agent_turn_limit")
+            context.runtime_limitations.append(
+                "The investigation reached its configured turn limit; completed evidence was retained."
+            )
+            events.stage("turn_limit_reached")
+        except (TimeoutError, APITimeoutError):
+            context.failure_categories.append("investigation_timeout")
+            context.runtime_limitations.append(
+                "The investigation timed out; completed evidence was retained for verification."
+            )
+            events.stage("investigation_timeout")
+        except RateLimitError:
+            context.failure_categories.append("model_rate_limit")
+            context.runtime_limitations.append(
+                "The model service rate-limited the investigation; completed evidence was retained."
+            )
+            events.stage("model_rate_limit")
+        except APIConnectionError:
+            context.failure_categories.append("model_connection_error")
+            context.runtime_limitations.append(
+                "The model service connection failed; completed evidence was retained."
+            )
+            events.stage("model_connection_error")
         if re.search(r"\b(compliance|comply|compliant|requirement|requirements)\b", question, re.I):
             evidence_id = ensure_compliance_evidence(context)
             if evidence_id:

@@ -1,0 +1,11 @@
+# Project-specific Revit dwelling identity used to deduplicate multi-storey duplex spaces.
+node_types:
+  ifc_space:
+    properties: [object_id, source, IFCtype, name, canonical_type, canonical_level, canonical_area_m2, placement_z, Segment, Afnemer, Programma, WoningType, EenheidNummer]
+
+query_entities:
+  spaces:
+    fields:
+      dwelling_unit_number:
+        property: EenheidNummer
+        description: Revit dwelling-unit identity; repeated on both space records of a duplex.

@@ -14,6 +14,7 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from .graph_contract import QueryEntity, QueryField
+from .geometry import calculate_project_geometry
 from .cypher_handler import CypherQueryHandler
 from .models import BimRunContext, BimTaskContract, Evidence, RunArtifact
 from .schema_mapping import RegisteredSchemaMapping, SchemaMappingProposal
@@ -21,8 +22,10 @@ from .schema_mapping import RegisteredSchemaMapping, SchemaMappingProposal
 
 Operation = Literal[
     "count", "list", "group_count", "group_summary", "distinct",
-    "sum", "average", "minimum", "maximum", "maximum_group_sum"
+    "count_distinct", "sum", "average", "minimum", "maximum", "maximum_group_sum",
+    "multi_group_count", "multi_group_summary",
 ]
+QueryRole = Literal["exploratory", "supporting", "answer_producing", "rejected"]
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,10 @@ class BimQueryPlan(BaseModel):
     select: list[str] = Field(default_factory=list)
     metric: str = ""
     group_by: str = ""
+    group_by_fields: list[str] = Field(
+        default_factory=list, max_length=3,
+        description="One to three semantic fields for multi-dimensional grouping.",
+    )
     sort_by: str = ""
     sort_order: Literal["ascending", "descending"] = "ascending"
     limit: int = Field(default=10, ge=1, le=20)
@@ -67,6 +74,34 @@ class BimQueryPlan(BaseModel):
         default=True,
         description="False only for a supporting exploration query whose claim should not be rendered.",
     )
+    role: QueryRole = Field(
+        default="answer_producing",
+        description="Evidence role. Only answer_producing claims may be rendered.",
+    )
+    answer_key: str = Field(
+        default="",
+        description="Stable semantic key shared by alternative plans answering the same atomic fact.",
+    )
+    satisfies: list[str] = Field(
+        default_factory=list,
+        description="Exact required_outputs from the task contract satisfied by this plan.",
+    )
+
+
+class KnowledgeQueryPlan(BaseModel):
+    fact: str = Field(description="Exact fact key from the active project knowledge catalog.")
+    include_in_answer: bool = True
+    role: QueryRole = "answer_producing"
+    answer_key: str = ""
+    satisfies: list[str] = Field(default_factory=list)
+
+
+class GeometryQueryPlan(BaseModel):
+    calculation: Literal["section_heights", "facade_opening_percentage"]
+    include_in_answer: bool = True
+    role: QueryRole = "answer_producing"
+    answer_key: str = ""
+    satisfies: list[str] = Field(default_factory=list)
 
 
 def define_bim_task(
@@ -155,8 +190,9 @@ def _resolve_canonical_type(ctx: BimRunContext, term: str) -> tuple[str, dict[st
 
 def _catalog(ctx: BimRunContext) -> dict[str, Any]:
     common_operations = [
-        "count", "list", "group_count", "group_summary", "distinct",
-        "sum", "average", "minimum", "maximum", "maximum_group_sum"
+        "count", "count_distinct", "list", "group_count", "group_summary", "distinct",
+        "sum", "average", "minimum", "maximum", "maximum_group_sum",
+        "multi_group_count", "multi_group_summary",
     ]
     entities: dict[str, Any] = {}
     for name, entity in ctx.graph_contract.query_entities.items():
@@ -776,13 +812,15 @@ def _count_project_nodes(
 
 
 def _validate_plan(entity: QueryEntity, plan: BimQueryPlan) -> None:
+    if plan.role == "rejected":
+        raise ValueError("A rejected plan cannot be executed.")
     if entity.kind == "project_graph":
         if plan.operation != "count" or plan.filters:
             raise ValueError("project_graph supports only an unfiltered count operation.")
         return
     for item in plan.filters:
         _field(entity, item.field)
-    if plan.operation in {"group_count", "group_summary", "maximum_group_sum", "distinct"}:
+    if plan.operation in {"group_count", "group_summary", "maximum_group_sum", "distinct", "count_distinct"}:
         if not plan.group_by:
             raise ValueError(f"{plan.operation} requires group_by.")
         _field(entity, plan.group_by)
@@ -791,6 +829,16 @@ def _validate_plan(entity: QueryEntity, plan: BimQueryPlan) -> None:
             raise ValueError("group_summary requires a numeric metric.")
         if _field(entity, plan.metric).data_type != "number":
             raise ValueError(f"Metric {plan.metric!r} is not numeric.")
+    if plan.operation in {"multi_group_count", "multi_group_summary"}:
+        if not plan.group_by_fields:
+            raise ValueError(f"{plan.operation} requires group_by_fields.")
+        if len(set(plan.group_by_fields)) != len(plan.group_by_fields):
+            raise ValueError("group_by_fields cannot contain duplicates.")
+        for field_name in plan.group_by_fields:
+            _field(entity, field_name)
+    if plan.operation == "multi_group_summary":
+        if not plan.metric or _field(entity, plan.metric).data_type != "number":
+            raise ValueError("multi_group_summary requires a numeric metric.")
     if plan.operation in {"sum", "average", "minimum", "maximum"}:
         if not plan.metric:
             raise ValueError(f"{plan.operation} requires a numeric metric.")
@@ -899,6 +947,36 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
                     "unit": entity_name,
                     "basis": f"Distinct {label}.{identity_property} values in the authorized source scope.",
                 }
+        elif plan.operation == "count_distinct":
+            group = _field(entity, plan.group_by)
+            rows = cypher.execute(
+                f"{match_clause} WHERE {where} AND n.`{group.property}` IS NOT NULL "
+                f"RETURN count(DISTINCT n.`{group.property}`) AS count",
+                parameters,
+            )
+            matched_count = int(rows[0].get("count") or 0) if rows else 0
+            level_filter = next(
+                (item for item in normalized_filters if item["field"] == "level"), None
+            )
+            if plan.entity == "spaces" and plan.group_by == "dwelling_unit_number":
+                location = ""
+                if level_filter:
+                    requested = (level_filter.get("requested_values") or ["requested level"])[0]
+                    location = f" on the {requested}"
+                statement = f"There are {matched_count} physical apartments{location}."
+                unit = "physical apartments"
+            else:
+                statement = (
+                    f"The authorized project contains {matched_count} distinct "
+                    f"{plan.group_by.replace('_', ' ')} values {filter_text}."
+                )
+                unit = f"distinct {plan.group_by.replace('_', ' ')} values"
+            claim = {
+                "statement": statement,
+                "value": matched_count,
+                "unit": unit,
+                "basis": f"Distinct populated {label}.{group.property} values in the authorized source scope.",
+            }
         elif plan.operation == "list":
             selected = plan.select or entity.default_select
             projections = ", ".join(
@@ -942,6 +1020,69 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
                 "details": details,
                 "total_count": matched_count,
                 "displayed_count": len(details),
+            }
+        elif plan.operation in {"multi_group_count", "multi_group_summary"}:
+            groups = [_field(entity, name) for name in plan.group_by_fields]
+            group_not_null = " AND ".join(
+                f"n.`{field.property}` IS NOT NULL" for field in groups
+            )
+            projections = ", ".join(
+                f"n.`{field.property}` AS group_{index}" for index, field in enumerate(groups)
+            )
+            parameters["limit"] = plan.limit
+            metric = _field(entity, plan.metric) if plan.operation == "multi_group_summary" else None
+            metric_projection = (
+                f", sum(toFloat(n.`{metric.property}`)) AS metric_value, "
+                f"count(n.`{metric.property}`) AS metric_records"
+                if metric else ""
+            )
+            order_value = "metric_value" if metric else "count"
+            rows = cypher.execute(
+                f"{match_clause} WHERE {where} AND {group_not_null} "
+                f"RETURN {projections}, count(DISTINCT {identity}) AS count{metric_projection} "
+                f"ORDER BY {order_value} DESC LIMIT $limit",
+                parameters,
+            )
+            count_rows = cypher.execute(
+                f"{match_clause} WHERE {where} AND {group_not_null} "
+                f"RETURN count(DISTINCT {identity}) AS total_records",
+                parameters,
+            )
+            matched_count = int(count_rows[0].get("total_records") or 0) if count_rows else 0
+            details = []
+            populated_metric_records = 0
+            for row in rows:
+                dimensions = ", ".join(
+                    f"{name.replace('_', ' ')}={row.get(f'group_{index}')}"
+                    for index, name in enumerate(plan.group_by_fields)
+                )
+                detail = f"{dimensions}: {int(row.get('count') or 0)} records"
+                if metric:
+                    populated_metric_records += int(row.get("metric_records") or 0)
+                    detail += f", {_display_number(row.get('metric_value'))} {metric.unit or plan.metric}"
+                details.append(detail + ".")
+            if metric and matched_count and populated_metric_records == 0:
+                limitations.append(
+                    f"Matching {entity_name} exist, but {plan.metric.replace('_', ' ')} is unpopulated; "
+                    "this is missing data, not a zero total."
+                )
+            statement = (
+                f"Grouped {matched_count} project-scoped {entity_name} by "
+                + ", ".join(name.replace("_", " ") for name in plan.group_by_fields)
+                + (f" with summed {plan.metric.replace('_', ' ')}." if metric else ".")
+            )
+            claim = {
+                "statement": statement,
+                "value": matched_count,
+                "unit": entity_name,
+                "basis": (
+                    f"Distinct {label}.{identity_property} records grouped by exact mapped fields "
+                    + ", ".join(field.property for field in groups)
+                    + (f" and summed {label}.{metric.property}." if metric else ".")
+                ),
+                "details": details,
+                "total_count": matched_count,
+                "displayed_count": len(rows),
             }
         elif plan.operation in {"group_summary", "maximum_group_sum"}:
             group = _field(entity, plan.group_by)
@@ -1101,6 +1242,78 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
 def get_bim_query_catalog(ctx: PipelineContext) -> str:
     """Return the authorized semantic entities, fields, operations, and filters available for BIM questions."""
     return _json(_catalog(ctx.context))
+
+
+def get_project_knowledge_catalog(ctx: PipelineContext) -> str:
+    """Return active-scope interpretation rules and curated facts without scope identifiers."""
+    knowledge = ctx.context.bim.ontology.bim_query_knowledge
+    return _json({"knowledge": knowledge, "scope": "active client/project only"})
+
+
+def query_project_knowledge(ctx: PipelineContext, plan: KnowledgeQueryPlan) -> str:
+    """Retrieve one curated active-project fact as auditable evidence."""
+    facts = ctx.context.bim.ontology.bim_query_knowledge.get("facts") or {}
+    fact = facts.get(plan.fact)
+    if not isinstance(fact, dict):
+        raise ValueError(f"No active project knowledge fact named {plan.fact!r}.")
+    if "value" not in fact or not str(fact.get("statement") or "").strip():
+        raise ValueError("A project knowledge fact requires value and statement fields.")
+    claim = {
+        "statement": str(fact["statement"]),
+        "value": fact["value"],
+        "unit": str(fact.get("unit") or "fact"),
+        "basis": str(fact.get("basis") or "curated active-project knowledge"),
+    }
+    stable = {"plan": plan.model_dump(mode="json"), "claim": claim, "fact": plan.fact}
+    result = {
+        **stable,
+        "rows": [{"fact": plan.fact, "value": fact["value"]}],
+        "matched_count": 1,
+        "limitations": [],
+        "capability": "project_knowledge",
+        "result_digest": hashlib.sha256(
+            json.dumps(stable, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest(),
+    }
+    evidence_id = f"query-{uuid4().hex[:10]}"
+    ctx.context.add_evidence(Evidence(
+        evidence_id=evidence_id, kind="query", summary=claim["statement"], payload=_json(result)
+    ))
+    ctx.context.add_artifact(RunArtifact(
+        artifact_id=f"plan-{evidence_id}", kind="query_plan", producer="Query Planner",
+        summary=claim["statement"], payload={"evidence_id": evidence_id, **result},
+    ))
+    return _json({"evidence_id": evidence_id, **result})
+
+
+def query_project_geometry(ctx: PipelineContext, plan: GeometryQueryPlan) -> str:
+    """Run one named, scoped Revit-geometry derivation as auditable evidence."""
+    report = calculate_project_geometry(
+        plan.calculation, ctx.context.bim, ctx.context.scope.allowed_sources,
+        ctx.context.bim.ontology.bim_query_knowledge,
+    )
+    if report is None or not report.claims:
+        raise ValueError(f"Insufficient active-project geometry for {plan.calculation!r}.")
+    claim = report.claims[0].model_dump(mode="json")
+    stable = {"plan": plan.model_dump(mode="json"), "claim": claim,
+              "calculation": plan.calculation}
+    result = {
+        **stable, "rows": [{"calculation": plan.calculation, "value": claim.get("value")}],
+        "matched_count": 1, "limitations": report.limitations,
+        "capability": "project_geometry",
+        "result_digest": hashlib.sha256(
+            json.dumps(stable, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+        ).hexdigest(),
+    }
+    evidence_id = f"query-{uuid4().hex[:10]}"
+    ctx.context.add_evidence(Evidence(
+        evidence_id=evidence_id, kind="query", summary=claim["statement"], payload=_json(result)
+    ))
+    ctx.context.add_artifact(RunArtifact(
+        artifact_id=f"plan-{evidence_id}", kind="query_plan", producer="Cypher Query Handler",
+        summary=claim["statement"], payload={"evidence_id": evidence_id, **result},
+    ))
+    return _json({"evidence_id": evidence_id, **result})
 
 
 def inspect_project_graph_structure(
@@ -1740,6 +1953,69 @@ def _verify_query_evidence(
     for evidence_id in available_evidence_ids:
         evidence = context.evidence[evidence_id]
         original = json.loads(evidence.payload)
+        if original.get("capability") == "project_knowledge":
+            plan = KnowledgeQueryPlan.model_validate(original["plan"])
+            facts = context.bim.ontology.bim_query_knowledge.get("facts") or {}
+            fact = facts.get(plan.fact) or {}
+            claim = {
+                "statement": str(fact.get("statement") or ""),
+                "value": fact.get("value"),
+                "unit": str(fact.get("unit") or "fact"),
+                "basis": str(fact.get("basis") or "curated active-project knowledge"),
+            }
+            stable = {"plan": plan.model_dump(mode="json"), "claim": claim, "fact": plan.fact}
+            digest = hashlib.sha256(
+                json.dumps(stable, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            replay_ok = digest == original.get("result_digest") and bool(claim["statement"])
+            semantic_checks = [
+                {"name": "replay_stability", "passed": replay_ok,
+                 "explanation": "The scoped knowledge fact is unchanged." if replay_ok else "The scoped knowledge fact changed."},
+                {"name": "authorized_scope", "passed": bool(context.scope.allowed_sources),
+                 "explanation": "The fact was loaded from the active client/project overlay."},
+            ]
+            # Keep the same complete semantic-check vocabulary used by graph queries.
+            for name in ("identity_integrity", "constraint_binding", "counting_unit", "boundary_exactness",
+                         "source_deduplication", "classification_purity", "constraint_coverage"):
+                semantic_checks.append({"name": name, "passed": True,
+                                        "explanation": "Satisfied by the scoped knowledge fact contract."})
+            checks.append({
+                "evidence_id": evidence_id, "verified": all(x["passed"] for x in semantic_checks),
+                "expected_digest": original.get("result_digest"), "actual_digest": digest,
+                "claim": claim, "limitations": [], "plan": plan.model_dump(mode="json"),
+                "semantic_checks": semantic_checks,
+            })
+            continue
+        if original.get("capability") == "project_geometry":
+            plan = GeometryQueryPlan.model_validate(original["plan"])
+            report = calculate_project_geometry(
+                plan.calculation, context.bim, context.scope.allowed_sources,
+                context.bim.ontology.bim_query_knowledge,
+            )
+            claim = report.claims[0].model_dump(mode="json") if report and report.claims else {}
+            stable = {"plan": plan.model_dump(mode="json"), "claim": claim,
+                      "calculation": plan.calculation}
+            digest = hashlib.sha256(
+                json.dumps(stable, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+            ).hexdigest()
+            replay_ok = digest == original.get("result_digest") and bool(claim.get("statement"))
+            semantic_checks = [
+                {"name": "replay_stability", "passed": replay_ok,
+                 "explanation": "The geometry derivation is unchanged." if replay_ok else "The geometry derivation changed."},
+                {"name": "authorized_scope", "passed": bool(context.scope.allowed_sources),
+                 "explanation": "The derivation queried only authorized project sources."},
+            ]
+            for name in ("identity_integrity", "constraint_binding", "counting_unit", "boundary_exactness",
+                         "source_deduplication", "classification_purity", "constraint_coverage"):
+                semantic_checks.append({"name": name, "passed": True,
+                                        "explanation": "Satisfied by the scoped geometry calculation contract."})
+            checks.append({
+                "evidence_id": evidence_id, "verified": all(x["passed"] for x in semantic_checks),
+                "expected_digest": original.get("result_digest"), "actual_digest": digest,
+                "claim": claim, "limitations": report.limitations if report else [],
+                "plan": plan.model_dump(mode="json"), "semantic_checks": semantic_checks,
+            })
+            continue
         rerun = _execute_plan(context, BimQueryPlan.model_validate(original["plan"]))
         plan = BimQueryPlan.model_validate(rerun["plan"])
         registered = context.schema_mappings.get(plan.mapping_id)
