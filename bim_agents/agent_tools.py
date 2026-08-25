@@ -14,6 +14,7 @@ from .knowledge import (
 from .schema_mapping import SchemaMappingProposal
 from .tools import (
     BimQueryPlan,
+    build_compact_model_profile,
     GeometryQueryPlan,
     PipelineContext,
     define_bim_task as _define_bim_task,
@@ -144,6 +145,7 @@ def inspect_evidence_capabilities(
         "query_capabilities": json.loads(_get_catalog(_ctx(ctx))),
         "project_knowledge": json.loads(_get_project_knowledge(_ctx(ctx))),
         "learned_knowledge": _learned_knowledge_payload(ctx),
+        "model_profile": build_compact_model_profile(ctx.context).model_dump(mode="json"),
     }, ensure_ascii=False, sort_keys=True)
 
 

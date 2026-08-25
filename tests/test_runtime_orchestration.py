@@ -13,10 +13,12 @@ from bim_agents.models import (
     EvidenceWorkPackage,
     EvidenceWorkstreamResult,
     ProjectScope,
+    TaskConstraint,
 )
 from bim_agents.observability import PipelineEvents
 from bim_agents.orchestration import (
     _checkpoint_handoff, evidence_work_packages, package_contract, run_evidence_workstreams,
+    trusted_geometry_handoff,
 )
 from bim_agents.registry import build_agent_registry
 from bim_agents.runtime import _merge_isolated_workstream
@@ -62,6 +64,56 @@ class RuntimeOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(projected.required_outputs, ["switch count"])
         self.assertEqual(projected.work_packages, [])
+
+    def test_package_projection_does_not_leak_sibling_floor_constraint(self):
+        contract = BimTaskContract(
+            goal="Count all and ground-floor units", operation="count_distinct",
+            entity_concept="apartments",
+            constraints=[TaskConstraint(concept="floor", requested_value="ground floor")],
+            required_outputs=["all units", "ground-floor units"],
+            work_packages=[
+                EvidenceWorkPackage(
+                    package_id="all", objective="Count all units", required_outputs=["all units"],
+                    constraints=[],
+                ),
+                EvidenceWorkPackage(
+                    package_id="ground", objective="Count ground-floor units",
+                    required_outputs=["ground-floor units"],
+                    constraints=[TaskConstraint(concept="floor", requested_value="ground floor")],
+                ),
+            ],
+            success_criteria=["Both counts"],
+        )
+        self.assertEqual(package_contract(contract, contract.work_packages[0]).constraints, [])
+        self.assertEqual(
+            package_contract(contract, contract.work_packages[1]).constraints[0].requested_value,
+            "ground floor",
+        )
+
+    def test_exact_named_geometry_route_precedes_schema_discovery(self):
+        root = BimRunContext(
+            bim=SimpleNamespace(ontology=SimpleNamespace(bim_query_knowledge={
+                "massing": {
+                    "calculation": "section_heights",
+                    "route_terms": ["various section heights"],
+                    "semantics": "Project massing tops.",
+                }
+            })),
+            scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+            question="What are the various section heights?",
+            task_contract=BimTaskContract(
+                goal="Report section heights", operation="list", entity_concept="sections",
+                required_outputs=["section heights"], success_criteria=["Measured heights"],
+            ),
+        )
+        package = EvidenceWorkPackage(
+            package_id="heights", objective="Report various section heights",
+            required_outputs=["section heights"],
+        )
+        handoff = trusted_geometry_handoff(root, package)
+        self.assertEqual(handoff.route, "geometry")
+        self.assertEqual(handoff.calculation, "section_heights")
 
     def test_registered_mapping_checkpoint_recovers_scout_turn_limit(self):
         contract = self.contract()

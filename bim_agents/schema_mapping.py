@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class SchemaFieldMapping(BaseModel):
@@ -10,7 +10,16 @@ class SchemaFieldMapping(BaseModel):
     property: str
     data_type: Literal["string", "number"] = "string"
     unit: str | None = None
+    source_unit: str | None = None
+    conversion_factor: float = Field(default=1.0, gt=0)
+    conversion_basis: str = "identity conversion"
     ontology_kind: Literal["canonical_type", "ifc_class", "level"] | None = None
+
+    @model_validator(mode="after")
+    def validate_unit_conversion(self) -> "SchemaFieldMapping":
+        if self.source_unit and self.unit and self.source_unit != self.unit and self.conversion_factor == 1:
+            raise ValueError("Different source and canonical units require an explicit conversion factor.")
+        return self
 
 
 class SchemaRelationshipStep(BaseModel):

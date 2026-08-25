@@ -28,3 +28,68 @@ bim_query_knowledge:
       semantics: >-
         This is a door-opening/intercom switch, not a lighting switch. It may be reported
         separately when the user explicitly requests the broader electrical-switch scope.
+
+  cable_tray_segments:
+    entity_concept: cable tray segments
+    aliases: [cable tray, cable trays, tray, trays, "מגש כבלים", "מגשי כבלים"]
+    label: IfcFlowSegment
+    source_property: source
+    identity_property: GlobalID
+    category_property: Category
+    category_value: Cable Trays
+    classification_property: Type
+    classification_semantic_name: type
+    exact_family_values: [Wire Mesh Cable Tray, Channel Cable Tray]
+    fields:
+      - {semantic_name: width, property: Width, data_type: number, source_unit: cm, unit: mm, conversion_factor: 10, conversion_basis: "centimetres to millimetres"}
+      - {semantic_name: height, property: Height, data_type: number, source_unit: cm, unit: mm, conversion_factor: 10, conversion_basis: "centimetres to millimetres"}
+      - {semantic_name: length, property: Length, data_type: number, source_unit: cm, unit: m, conversion_factor: 0.01, conversion_basis: "centimetres to metres"}
+      - {semantic_name: material, property: "Materials and Finishes_Material", optional: true}
+      - {semantic_name: level, property: canonical_level, ontology_kind: level}
+    counting_unit: physical cable-tray segment instance
+    counting_unit_semantics: >-
+      Count distinct GlobalID values on the exact Cable Trays category. IfcFlowFitting
+      records are separate fittings and are not cable-tray length segments.
+
+  socket_box_6_modules:
+    entity_concept: socket box for 6 modules
+    aliases: [socket box for 6 modules, socket box, "קופסת שקעים ל-6 מודולים"]
+    label: IfcBuildingElementProxy
+    source_property: source
+    identity_property: GlobalID
+    category_property: Category
+    category_value: Electrical Fixtures
+    classification_property: Family
+    exact_family_values: [D-20, D14AV, "D17-קופסת שקעים", EF_D11, EF_D17, EF_D18A]
+    type_property: Type
+    fields:
+      - {semantic_name: level, property: canonical_level, ontology_kind: level}
+      - {semantic_name: elevation_from_level, property: "Elevation from Level", data_type: number, source_unit: cm, unit: cm, conversion_factor: 1, conversion_basis: "source already uses canonical centimetres"}
+      - {semantic_name: planned_default_elevation, property: "Constraints_Default Elevation"}
+      - {semantic_name: description, property: "Identity Data_Description"}
+      - {semantic_name: mark, property: Mark}
+    counting_unit: physical socket-box instance
+    counting_unit_semantics: >-
+      The governed family boundary covers the eight observed family/type combinations whose
+      descriptions identify a six-module socket box. Elevation from Level is the modeled
+      instance reference-point offset in centimetres; it is not a clear-height measurement.
+
+  nonmetallic_conduit_segments:
+    entity_concept: nonmetallic electrical conduit segments
+    aliases: [nonmetallic conduit, electrical conduit, conduit, conduits, "צינורות חשמל לא מתכתיים"]
+    label: IfcFlowSegment
+    source_property: source
+    identity_property: GlobalID
+    category_property: Category
+    category_value: Conduits
+    classification_property: Type
+    classification_semantic_name: type
+    exact_family_values: [Electrical Nonmetallic Conduit (HDPE)]
+    fields:
+      - {semantic_name: diameter, property: "Outside Diameter", data_type: number, source_unit: cm, unit: mm, conversion_factor: 10, conversion_basis: "centimetres to millimetres"}
+      - {semantic_name: length, property: Length, data_type: number, source_unit: cm, unit: m, conversion_factor: 0.01, conversion_basis: "centimetres to metres"}
+      - {semantic_name: level, property: canonical_level, ontology_kind: level}
+    counting_unit: physical modeled conduit segment instance
+    counting_unit_semantics: >-
+      Count distinct GlobalID values on the exact Conduits category and HDPE type. Conduit
+      fittings are separate records and are excluded from the segment count and length.

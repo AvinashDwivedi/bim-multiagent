@@ -23,7 +23,7 @@ from .orchestration import run_evidence_workstreams
 from .registry import build_agent_registry
 from .tools import (
     PipelineContext, define_bim_task, ensure_bim_verification, ensure_compliance_evidence,
-    inspect_completion_gates,
+    inspect_completion_gates, build_compact_model_profile,
 )
 
 
@@ -344,6 +344,16 @@ async def answer_bim_question(
                 context.knowledge_store = None
                 context.failure_categories.append("learned_knowledge_unavailable")
                 events.stage("knowledge_unavailable")
+        try:
+            build_compact_model_profile(context)
+            events.stage(
+                "model_profile_ready",
+                node_types=len(context.model_profile.node_types),
+                relationship_types=len(context.model_profile.relationship_types),
+            )
+        except Exception:
+            context.failure_categories.append("model_profile_unavailable")
+            events.stage("model_profile_unavailable")
         capability_gap = _capability_gap(question, contract, project_knowledge)
         if capability_gap:
             report = PipelineReport(

@@ -10,6 +10,7 @@ bim_query_knowledge:
 
   massing_sections:
     calculation: section_heights
+    route_terms: ["section heights", "various section heights", "height of the building", "building height"]
     slab_label: IfcSlab
     predefined_type_property: PredefinedType
     predefined_type_value: ROOF
@@ -22,6 +23,7 @@ bim_query_knowledge:
 
   tower_facade:
     calculation: facade_opening_percentage
+    route_terms: ["opening percentage of the tower facade", "tower facade opening percentage"]
     wall_label: IfcWall
     wall_name_property: name
     wall_name_value: Klimaatgevel
@@ -38,6 +40,22 @@ bim_query_knowledge:
       Equal repeated upper-floor facade schedules define the typical tower floor.
       Opening percentage is external window/door area divided by opening area plus
       oriented Klimaatgevel opaque area.
+
+  tower_floor_area:
+    calculation: tower_max_floor_area
+    route_terms: ["tower's maximum floor area", "tower maximum floor area", "maximum tower floor area"]
+    space_label: IfcSpace
+    type_property: canonical_type
+    floor_plate_type: residential_zone
+    basis_property: Bepalingsmethode
+    floor_plate_basis: BVO
+    area_property: canonical_area_m2
+    level_property: canonical_level
+    repeated_floor_min_count: 2
+    repeated_area_precision: 3
+    semantics: >-
+      Repeated upper-storey BVO residential-zone records are the tower floor plates.
+      Other overlapping area-plan records and podium functions are outside this measure.
 
   residential_records:
     segment_code: MSH

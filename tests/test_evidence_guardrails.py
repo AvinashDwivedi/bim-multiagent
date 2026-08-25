@@ -334,6 +334,11 @@ class EvidenceGuardrailTests(unittest.TestCase):
         self.assertEqual(report.verification_status, "insufficient_evidence")
         self.assertIn("Two tray types", report.answer)
         self.assertIn("material availability", " ".join(report.limitations))
+        statuses = {item.output: item for item in report.output_statuses}
+        self.assertEqual(statuses["type"].status, "verified")
+        self.assertTrue(statuses["type"].evidence_ids)
+        self.assertEqual(statuses["material availability"].status, "unsupported")
+        self.assertIn("No replay-verified evidence", statuses["material availability"].limitation)
 
     def test_verified_supporting_probe_can_satisfy_missing_data_output(self):
         context = BimRunContext(

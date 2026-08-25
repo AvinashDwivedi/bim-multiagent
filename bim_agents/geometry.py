@@ -65,16 +65,89 @@ def _section_heights(bim, allowed_sources: list[str], knowledge: dict[str, Any])
     if not heights:
         return None
     rendered = ", ".join(f"{height:g} m" for height in heights)
+    storeys = bim.query(
+        "MATCH (storey:IfcBuildingStorey) WHERE storey.source IN $allowed_sources "
+        "AND storey.placement_z IS NOT NULL "
+        "RETURN max(toFloat(storey.placement_z)) AS highest_storey_elevation_m",
+        {"allowed_sources": allowed_sources},
+    )
+    highest_storey = (
+        storeys[0].get("highest_storey_elevation_m") if storeys else None
+    )
     statement = (
         f"The Revit geometry has {len(heights)} primary massing sections with roof elevations "
         f"of {rendered} above the ground/project datum."
     )
+    if highest_storey is not None:
+        statement += (
+            f" The highest defined storey reference elevation is "
+            f"{float(highest_storey):g} m. These are geometry reference elevations, "
+            "not a directly modelled total building-height quantity."
+        )
     return _report(
         statement,
         rendered,
         "m",
         "Project-scoped roof gross areas joined to containing-storey elevations using scoped knowledge: "
         + str(config.get("semantics") or "primary massing-section interpretation"),
+    )
+
+
+def _tower_max_floor_area(
+    bim, allowed_sources: list[str], knowledge: dict[str, Any]
+) -> PipelineReport | None:
+    config = knowledge.get("tower_floor_area") or {}
+    if not config:
+        return None
+    label = _identifier(config.get("space_label"))
+    type_property = _identifier(config.get("type_property"))
+    basis_property = _identifier(config.get("basis_property"))
+    area_property = _identifier(config.get("area_property"))
+    level_property = _identifier(config.get("level_property"))
+    rows = bim.query(
+        f"MATCH (space:`{label}`) WHERE space.source IN $allowed_sources "
+        f"AND space.`{type_property}` = $space_type "
+        f"AND space.`{basis_property}` = $area_basis "
+        f"AND space.`{area_property}` IS NOT NULL "
+        f"RETURN space.`{level_property}` AS level, "
+        f"sum(toFloat(space.`{area_property}`)) AS area_m2, count(*) AS records "
+        "ORDER BY area_m2 DESC, level",
+        {
+            "allowed_sources": allowed_sources,
+            "space_type": config.get("floor_plate_type"),
+            "area_basis": config.get("floor_plate_basis"),
+        },
+    )
+    values = [row for row in rows if row.get("area_m2") is not None]
+    if not values:
+        return None
+    precision = int(config.get("repeated_area_precision", 3))
+    signatures = Counter(round(float(row["area_m2"]), precision) for row in values)
+    repeated = [
+        (count, area) for area, count in signatures.items()
+        if count >= int(config.get("repeated_floor_min_count", 2))
+    ]
+    if not repeated:
+        return None
+    _, maximum = max(repeated, key=lambda item: (item[0], item[1]))
+    levels = sorted(
+        str(row.get("level") or "unassigned level")
+        for row in values
+        if round(float(row["area_m2"]), precision) == maximum
+    )
+    level_text = ", ".join(levels)
+    basis = str(config.get("floor_plate_basis"))
+    statement = (
+        f"The maximum repeated tower floor plate is {maximum:.2f} m² {basis}, attained on "
+        f"{level_text}. The tower scope is the project-governed repeated upper-storey "
+        "residential-zone floor-plate interpretation."
+    )
+    return _report(
+        statement,
+        round(maximum, 3),
+        "m²",
+        "Project-scoped residential floor plates calculated using scoped knowledge: "
+        + str(config.get("semantics") or "tower floor-plate interpretation"),
     )
 
 
@@ -153,4 +226,6 @@ def calculate_project_geometry(
         return _section_heights(bim, allowed_sources, knowledge)
     if calculation == "facade_opening_percentage":
         return _facade_opening_percentage(bim, allowed_sources, knowledge)
+    if calculation == "tower_max_floor_area":
+        return _tower_max_floor_area(bim, allowed_sources, knowledge)
     raise ValueError(f"Unknown project geometry calculation: {calculation!r}")

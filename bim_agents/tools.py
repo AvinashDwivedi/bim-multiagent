@@ -7,6 +7,7 @@ import os
 import re
 import unicodedata
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -19,6 +20,7 @@ from .cypher_handler import CypherQueryHandler
 from .models import (
     BimRunContext, BimTaskContract, CompletionGateReport, Evidence,
     InvestigationAction, InvestigationHypothesis, InvestigationObservation, RunArtifact,
+    ProjectModelProfile,
 )
 from .schema_mapping import (
     RegisteredSchemaMapping, SchemaFieldMapping, SchemaMappingProposal,
@@ -29,9 +31,11 @@ from .schema_mapping import (
 Operation = Literal[
     "count", "list", "group_count", "group_summary", "distinct",
     "count_distinct", "sum", "average", "minimum", "maximum", "maximum_group_sum",
-    "multi_group_count", "multi_group_summary",
+    "multi_group_count", "multi_group_summary", "coverage",
 ]
 QueryRole = Literal["exploratory", "supporting", "answer_producing", "rejected"]
+_MODEL_PROFILE_CACHE: dict[str, ProjectModelProfile] = {}
+_MODEL_PROFILE_LOCK = Lock()
 
 
 @dataclass(frozen=True)
@@ -64,6 +68,10 @@ class BimQueryPlan(BaseModel):
     filters: list[BimFilter] = Field(default_factory=list)
     select: list[str] = Field(default_factory=list)
     metric: str = ""
+    coverage_field: str = Field(
+        default="",
+        description="Semantic property whose populated/missing coverage must be exhaustively measured.",
+    )
     group_by: str = ""
     group_by_fields: list[str] = Field(
         default_factory=list, max_length=3,
@@ -95,7 +103,9 @@ class BimQueryPlan(BaseModel):
 
 
 class GeometryQueryPlan(BaseModel):
-    calculation: Literal["section_heights", "facade_opening_percentage"]
+    calculation: Literal[
+        "section_heights", "facade_opening_percentage", "tower_max_floor_area",
+    ]
     include_in_answer: bool = True
     role: QueryRole = "answer_producing"
     answer_key: str = ""
@@ -357,7 +367,7 @@ def _catalog(ctx: BimRunContext) -> dict[str, Any]:
     common_operations = [
         "count", "count_distinct", "list", "group_count", "group_summary", "distinct",
         "sum", "average", "minimum", "maximum", "maximum_group_sum",
-        "multi_group_count", "multi_group_summary",
+        "multi_group_count", "multi_group_summary", "coverage",
     ]
     entities: dict[str, Any] = {}
     for name, entity in ctx.graph_contract.query_entities.items():
@@ -370,6 +380,8 @@ def _catalog(ctx: BimRunContext) -> dict[str, Any]:
                     "type": field.data_type,
                     "description": field.description,
                     "unit": field.unit,
+                    "source_unit": field.source_unit or field.unit,
+                    "conversion_factor": field.conversion_factor,
                 }
                 for field_name, field in entity.fields.items()
             },
@@ -389,6 +401,8 @@ def _catalog(ctx: BimRunContext) -> dict[str, Any]:
                     "type": field.data_type,
                     "description": f"Mapped live property {field.property}.",
                     "unit": field.unit,
+                    "source_unit": field.source_unit or field.unit,
+                    "conversion_factor": field.conversion_factor,
                 }
                 for field in proposal.fields
             },
@@ -598,6 +612,59 @@ def _project_graph_structure(
     }
 
 
+def build_compact_model_profile(ctx: BimRunContext) -> ProjectModelProfile:
+    """Build one bounded structural profile for reuse by isolated schema scouts.
+
+    The profile is routing metadata only. Counts, exact bindings, and absence findings
+    are always recomputed by the live query and verifier paths.
+    """
+    if ctx.model_profile:
+        return ctx.model_profile
+    cache_key = hashlib.sha256(_json({
+        "client_id": ctx.scope.client_id,
+        "project_id": ctx.scope.project_id,
+        "allowed_sources": sorted(ctx.scope.allowed_sources),
+        "contract_version": ctx.graph_contract.version,
+        "schema_fingerprint": ctx.schema_fingerprint,
+    }).encode("utf-8")).hexdigest()
+    with _MODEL_PROFILE_LOCK:
+        cached = _MODEL_PROFILE_CACHE.get(cache_key)
+    if cached is not None:
+        ctx.model_profile = cached
+        return cached
+    structure = _project_graph_structure(ctx, sample_limit=2, include_properties=True)
+    profile = ProjectModelProfile(
+        profile_version=1,
+        schema_fingerprint=ctx.schema_fingerprint,
+        authorized_source_count=structure["authorized_source_count"],
+        node_types=[
+            {
+                "labels": item["labels"],
+                "node_count": item["node_count"],
+                "properties": item["properties"],
+            }
+            for item in structure["node_types"]
+        ],
+        relationship_types=[
+            {
+                "type": item["type"],
+                "from_labels": item["from_labels"],
+                "to_labels": item["to_labels"],
+                "relationship_count": item["relationship_count"],
+            }
+            for item in structure["relationship_types"]
+        ],
+        scope_note=structure["scope_note"],
+        freshness_note=(
+            "Routing cache only; answer values and absence claims require a live exhaustive query."
+        ),
+    )
+    with _MODEL_PROFILE_LOCK:
+        _MODEL_PROFILE_CACHE[cache_key] = profile
+    ctx.model_profile = profile
+    return profile
+
+
 def _record_mapping(ctx: BimRunContext, entity: QueryEntity) -> tuple[str, str, str]:
     if not entity.node_type or not entity.identity_property or not entity.source_property:
         raise ValueError("The selected entity is not a record collection.")
@@ -633,6 +700,9 @@ def _entity_from_registered_mapping(
             property=field.property,
             data_type=field.data_type,
             unit=field.unit,
+            source_unit=field.source_unit,
+            conversion_factor=field.conversion_factor,
+            conversion_basis=field.conversion_basis,
             ontology_kind=field.ontology_kind,
             description=f"Live-mapped field {field.semantic_name}.",
         )
@@ -763,7 +833,7 @@ def _compile_filters(
             if field.data_type != "number":
                 raise ValueError(f"Numeric comparison is not allowed for {item.field!r}.")
             try:
-                parameters[key] = float(values[0])
+                parameters[key] = float(values[0]) / field.conversion_factor
             except ValueError as exc:
                 raise ValueError(f"Filter {item.field!r} requires a numeric value.") from exc
             symbol = {
@@ -774,7 +844,7 @@ def _compile_filters(
             continue
         if field.data_type == "number" and item.operator in {"equals", "not_equals", "in"}:
             try:
-                parameters[key] = [float(value) for value in values]
+                parameters[key] = [float(value) / field.conversion_factor for value in values]
             except ValueError as exc:
                 raise ValueError(f"Filter {item.field!r} requires numeric values.") from exc
             numeric_clause = f"toFloat({prop}) IN ${key}"
@@ -1070,6 +1140,10 @@ def _validate_plan(entity: QueryEntity, plan: BimQueryPlan) -> None:
         return
     for item in plan.filters:
         _field(entity, item.field)
+    if plan.operation == "coverage":
+        if not plan.coverage_field:
+            raise ValueError("coverage requires coverage_field.")
+        _field(entity, plan.coverage_field)
     if plan.operation in {"group_count", "group_summary", "maximum_group_sum", "distinct", "count_distinct"}:
         if not plan.group_by:
             raise ValueError(f"{plan.operation} requires group_by.")
@@ -1152,7 +1226,48 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
         filter_text = _format_filters(normalized_filters)
         rows: list[dict[str, Any]]
         matched_count: int
-        if plan.operation == "count":
+        if plan.operation == "coverage":
+            covered = _field(entity, plan.coverage_field)
+            rows = cypher.execute(
+                f"{match_clause} WHERE {where} "
+                f"RETURN count(DISTINCT {identity}) AS candidate_count, "
+                f"count(DISTINCT CASE WHEN n.`{covered.property}` IS NOT NULL "
+                f"AND trim(toString(n.`{covered.property}`)) <> '' THEN {identity} END) AS populated_count",
+                parameters,
+            )
+            candidate_count = int(rows[0].get("candidate_count") or 0) if rows else 0
+            populated_count = int(rows[0].get("populated_count") or 0) if rows else 0
+            missing_count = max(candidate_count - populated_count, 0)
+            matched_count = populated_count
+            fill_rate = (populated_count / candidate_count) if candidate_count else None
+            statement = (
+                f"The {plan.coverage_field.replace('_', ' ')} property is populated on "
+                f"{populated_count} of {candidate_count} project-scoped {entity_name}; "
+                f"{missing_count} records are missing it."
+            )
+            claim = {
+                "statement": statement,
+                "value": populated_count,
+                "unit": "populated records",
+                "basis": f"Exhaustive null/blank coverage scan of {label}.{covered.property} in scope.",
+                "coverage": {
+                    "candidate_count": candidate_count,
+                    "evaluated_count": candidate_count,
+                    "matched_count": populated_count,
+                    "missing_count": missing_count,
+                    "unknown_count": 0,
+                    "excluded_count": 0,
+                    "exhaustive": True,
+                },
+                "method": "coverage",
+                "source_tags": [f"{label}.{covered.property}"],
+                "details": [
+                    "Fill rate: " + (f"{fill_rate:.1%}" if fill_rate is not None else "not applicable")
+                ],
+                "total_count": candidate_count,
+                "displayed_count": 1 if candidate_count else 0,
+            }
+        elif plan.operation == "count":
             rows = cypher.execute(
                 f"{match_clause} WHERE {where} "
                 f"RETURN count(DISTINCT {identity}) AS count",
@@ -1276,37 +1391,54 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
             }
         elif plan.operation in {"multi_group_count", "multi_group_summary"}:
             groups = [_field(entity, name) for name in plan.group_by_fields]
-            group_not_null = " AND ".join(
-                f"n.`{field.property}` IS NOT NULL" for field in groups
-            )
+            group_expressions = [
+                (
+                    f"coalesce(toString(toFloat(n.`{field.property}`) * "
+                    f"{field.conversion_factor!r}), 'not modelled')"
+                    if field.data_type == "number" else
+                    f"coalesce(toString(n.`{field.property}`), 'not modelled')"
+                )
+                for field in groups
+            ]
             projections = ", ".join(
-                f"n.`{field.property}` AS group_{index}" for index, field in enumerate(groups)
+                f"{expression} AS group_{index}"
+                for index, expression in enumerate(group_expressions)
             )
             parameters["limit"] = plan.limit
             metric = _field(entity, plan.metric) if plan.operation == "multi_group_summary" else None
             metric_projection = (
-                f", sum(toFloat(n.`{metric.property}`)) AS metric_value, "
+                f", sum(toFloat(n.`{metric.property}`) * {metric.conversion_factor!r}) AS metric_value, "
                 f"count(n.`{metric.property}`) AS metric_records"
                 if metric else ""
             )
             order_value = "metric_value" if metric else "count"
             rows = cypher.execute(
-                f"{match_clause} WHERE {where} AND {group_not_null} "
+                f"{match_clause} WHERE {where} "
                 f"RETURN {projections}, count(DISTINCT {identity}) AS count{metric_projection} "
                 f"ORDER BY {order_value} DESC LIMIT $limit",
                 parameters,
             )
             count_rows = cypher.execute(
-                f"{match_clause} WHERE {where} AND {group_not_null} "
-                f"RETURN count(DISTINCT {identity}) AS total_records",
+                f"{match_clause} WHERE {where} "
+                f"RETURN count(DISTINCT {identity}) AS total_records"
+                + (f", count(n.`{metric.property}`) AS metric_records" if metric else ""),
                 parameters,
             )
             matched_count = int(count_rows[0].get("total_records") or 0) if count_rows else 0
+            total_metric_records = (
+                int(count_rows[0].get("metric_records") or 0) if count_rows and metric else 0
+            )
             details = []
             populated_metric_records = 0
             for row in rows:
                 dimensions = ", ".join(
                     f"{name.replace('_', ' ')}={row.get(f'group_{index}')}"
+                    + (
+                        f" {groups[index].unit}"
+                        if groups[index].data_type == "number"
+                        and row.get(f"group_{index}") != "not modelled"
+                        and groups[index].unit else ""
+                    )
                     for index, name in enumerate(plan.group_by_fields)
                 )
                 detail = f"{dimensions}: {int(row.get('count') or 0)} records"
@@ -1337,6 +1469,25 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
                 "total_count": matched_count,
                 "displayed_count": len(rows),
             }
+            if metric:
+                claim["coverage"] = {
+                    "candidate_count": matched_count, "evaluated_count": matched_count,
+                    "matched_count": total_metric_records,
+                    "missing_count": max(matched_count - total_metric_records, 0),
+                    "unknown_count": 0, "excluded_count": 0, "exhaustive": True,
+                }
+                claim["measurement"] = {
+                    "source_value": None,
+                    "source_unit": metric.source_unit or metric.unit,
+                    "canonical_unit": metric.unit,
+                    "conversion_factor": metric.conversion_factor,
+                    "conversion_basis": metric.conversion_basis,
+                    "source_property": f"{label}.{metric.property}",
+                }
+                claim["source_tags"] = [
+                    *(f"{label}.{field.property}" for field in groups),
+                    f"{label}.{metric.property}",
+                ]
         elif plan.operation in {"group_summary", "maximum_group_sum"}:
             group = _field(entity, plan.group_by)
             metric = _field(entity, plan.metric)
@@ -1344,15 +1495,17 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
             totals = cypher.execute(
                 f"{match_clause} WHERE {where} AND n.`{group.property}` IS NOT NULL "
                 f"RETURN count(DISTINCT n.`{group.property}`) AS total_groups, "
-                f"count(DISTINCT {identity}) AS total_records",
+                f"count(DISTINCT {identity}) AS total_records, "
+                f"count(n.`{metric.property}`) AS metric_records",
                 parameters,
             )
             total_groups = int(totals[0].get("total_groups") or 0) if totals else 0
             matched_count = int(totals[0].get("total_records") or 0) if totals else 0
+            total_metric_records = int(totals[0].get("metric_records") or 0) if totals else 0
             rows = cypher.execute(
                 f"{match_clause} WHERE {where} AND n.`{group.property}` IS NOT NULL "
                 f"RETURN n.`{group.property}` AS value, count(DISTINCT {identity}) AS count, "
-                f"sum(toFloat(n.`{metric.property}`)) AS metric_value, "
+                f"sum(toFloat(n.`{metric.property}`) * {metric.conversion_factor!r}) AS metric_value, "
                 f"count(n.`{metric.property}`) AS metric_records "
                 "ORDER BY metric_value DESC, value LIMIT $limit",
                 parameters,
@@ -1412,6 +1565,21 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
                 ),
                 "total_count": total_groups,
                 "displayed_count": len(rows),
+                "coverage": {
+                    "candidate_count": matched_count, "evaluated_count": matched_count,
+                    "matched_count": total_metric_records,
+                    "missing_count": max(matched_count - total_metric_records, 0),
+                    "unknown_count": 0, "excluded_count": 0, "exhaustive": True,
+                },
+                "measurement": {
+                    "source_value": None,
+                    "source_unit": metric.source_unit or metric.unit,
+                    "canonical_unit": metric.unit,
+                    "conversion_factor": metric.conversion_factor,
+                    "conversion_basis": metric.conversion_basis,
+                    "source_property": f"{label}.{metric.property}",
+                },
+                "source_tags": [f"{label}.{group.property}", f"{label}.{metric.property}"],
             }
         elif plan.operation in {"group_count", "distinct"}:
             group = _field(entity, plan.group_by)
@@ -1452,12 +1620,14 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
             }[plan.operation]
             rows = cypher.execute(
                 f"{match_clause} WHERE {where} AND n.`{metric.property}` IS NOT NULL "
-                f"RETURN {function_name}(toFloat(n.`{metric.property}`)) AS value, "
-                f"count(n.`{metric.property}`) AS matched_records",
+                f"RETURN {function_name}(toFloat(n.`{metric.property}`) * {metric.conversion_factor!r}) AS value, "
+                f"count(n.`{metric.property}`) AS matched_records, "
+                f"count(DISTINCT {identity}) AS evaluated_records",
                 parameters,
             )
             value = rows[0].get("value") if rows else None
             matched_count = int(rows[0].get("matched_records") or 0) if rows else 0
+            evaluated_count = int(rows[0].get("evaluated_records") or matched_count) if rows else 0
             display = "no modelled value" if value is None else str(round(value, 4) if isinstance(value, float) else value)
             unit_text = f" {metric.unit}" if metric.unit else ""
             claim = {
@@ -1468,6 +1638,25 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
                 "value": value,
                 "unit": metric.unit or plan.metric,
                 "basis": f"{plan.operation} of populated {label}.{metric.property} values in scope.",
+                "coverage": {
+                    "candidate_count": evaluated_count,
+                    "evaluated_count": evaluated_count,
+                    "matched_count": matched_count,
+                    "missing_count": max(evaluated_count - matched_count, 0),
+                    "unknown_count": 0,
+                    "excluded_count": 0,
+                    "exhaustive": True,
+                },
+                "measurement": {
+                    "source_value": (value / metric.conversion_factor) if isinstance(value, (int, float)) else None,
+                    "source_unit": metric.source_unit or metric.unit,
+                    "canonical_unit": metric.unit,
+                    "conversion_factor": metric.conversion_factor,
+                    "conversion_basis": metric.conversion_basis,
+                    "source_property": f"{label}.{metric.property}",
+                },
+                "method": plan.operation,
+                "source_tags": [f"{label}.{metric.property}"],
             }
         result = {
             "rows": rows,
@@ -1476,6 +1665,34 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
             "limitations": limitations,
             "normalized_filters": normalized_filters,
         }
+    claim_payload = result.get("claim") or {}
+    claim_payload.setdefault("method", plan.operation)
+    claim_payload.setdefault("answer_key", plan.answer_key)
+    claim_payload.setdefault("satisfies", list(plan.satisfies))
+    plausibility_flags: list[dict[str, Any]] = list(claim_payload.get("plausibility_flags") or [])
+    claim_value = claim_payload.get("value")
+    claim_unit = str(claim_payload.get("unit") or "").casefold()
+    if isinstance(claim_value, (int, float)) and not isinstance(claim_value, bool):
+        if not math.isfinite(float(claim_value)):
+            plausibility_flags.append({
+                "code": "non_finite_measurement", "severity": "error",
+                "message": "The computed numeric result is not finite.", "evidence_ids": [],
+            })
+        if ("percent" in claim_unit or "%" in claim_unit) and not 0 <= float(claim_value) <= 100:
+            plausibility_flags.append({
+                "code": "percentage_out_of_range", "severity": "error",
+                "message": "A percentage result must be between 0 and 100.", "evidence_ids": [],
+            })
+        measurement = claim_payload.get("measurement") or {}
+        canonical_unit = str(measurement.get("canonical_unit") or claim_unit).casefold()
+        nonnegative_units = {"m", "mm", "cm", "m²", "m2", "square metres", "square meters"}
+        if canonical_unit in nonnegative_units and float(claim_value) < 0:
+            plausibility_flags.append({
+                "code": "negative_measurement", "severity": "error",
+                "message": "Lengths and areas cannot be negative.", "evidence_ids": [],
+            })
+    claim_payload["plausibility_flags"] = plausibility_flags
+    result["claim"] = claim_payload
     stable = {
         "plan": plan.model_dump(mode="json"),
         "rows": result["rows"],
@@ -1519,6 +1736,29 @@ def _constraint_field(concept: str) -> str:
     return _normalize(concept).replace(" ", "_")
 
 
+def _is_authorized_container_constraint(concept: str, requested_value: str) -> bool:
+    """Recognize generic project/building nouns already enforced by source scope.
+
+    Named sub-scopes such as a tower, wing, block, or zone remain real semantic
+    constraints and must still be bound to evidence.
+    """
+    text = _normalize(f"{concept} {requested_value}")
+    named_portions = {"tower", "wing", "block", "section", "zone", "podium"}
+    if any(re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text) for term in named_portions):
+        return False
+    container_terms = {
+        "building", "the building", "model", "the model", "project", "the project",
+        "current building", "current model", "authorized building", "authorised building",
+    }
+    concept_text = _normalize(concept)
+    value_text = _normalize(requested_value)
+    return concept_text in {
+        "building membership", "model membership", "project membership", "container", "scope",
+        "authorization", "authorisation", "authorized scope", "authorised scope",
+        "configured scope", "project scope",
+    } or value_text in container_terms
+
+
 def _plan_constraint_coverage(
     context: BimRunContext, plan: BimQueryPlan,
 ) -> tuple[bool, list[str]]:
@@ -1533,21 +1773,28 @@ def _plan_constraint_coverage(
     registered = context.schema_mappings.get(plan.mapping_id)
     missing: list[str] = []
     for constraint in contract.constraints:
-        governance_concept = _normalize(constraint.concept)
-        if any(term in governance_concept for term in (
-            "authorized scope", "authorised scope", "configured scope", "project scope",
-        )) or governance_concept in {"scope", "authorization", "authorisation"}:
+        if _is_authorized_container_constraint(
+            constraint.concept, constraint.requested_value
+        ):
             # Source authorization is injected by the compiler and verified as
             # its own semantic check; it is intentionally not a model field.
             continue
         target_field = _constraint_field(constraint.concept)
+        requested = _normalize(constraint.requested_value)
+        grouping_fields = {
+            _constraint_field(value)
+            for value in ([plan.group_by] if plan.group_by else []) + list(plan.group_by_fields)
+        }
+        if target_field == "level" and requested in {
+            "per floor", "by floor", "each floor", "all floors", "בכל קומה", "לפי קומה", "בקומה",
+        } and "level" in grouping_fields:
+            continue
         candidates = [
             item for item in plan.filters
             if _constraint_field(item.field) == target_field
             or target_field in _normalize(item.field).replace(" ", "_")
         ]
         covered = bool(candidates)
-        requested = _normalize(constraint.requested_value)
         if covered and requested:
             raw_values = [_normalize(value) for item in candidates for value in _raw_filter_values(item)]
             value_covered = any(
@@ -1601,6 +1848,26 @@ def _validate_answer_metadata(ctx: PipelineContext, plan: Any) -> None:
                 "The query plan omits required task constraints: "
                 + ", ".join(missing_constraints)
             )
+        if role == "answer_producing":
+            output_text = " ".join(satisfies).casefold()
+            measurement_requested = any(
+                re.search(pattern, output_text)
+                for pattern in (
+                    r"\b(length|distance|height)\b",
+                    r"\b(area|volume)\s+(value|size|total|sum|measurement|by|per)",
+                    r"\b(total|sum|maximum|minimum|average)\s+(area|length|height|distance|volume)",
+                )
+            )
+            numeric_operations = {
+                "sum", "average", "minimum", "maximum", "maximum_group_sum",
+                "group_summary", "multi_group_summary",
+            }
+            if measurement_requested and (
+                plan.operation not in numeric_operations or not plan.metric
+            ):
+                raise ValueError(
+                    "A numeric measurement output requires an aggregate operation and metric."
+                )
 
 
 def query_project_geometry(ctx: PipelineContext, plan: GeometryQueryPlan) -> str:
@@ -2552,9 +2819,15 @@ def activate_project_knowledge_mapping(ctx: PipelineContext, knowledge_key: str)
     type_property = str(knowledge.get("type_property") or "")
     category_property = str(knowledge.get("category_property") or "")
     category_value = str(knowledge.get("category_value") or "")
+    configured_fields = knowledge.get("fields") or []
+    if not isinstance(configured_fields, list) or any(
+        not isinstance(item, dict) for item in configured_fields
+    ):
+        raise ValueError("Governed mapping fields must be a list of field definitions.")
     exact_values = [str(value) for value in knowledge["exact_family_values"] if str(value)]
     identifiers = [label, source_property, identity_property, classification_property]
     identifiers.extend(value for value in (type_property, category_property) if value)
+    identifiers.extend(str(item.get("property") or "") for item in configured_fields)
     if any("`" in value or any(ord(character) < 32 for character in value) for value in identifiers):
         raise ValueError("The governed project mapping contains unsafe identifiers.")
     if source_property != ctx.context.graph_contract.authorization_path.source_property:
@@ -2566,6 +2839,10 @@ def activate_project_knowledge_mapping(ctx: PipelineContext, knowledge_key: str)
     required_properties = {
         source_property, identity_property, classification_property,
         *(value for value in (type_property, category_property) if value),
+        *(
+            str(item.get("property") or "") for item in configured_fields
+            if not item.get("optional", False)
+        ),
     }
     unknown = required_properties - set(observed["properties"])
     if unknown:
@@ -2606,8 +2883,11 @@ def activate_project_knowledge_mapping(ctx: PipelineContext, knowledge_key: str)
             semantic_name="category", property=category_property,
             ontology_kind="canonical_type",
         ))
+    classification_semantic_name = str(
+        knowledge.get("classification_semantic_name") or "family"
+    )
     fields.append(SchemaFieldMapping(
-        semantic_name="family", property=classification_property,
+        semantic_name=classification_semantic_name, property=classification_property,
         ontology_kind="canonical_type",
     ))
     if type_property:
@@ -2615,6 +2895,28 @@ def activate_project_knowledge_mapping(ctx: PipelineContext, knowledge_key: str)
             semantic_name="type", property=type_property,
             ontology_kind="canonical_type",
         ))
+    existing_semantic_names = {field.semantic_name for field in fields}
+    for item in configured_fields:
+        semantic_name = str(item.get("semantic_name") or "")
+        property_name = str(item.get("property") or "")
+        if not semantic_name or not property_name:
+            raise ValueError("Each governed field requires semantic_name and property.")
+        if semantic_name in existing_semantic_names:
+            raise ValueError(f"Duplicate governed semantic field: {semantic_name!r}.")
+        fields.append(SchemaFieldMapping(
+            semantic_name=semantic_name,
+            property=property_name,
+            data_type=str(item.get("data_type") or "string"),
+            unit=str(item.get("unit")) if item.get("unit") is not None else None,
+            source_unit=(
+                str(item.get("source_unit")) if item.get("source_unit") is not None
+                else str(item.get("unit")) if item.get("unit") is not None else None
+            ),
+            conversion_factor=float(item.get("conversion_factor", 1.0)),
+            conversion_basis=str(item.get("conversion_basis") or "identity conversion"),
+            ontology_kind=item.get("ontology_kind"),
+        ))
+        existing_semantic_names.add(semantic_name)
     value_bindings = []
     if category_property and category_value:
         value_bindings.append(SchemaValueBinding(
@@ -2624,7 +2926,7 @@ def activate_project_knowledge_mapping(ctx: PipelineContext, knowledge_key: str)
             matches=[SchemaValueMatch(value=category_value, similarity=1.0)],
         ))
     value_bindings.append(SchemaValueBinding(
-        semantic_name="family",
+        semantic_name=classification_semantic_name,
         property=classification_property,
         user_concept=str(knowledge["entity_concept"]),
         matches=[SchemaValueMatch(value=value, similarity=1.0) for value in exact_values],
@@ -2677,7 +2979,14 @@ def query_bim(ctx: PipelineContext, plan: BimQueryPlan) -> str:
     _validate_answer_metadata(ctx, plan)
     result = _execute_plan(ctx.context, plan)
     diagnostics: list[str] = []
-    if result.get("matched_count") == 0:
+    coverage = (result.get("claim") or {}).get("coverage") or {}
+    if (
+        plan.operation == "coverage"
+        and int(coverage.get("candidate_count") or 0) > 0
+        and int(coverage.get("matched_count") or 0) == 0
+    ):
+        diagnostics.append("verified_absence: exhaustive property coverage found no populated values")
+    elif result.get("matched_count") == 0:
         diagnostics.append(
             "zero_match: no records matched this exact entity/classification/filter hypothesis"
         )
@@ -2863,10 +3172,15 @@ def _verify_query_evidence(
             answer_producing = (
                 plan.role == "answer_producing" and plan.include_in_answer is not False
             )
+            coverage = (rerun.get("claim") or {}).get("coverage") or {}
+            zero_population = int(
+                coverage.get("candidate_count")
+                if plan.operation == "coverage" else rerun.get("matched_count") or 0
+            ) == 0
             unexpected_zero = (
                 answer_producing
                 and bool(registered.proposal.value_bindings)
-                and int(rerun.get("matched_count") or 0) == 0
+                and zero_population
             )
             if unexpected_zero:
                 classification_ok = False
@@ -2880,6 +3194,10 @@ def _verify_query_evidence(
             if constraints_ok else
             "Missing task constraints: " + ", ".join(missing_constraints) + "."
         )
+        coverage = (rerun.get("claim") or {}).get("coverage") or {}
+        coverage_ok = not coverage or bool(coverage.get("exhaustive"))
+        plausibility_flags = (rerun.get("claim") or {}).get("plausibility_flags") or []
+        plausibility_ok = not any(item.get("severity") == "error" for item in plausibility_flags)
         semantic_checks = [
             {"name": "replay_stability", "passed": replay_ok,
              "explanation": "The rerun result digest matches the original." if replay_ok
@@ -2900,6 +3218,16 @@ def _verify_query_evidence(
              "explanation": classification_explanation},
             {"name": "constraint_coverage", "passed": binding_ok and constraints_ok,
              "explanation": constraint_explanation if binding_ok else binding_explanation},
+            {"name": "population_coverage", "passed": coverage_ok,
+             "explanation": (
+                 "The result exposes an exhaustive evaluated population."
+                 if coverage else "This operation does not claim property-absence coverage."
+             )},
+            {"name": "measurement_plausibility", "passed": plausibility_ok,
+             "explanation": (
+                 "No impossible numeric invariant was detected."
+                 if plausibility_ok else "The computed result violates a numeric invariant."
+             )},
         ]
         checks.append({
             "evidence_id": evidence_id,
@@ -2911,8 +3239,13 @@ def _verify_query_evidence(
             "plan": rerun["plan"],
             "matched_count": rerun.get("matched_count"),
             "diagnostics": (
-                ["zero_match"] if int(rerun.get("matched_count") or 0) == 0 else []
+                ["verified_absence"]
+                if plan.operation == "coverage"
+                and int(((rerun.get("claim") or {}).get("coverage") or {}).get("candidate_count") or 0) > 0
+                and int(rerun.get("matched_count") or 0) == 0
+                else ["zero_match"] if int(rerun.get("matched_count") or 0) == 0 else []
             ),
+            "plausibility_flags": plausibility_flags,
             "semantic_checks": semantic_checks,
         })
     return {

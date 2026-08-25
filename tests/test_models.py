@@ -72,6 +72,13 @@ class ContractTests(unittest.TestCase):
         )
         self.assertEqual(report.claims[0].value, 2)
 
+    def test_claim_rejects_inconsistent_display_population(self):
+        with self.assertRaises(ValidationError):
+            Claim(
+                statement="Three records.", value=3, unit="records", basis="test",
+                total_count=3, displayed_count=4,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -28,6 +28,26 @@ class GeneralQueryPlanTests(unittest.TestCase):
         )
         _validate_plan(self.contract.query_entity(plan.entity), plan)
 
+    def test_accepts_explicit_property_coverage(self):
+        plan = BimQueryPlan(
+            entity="elements", operation="coverage", coverage_field="area_m2",
+        )
+        _validate_plan(self.contract.query_entity(plan.entity), plan)
+
+    def test_coverage_requires_a_known_field(self):
+        with self.assertRaisesRegex(ValueError, "coverage_field"):
+            _validate_plan(
+                self.contract.query_entity("elements"),
+                BimQueryPlan(entity="elements", operation="coverage"),
+            )
+        with self.assertRaisesRegex(ValueError, "Unknown field"):
+            _validate_plan(
+                self.contract.query_entity("elements"),
+                BimQueryPlan(
+                    entity="elements", operation="coverage", coverage_field="invented",
+                ),
+            )
+
     def test_accepts_distinct_physical_dwelling_identity(self):
         contract = load_graph_contract(
             client_id="653fbe80-e4c5-11ed-95e8-fdb8a484b2c4",
@@ -192,6 +212,65 @@ class GeneralQueryPlanTests(unittest.TestCase):
         )
 
         _validate_answer_metadata(PipelineContext(context), plan)
+
+    def test_building_scope_is_injected_but_named_floor_still_requires_filter(self):
+        context = BimRunContext(
+            bim=object(),
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=self.contract,
+            task_contract=BimTaskContract(
+                goal="Count units in the building", operation="count_distinct",
+                entity_concept="spaces",
+                constraints=[TaskConstraint(
+                    concept="building membership", requested_value="the building"
+                )],
+                required_outputs=["unit count"], success_criteria=["Scoped count"],
+            ),
+        )
+        plan = BimQueryPlan(
+            entity="spaces", operation="count_distinct", group_by="global_id",
+            answer_key="units", satisfies=["unit count"],
+        )
+        _validate_answer_metadata(PipelineContext(context), plan)
+        context.task_contract.constraints.append(
+            TaskConstraint(concept="floor", requested_value="ground floor")
+        )
+        with self.assertRaisesRegex(ValueError, "floor=ground floor"):
+            _validate_answer_metadata(PipelineContext(context), plan)
+
+    def test_per_floor_constraint_is_covered_by_level_grouping(self):
+        context = BimRunContext(
+            bim=object(),
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=self.contract,
+            task_contract=BimTaskContract(
+                goal="Count endpoints per floor", operation="group_count",
+                entity_concept="elements",
+                constraints=[TaskConstraint(concept="floor", requested_value="per floor")],
+                required_outputs=["endpoint count per floor"], success_criteria=["Floor groups"],
+            ),
+        )
+        plan = BimQueryPlan(
+            entity="elements", operation="group_count", group_by="level",
+            answer_key="endpoints", satisfies=["endpoint count per floor"],
+        )
+        _validate_answer_metadata(PipelineContext(context), plan)
+
+    def test_measurement_output_rejects_count_only_plan(self):
+        context = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=self.contract,
+            task_contract=BimTaskContract(
+                goal="Summarize length", operation="group_summary", entity_concept="elements",
+                required_outputs=["total length by type"], success_criteria=["Numeric length"],
+            ),
+        )
+        plan = BimQueryPlan(
+            entity="elements", operation="group_count", group_by="type",
+            answer_key="length", satisfies=["total length by type"],
+        )
+        with self.assertRaisesRegex(ValueError, "requires an aggregate operation and metric"):
+            _validate_answer_metadata(PipelineContext(context), plan)
 
 
 if __name__ == "__main__":

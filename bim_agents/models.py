@@ -5,7 +5,7 @@ from threading import RLock
 from typing import Any, Literal, TypeAlias
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from bim_context import BimContext
 
@@ -24,6 +24,37 @@ class ProjectScope(BaseModel):
     allowed_sources: list[str] = Field(default_factory=list)
 
 
+class ModelNodeSignature(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    labels: list[str]
+    node_count: int = Field(ge=0)
+    properties: list[str] = Field(default_factory=list)
+
+
+class ModelRelationshipPattern(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    type: str
+    from_labels: list[str]
+    to_labels: list[str]
+    relationship_count: int = Field(ge=0)
+
+
+class ProjectModelProfile(BaseModel):
+    """Immutable routing cache; never authoritative evidence for answer values."""
+
+    model_config = ConfigDict(frozen=True)
+
+    profile_version: int = 1
+    schema_fingerprint: str = ""
+    authorized_source_count: int = Field(ge=0)
+    node_types: list[ModelNodeSignature] = Field(default_factory=list)
+    relationship_types: list[ModelRelationshipPattern] = Field(default_factory=list)
+    scope_note: str
+    freshness_note: str
+
+
 class TaskConstraint(BaseModel):
     concept: str
     requested_value: str
@@ -35,6 +66,13 @@ class EvidenceWorkPackage(BaseModel):
     package_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,47}$")
     objective: str = Field(min_length=1)
     required_outputs: list[str] = Field(min_length=1)
+    constraints: list[TaskConstraint] | None = Field(
+        default=None,
+        description=(
+            "Constraints owned by this package. Null inherits contract constraints for "
+            "legacy single-package tasks; an empty list explicitly means project scope only."
+        ),
+    )
     depends_on: list[str] = Field(default_factory=list)
     route_hint: Literal["auto", "contract", "geometry", "live_schema", "requirements"] = "auto"
 
@@ -45,7 +83,7 @@ class BimTaskContract(BaseModel):
     goal: str
     operation: Literal[
         "count", "count_distinct", "list", "group_count", "group_summary", "distinct",
-        "sum", "average", "minimum", "maximum", "maximum_group_sum",
+        "sum", "average", "minimum", "maximum", "maximum_group_sum", "coverage",
         "multi_group_count", "multi_group_summary", "project_graph_count",
     ]
     entity_concept: str
@@ -82,6 +120,17 @@ class BimTaskContract(BaseModel):
         assigned = [output for item in self.work_packages for output in item.required_outputs]
         if len(set(assigned)) != len(assigned) or set(assigned) != set(self.required_outputs):
             raise ValueError("work packages must partition required_outputs exactly once.")
+        contract_constraints = {
+            (item.concept.casefold(), item.requested_value.casefold())
+            for item in self.constraints
+        }
+        for package in self.work_packages:
+            for constraint in package.constraints or []:
+                key = (constraint.concept.casefold(), constraint.requested_value.casefold())
+                if key not in contract_constraints:
+                    raise ValueError(
+                        "work package constraints must be declared by the task contract."
+                    )
         return self
 
 
@@ -160,9 +209,59 @@ class SemanticCheck(BaseModel):
         "replay_stability", "authorized_scope", "identity_integrity",
         "constraint_binding", "counting_unit", "boundary_exactness",
         "source_deduplication", "classification_purity", "constraint_coverage",
+        "population_coverage", "measurement_plausibility",
     ]
     passed: bool
     explanation: str
+
+
+class PopulationCoverage(BaseModel):
+    """Machine-readable denominator for a BIM result or absence finding."""
+
+    candidate_count: int = Field(ge=0)
+    evaluated_count: int = Field(ge=0)
+    matched_count: int = Field(ge=0)
+    missing_count: int = Field(default=0, ge=0)
+    unknown_count: int = Field(default=0, ge=0)
+    excluded_count: int = Field(default=0, ge=0)
+    exhaustive: bool = False
+
+    @model_validator(mode="after")
+    def validate_population(self) -> "PopulationCoverage":
+        if self.evaluated_count + self.unknown_count > self.candidate_count:
+            raise ValueError("Evaluated and unknown populations exceed the candidate population.")
+        if self.matched_count > self.evaluated_count:
+            raise ValueError("Matched population cannot exceed the evaluated population.")
+        if self.matched_count + self.missing_count > self.evaluated_count:
+            raise ValueError("Matched and missing populations exceed the evaluated population.")
+        if self.exhaustive and self.unknown_count:
+            raise ValueError("An exhaustive population cannot contain unknown records.")
+        return self
+
+
+class MeasurementMetadata(BaseModel):
+    """Source-to-canonical measurement provenance; conversion is applied exactly once."""
+
+    source_value: ScalarValue = None
+    source_unit: str | None = None
+    canonical_unit: str | None = None
+    conversion_factor: float = Field(default=1.0, gt=0)
+    conversion_basis: str = "identity conversion"
+    source_property: str = ""
+
+
+class PlausibilityFlag(BaseModel):
+    code: str
+    severity: Literal["warning", "error"]
+    message: str
+    evidence_ids: list[str] = Field(default_factory=list)
+
+
+class OutputStatus(BaseModel):
+    output: str
+    status: Literal["verified", "unsupported", "conflict"]
+    evidence_ids: list[str] = Field(default_factory=list)
+    limitation: str = ""
 
 
 class Claim(BaseModel):
@@ -175,6 +274,24 @@ class Claim(BaseModel):
     total_count: int | None = Field(default=None, ge=0)
     displayed_count: int | None = Field(default=None, ge=0)
     confidence: float = Field(default=1.0, ge=0, le=1)
+    coverage: PopulationCoverage | None = None
+    measurement: MeasurementMetadata | None = None
+    source_tags: list[str] = Field(default_factory=list)
+    method: str = ""
+    caveats: list[str] = Field(default_factory=list)
+    plausibility_flags: list[PlausibilityFlag] = Field(default_factory=list)
+    answer_key: str = ""
+    satisfies: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_display_population(self) -> "Claim":
+        if (
+            self.total_count is not None
+            and self.displayed_count is not None
+            and self.displayed_count > self.total_count
+        ):
+            raise ValueError("displayed_count cannot exceed total_count.")
+        return self
 
 
 class Evidence(BaseModel):
@@ -250,6 +367,7 @@ class VerificationReport(BaseModel):
     rejected_claims: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     semantic_checks: list[SemanticCheck] = Field(default_factory=list)
+    plausibility_flags: list[PlausibilityFlag] = Field(default_factory=list)
 
 
 class PipelineReport(BaseModel):
@@ -261,6 +379,8 @@ class PipelineReport(BaseModel):
     investigation_trace: list[str] = Field(default_factory=list)
     semantic_checks: list[SemanticCheck] = Field(default_factory=list)
     failure_categories: list[str] = Field(default_factory=list)
+    plausibility_flags: list[PlausibilityFlag] = Field(default_factory=list)
+    output_statuses: list[OutputStatus] = Field(default_factory=list)
     verification_status: Literal["verified", "insufficient_evidence", "conflict"]
 
 
@@ -295,6 +415,7 @@ class BimRunContext:
     artifacts: dict[str, RunArtifact] = field(default_factory=dict)
     schema_mappings: dict[str, object] = field(default_factory=dict)
     schema_discovery: dict[str, object] = field(default_factory=dict)
+    model_profile: ProjectModelProfile | None = None
     evidence: dict[str, Evidence] = field(default_factory=dict)
     knowledge_store: Any | None = None
     schema_fingerprint: str = ""

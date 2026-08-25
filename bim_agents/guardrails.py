@@ -4,7 +4,7 @@ import json
 
 from .models import (
     BimQueryReport, BimRunContext, Claim, PipelineReport, SemanticCheck,
-    VerificationReport,
+    PlausibilityFlag, VerificationReport,
 )
 
 
@@ -26,6 +26,14 @@ def _claim_from_payload(payload: dict, evidence_ids: list[str]) -> Claim:
         details=[str(item) for item in claim_payload.get("details") or []],
         total_count=claim_payload.get("total_count"),
         displayed_count=claim_payload.get("displayed_count"),
+        coverage=claim_payload.get("coverage"),
+        measurement=claim_payload.get("measurement"),
+        source_tags=[str(item) for item in claim_payload.get("source_tags") or []],
+        method=str(claim_payload.get("method") or ""),
+        caveats=[str(item) for item in claim_payload.get("caveats") or []],
+        plausibility_flags=claim_payload.get("plausibility_flags") or [],
+        answer_key=str(claim_payload.get("answer_key") or ""),
+        satisfies=[str(item) for item in claim_payload.get("satisfies") or []],
         confidence=1.0,
     )
 
@@ -39,6 +47,8 @@ def _claim_signatures(claims: list[Claim]) -> list[tuple]:
             tuple(claim.details),
             claim.total_count,
             claim.displayed_count,
+            claim.coverage.model_dump_json() if claim.coverage else None,
+            claim.measurement.model_dump_json() if claim.measurement else None,
         )
         for claim in claims
     ]
@@ -115,6 +125,7 @@ def verification_report_from_evidence(context: BimRunContext) -> VerificationRep
     semantic_checks: list[SemanticCheck] = []
     verified_entries: list[tuple[Claim, dict]] = []
     satisfied_outputs: set[str] = set()
+    plausibility_flags: list[PlausibilityFlag] = []
     for check in payload.get("checks") or []:
         plan = check.get("plan") or {}
         include_in_answer = _is_answer_plan(plan)
@@ -129,11 +140,20 @@ def verification_report_from_evidence(context: BimRunContext) -> VerificationRep
             SemanticCheck.model_validate(item)
             for item in check.get("semantic_checks") or []
         )
+        for item in check.get("plausibility_flags") or []:
+            flag = PlausibilityFlag.model_validate(item)
+            if not flag.evidence_ids:
+                flag = flag.model_copy(update={"evidence_ids": [str(check.get("evidence_id"))]})
+            plausibility_flags.append(flag)
         if check.get("verified") is True and include_in_answer:
             claim = _claim_from_payload(
                 {"claim": check.get("claim") or {}},
                 [str(check.get("evidence_id")), evidence_id],
             )
+            if not claim.answer_key:
+                claim.answer_key = str(plan.get("answer_key") or "")
+            if not claim.satisfies:
+                claim.satisfies = [str(item) for item in plan.get("satisfies") or []]
             verified_entries.append((claim, plan))
         elif include_in_answer:
             failed_checks = [
@@ -184,12 +204,14 @@ def verification_report_from_evidence(context: BimRunContext) -> VerificationRep
             verified_claims=_consolidate_claims(claims),
             limitations=list(dict.fromkeys(limitations)),
             semantic_checks=semantic_checks,
+            plausibility_flags=plausibility_flags,
         )
     return VerificationReport(
         status="insufficient_evidence",
         rejected_claims=rejected or ["No independently reproducible BIM query result was produced."],
         limitations=list(dict.fromkeys(limitations)),
         semantic_checks=semantic_checks,
+        plausibility_flags=plausibility_flags,
     )
 
 
@@ -202,6 +224,19 @@ def pipeline_report_from_evidence(context: BimRunContext) -> PipelineReport:
         f"{artifact.producer}: {artifact.summary}"
         for artifact in context.artifacts.values()
     ]
+    plausibility_flags = verification.plausibility_flags
+    required_outputs = list(context.task_contract.required_outputs if context.task_contract else [])
+    output_statuses = []
+    for output in required_outputs:
+        supporting_claims = [claim for claim in verification.verified_claims if output in claim.satisfies]
+        output_statuses.append({
+            "output": output,
+            "status": "verified" if supporting_claims else "unsupported",
+            "evidence_ids": list(dict.fromkeys(
+                evidence_id for claim in supporting_claims for evidence_id in claim.evidence_ids
+            )),
+            "limitation": "" if supporting_claims else f"No replay-verified evidence satisfied {output!r}.",
+        })
     if verification.verified_claims:
         verified_answer = "\n\n".join(
             _render_claim_answer(claim) for claim in verification.verified_claims
@@ -229,6 +264,8 @@ def pipeline_report_from_evidence(context: BimRunContext) -> PipelineReport:
             investigation_trace=investigation_trace,
             semantic_checks=verification.semantic_checks,
             failure_categories=list(dict.fromkeys(context.failure_categories)),
+            plausibility_flags=plausibility_flags,
+            output_statuses=output_statuses,
             verification_status=status,
         )
     return PipelineReport(
@@ -239,5 +276,6 @@ def pipeline_report_from_evidence(context: BimRunContext) -> PipelineReport:
         investigation_trace=investigation_trace,
         semantic_checks=verification.semantic_checks,
         failure_categories=list(dict.fromkeys(context.failure_categories)),
+        output_statuses=output_statuses,
         verification_status="insufficient_evidence",
     )

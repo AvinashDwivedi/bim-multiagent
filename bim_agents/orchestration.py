@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass, field
 import json
 import os
+import re
 from typing import Callable
 
 from agents import MaxTurnsExceeded, Runner
@@ -53,7 +54,7 @@ def package_contract(
         goal=package.objective,
         operation=contract.operation,
         entity_concept=contract.entity_concept,
-        constraints=list(contract.constraints),
+        constraints=_package_constraints(contract, package),
         questions_to_resolve=list(contract.questions_to_resolve),
         required_outputs=list(package.required_outputs),
         success_criteria=[
@@ -62,6 +63,27 @@ def package_contract(
         ] or [f"Produce replayable evidence for {output}." for output in package.required_outputs],
         complexity=contract.complexity,
     )
+
+
+def _package_constraints(
+    contract: BimTaskContract, package: EvidenceWorkPackage,
+) -> list:
+    """Project global constraints onto the output package that actually owns them."""
+    if package.constraints is not None:
+        return list(package.constraints)
+    packages = evidence_work_packages(contract)
+    if len(packages) == 1:
+        return list(contract.constraints)
+    package_text = " ".join([
+        package.objective, *package.required_outputs,
+    ]).casefold()
+    selected = []
+    for constraint in contract.constraints:
+        concept = constraint.concept.casefold().strip()
+        value = constraint.requested_value.casefold().strip()
+        if (value and value in package_text) or (concept and concept in package_text):
+            selected.append(constraint)
+    return selected
 
 
 def _branch_limit(total: int, consumed: int, workstream_count: int, minimum: int) -> int:
@@ -143,6 +165,39 @@ def _checkpoint_handoff(
     )
 
 
+def trusted_geometry_handoff(
+    root: BimRunContext, package: EvidenceWorkPackage,
+) -> EvidenceHandoff | None:
+    """Resolve an exact project-governed calculation before open-ended discovery."""
+    if package.route_hint not in {"auto", "geometry"}:
+        return None
+    text = " ".join([
+        root.question, package.objective, *package.required_outputs,
+    ]).casefold()
+    normalized = re.sub(r"\s+", " ", text)
+    matches: list[tuple[int, str, dict]] = []
+    ontology = getattr(root.bim, "ontology", None)
+    knowledge = getattr(ontology, "bim_query_knowledge", {})
+    for config in knowledge.values():
+        if not isinstance(config, dict) or not config.get("calculation"):
+            continue
+        terms = [str(term).casefold().strip() for term in config.get("route_terms") or []]
+        matched = [term for term in terms if term and term in normalized]
+        if matched:
+            matches.append((max(map(len, matched)), str(config["calculation"]), config))
+    if not matches:
+        return None
+    _, calculation, config = max(matches, key=lambda item: item[0])
+    return EvidenceHandoff(
+        package_id=package.package_id,
+        status="ready_for_query",
+        route="geometry",
+        calculation=calculation,
+        operation=root.task_contract.operation if root.task_contract else "",
+        evidence_summary=str(
+            config.get("semantics") or "Project-governed deterministic geometry calculation."
+        ),
+    )
 async def _run_one_workstream(
     *,
     settings: Settings,
@@ -169,6 +224,7 @@ async def _run_one_workstream(
                 parent_workstream_id=root.workstream_id,
                 schema_mappings=dict(root.schema_mappings),
                 schema_fingerprint=root.schema_fingerprint,
+                model_profile=root.model_profile,
                 learned_knowledge=dict(root.learned_knowledge),
                 max_llm_calls=_branch_limit(
                     root.max_llm_calls, root.llm_calls, package_count, 6
@@ -188,23 +244,31 @@ async def _run_one_workstream(
                 "workstream_start", run_id=root.run_id,
                 workstream_id=workstream_id, outputs=len(package.required_outputs),
             )
-            try:
-                scout_result = await Runner.run(
-                    registry.schema_scout,
-                    _worker_input(root.question, root.task_contract, package),
-                    context=branch,
-                    max_turns=int(os.getenv("BIM_SCOUT_MAX_TURNS", "18")),
-                    hooks=hooks,
-                )
-                handoff = EvidenceHandoff.model_validate(scout_result.final_output)
-            except MaxTurnsExceeded:
-                handoff = _checkpoint_handoff(root, branch, package)
-                if handoff is None:
-                    raise
+            handoff = trusted_geometry_handoff(root, package)
+            if handoff is not None:
                 events.stage(
-                    "scout_checkpoint_recovered", run_id=root.run_id,
-                    workstream_id=workstream_id, mapping_id=handoff.mapping_id,
+                    "trusted_route_selected", run_id=root.run_id,
+                    workstream_id=workstream_id, route="geometry",
+                    calculation=handoff.calculation,
                 )
+            else:
+                try:
+                    scout_result = await Runner.run(
+                        registry.schema_scout,
+                        _worker_input(root.question, worker_contract, package),
+                        context=branch,
+                        max_turns=int(os.getenv("BIM_SCOUT_MAX_TURNS", "18")),
+                        hooks=hooks,
+                    )
+                    handoff = EvidenceHandoff.model_validate(scout_result.final_output)
+                except MaxTurnsExceeded:
+                    handoff = _checkpoint_handoff(root, branch, package)
+                    if handoff is None:
+                        raise
+                    events.stage(
+                        "scout_checkpoint_recovered", run_id=root.run_id,
+                        workstream_id=workstream_id, mapping_id=handoff.mapping_id,
+                    )
             if handoff.package_id != package.package_id:
                 raise ValueError("Schema scout returned a handoff for a different work package.")
             if handoff.status == "unsupported":
@@ -216,7 +280,7 @@ async def _run_one_workstream(
                     package, branch, "unsupported", limitations=list(handoff.limitations)
                 )
             query_input = (
-                _worker_input(root.question, root.task_contract, package)
+                _worker_input(root.question, worker_contract, package)
                 + "\nSCOUT_HANDOFF:\n"
                 + handoff.model_dump_json()
             )

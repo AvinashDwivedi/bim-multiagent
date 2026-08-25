@@ -20,6 +20,13 @@ KNOWLEDGE = {
         "door_quantity_set": "Qto_DoorBaseQuantities", "opening_area_quantity": "Area",
         "repeated_floor_min_count": 2, "semantics": "Test facade rule.",
     },
+    "tower_floor_area": {
+        "space_label": "IfcSpace", "type_property": "canonical_type",
+        "floor_plate_type": "residential_zone", "basis_property": "Bepalingsmethode",
+        "floor_plate_basis": "BVO", "area_property": "canonical_area_m2",
+        "level_property": "canonical_level", "repeated_floor_min_count": 2,
+        "repeated_area_precision": 3, "semantics": "Test tower rule.",
+    },
 }
 
 
@@ -38,6 +45,14 @@ class FakeBim:
             return [
                 slab(100, 5, "01"), slab(90, 8, "02"), slab(380, 11, "03"),
                 slab(381, 14, "04"), slab(562, 38, "12"),
+            ]
+        if "IfcBuildingStorey" in cypher:
+            return [{"highest_storey_elevation_m": 41.0}]
+        if "IfcSpace" in cypher:
+            return [
+                {"level": "05", "area_m2": 586.248, "records": 1},
+                {"level": "06", "area_m2": 586.248, "records": 1},
+                {"level": "ground", "area_m2": 234.34, "records": 1},
             ]
         if "IfcWall" in cypher:
             return [
@@ -66,6 +81,7 @@ class GeometryTests(unittest.TestCase):
         )
         self.assertEqual(report.verification_status, "verified")
         self.assertIn("11 m, 14 m, 38 m", report.answer)
+        self.assertIn("highest defined storey reference elevation is 41 m", report.answer)
 
     def test_derives_repeated_tower_facade_ratio(self):
         report = calculate_project_geometry(
@@ -73,6 +89,14 @@ class GeometryTests(unittest.TestCase):
         )
         self.assertEqual(report.verification_status, "verified")
         self.assertIn("43.6% (approximately 45%)", report.answer)
+
+    def test_derives_governed_tower_maximum_floor_area(self):
+        report = calculate_project_geometry(
+            "tower_max_floor_area", FakeBim(), ["source"], KNOWLEDGE
+        )
+        self.assertEqual(report.verification_status, "verified")
+        self.assertIn("586.25 m² BVO", report.answer)
+        self.assertIn("05, 06", report.answer)
 
 
 if __name__ == "__main__":

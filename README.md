@@ -7,7 +7,8 @@ A coding-agent-style, read-only system for investigating one authorized BIM proj
 1. The Task Architect creates one typed contract and a small evidence-work-package DAG.
 2. A deterministic scheduler launches ready packages concurrently (three by default).
 3. Every package gets its own BIM connection, mutable state, budgets, and causal workstream ID.
-4. A Schema Scout resolves a trusted contract, geometry route, learned mapping, or live mapping.
+4. Exact project-governed calculations are selected deterministically before exploration; otherwise a
+   Schema Scout resolves a trusted contract, governed mapping, learned mapping, or live mapping.
 5. A fresh Query Worker receives only the package and compact typed scout handoff, then submits the
    smallest declarative answer query. It has no discovery or mapping tools.
 6. The runtime validates each staged delta, atomically commits non-conflicting evidence, replays scoped
@@ -41,7 +42,8 @@ Query Worker conversation or another workstream.
 ## Multiagent kernel
 
 The Task Architect partitions required outputs exactly once into one to four packages (six is the schema
-limit). Outputs sharing an entity, filters, grouping dimensions, and metric stay together. Modelled facts,
+limit). Constraints are owned by packages, so a ground-floor filter cannot leak into a sibling whole-building
+total. Outputs sharing an entity, filters, grouping dimensions, and metric stay together. Modelled facts,
 requirements, and unrelated geometry can be independent packages. `BIM_MAX_PARALLEL_WORKERS` controls the
 runtime concurrency limit.
 
@@ -53,13 +55,27 @@ remain available in the package's isolated artifact ledger.
 
 Answer-producing queries must name a stable `answer_key`, declare the exact package outputs they satisfy,
 and include every task constraint as a real query filter. The runtime rejects a ground-floor claim backed by
-an unfiltered project-wide query. Missing-data probes remain non-rendered supporting evidence but can satisfy
-missing-data outputs. Zero matches, missing metrics, and changed values for one answer key are diagnostics.
+an unfiltered project-wide query. Diagnostic `is_missing` filters remain non-rendered supporting evidence;
+the first-class `coverage` operation may answer an absence/completeness question only after scanning the full
+scoped candidate population and reporting populated and missing denominators. Zero matches, missing metrics,
+and changed values for one answer key are diagnostics.
 
 The runtime independently checks scope, entity evidence, physical identity, classification, units,
 required-output coverage, contradictions, and replay stability. Replay-verified facts lead the response even
 when secondary completion gates remain open; unresolved checks follow as caveats. Task complexity adjusts
 model/tool budgets without storing project-specific numeric answers.
+
+At run start, deterministic code builds one compact scoped model profile containing label/property surfaces
+and relationship patterns. Isolated scouts share this immutable routing profile instead of rediscovering the
+same graph in separate conversations. It is explicitly a cache hint: exact bindings, current values, counts,
+and absence findings are always executed and replayed live.
+
+Numeric mappings retain `source_unit`, canonical `unit`, `conversion_factor`, conversion basis, and source
+property. Aggregation and numeric filters convert exactly once at the compiler boundary. Claims expose typed
+population coverage, measurement provenance, method, source tags, per-claim caveats and plausibility flags;
+reports also expose a terminal status for every required output. Impossible invariant violations (non-finite
+or negative physical measurements and percentages outside 0–100) block verification, while unusual but
+possible values can remain visible as warnings.
 
 ## Guarded project learning
 
@@ -86,7 +102,8 @@ insufficient-evidence, zero-match, or diagnostic-bearing runs cannot promote kno
 
 Governed project mappings are a faster bootstrap for known difficult schemas. A scout can select only a
 server-configured knowledge key; deterministic code then verifies the configured label, authorization and
-identity properties, exact category/family boundary, and live value population before registering it. The
+identity properties, exact category/family boundary, numeric fields and units, optional missing-data fields,
+and live value population before registering it. The
 configuration stores semantics, never counts or answer values, and fails closed when the live schema changes.
 
 The active registry contains a Task Architect, BIM Schema Scout, and BIM Query Worker. Replay verification,
