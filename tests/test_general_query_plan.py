@@ -3,11 +3,14 @@ import unittest
 from pydantic import ValidationError
 
 from bim_agents.graph_contract import load_graph_contract
+from bim_agents.models import BimRunContext, BimTaskContract, ProjectScope, TaskConstraint
 from bim_agents.tools import (
     BimFilter,
     BimQueryPlan,
+    PipelineContext,
     _format_space_rows,
     _space_list_headline,
+    _validate_answer_metadata,
     _validate_plan,
 )
 
@@ -143,6 +146,52 @@ class GeneralQueryPlanTests(unittest.TestCase):
         self.assertTrue(
             BimQueryPlan(entity="spaces", operation="count", include_details=True).include_details
         )
+
+    def test_answer_plan_cannot_drop_ground_floor_task_constraint(self):
+        context = BimRunContext(
+            bim=object(),
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=self.contract,
+            task_contract=BimTaskContract(
+                goal="Summarize ground-floor functions", operation="group_summary",
+                entity_concept="spaces",
+                constraints=[TaskConstraint(concept="floor", requested_value="ground floor")],
+                required_outputs=["function counts and areas"],
+                success_criteria=["Ground-floor filter is explicit"],
+            ),
+        )
+        unfiltered = BimQueryPlan(
+            entity="spaces", operation="group_summary", group_by="type", metric="area_m2",
+            answer_key="ground-functions", satisfies=["function counts and areas"],
+        )
+        with self.assertRaisesRegex(ValueError, "omits required task constraints"):
+            _validate_answer_metadata(PipelineContext(context), unfiltered)
+
+        filtered = unfiltered.model_copy(update={
+            "filters": [BimFilter(field="level", operator="equals", value="ground floor")]
+        })
+        _validate_answer_metadata(PipelineContext(context), filtered)
+
+    def test_authorized_scope_is_governance_not_a_query_filter(self):
+        context = BimRunContext(
+            bim=object(),
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=self.contract,
+            task_contract=BimTaskContract(
+                goal="Count spaces", operation="count", entity_concept="spaces",
+                constraints=[TaskConstraint(
+                    concept="authorized scope", requested_value="configured BIM project"
+                )],
+                required_outputs=["space count"],
+                success_criteria=["Scoped count"],
+            ),
+        )
+        plan = BimQueryPlan(
+            entity="spaces", operation="count", answer_key="spaces",
+            satisfies=["space count"],
+        )
+
+        _validate_answer_metadata(PipelineContext(context), plan)
 
 
 if __name__ == "__main__":

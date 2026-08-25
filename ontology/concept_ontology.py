@@ -130,6 +130,29 @@ def _merge_nested_map(base: dict, overlay: dict) -> dict:
     return out
 
 
+def _validate_bim_query_knowledge(knowledge: dict) -> None:
+    """Reject answer keys while allowing semantic mappings and calculation recipes."""
+    forbidden_sections = {"facts", "answers", "expected_answers", "golden_values"}
+
+    def visit(value, path: tuple[str, ...] = ()):
+        if not isinstance(value, dict):
+            return
+        forbidden = forbidden_sections.intersection(value)
+        if forbidden:
+            location = ".".join(path) or "bim_query_knowledge"
+            raise ValueError(
+                f"{location} contains forbidden direct-answer section(s): "
+                + ", ".join(sorted(forbidden))
+            )
+        if "statement" in value and "value" in value:
+            location = ".".join(path) or "bim_query_knowledge"
+            raise ValueError(f"{location} stores a direct answer (statement + value).")
+        for key, child in value.items():
+            visit(child, (*path, str(key)))
+
+    visit(knowledge)
+
+
 def _merge_named_map(result: dict, section: str, overlay_section: dict, merge_fn):
     """Merge a top-level slug->dict section (concepts / permit_measures). New slugs add
     wholesale; existing slugs merge via merge_fn."""
@@ -194,7 +217,9 @@ class ConceptOntology:
         # CP-PM4: project-level permit measures (mirror of bim_tools._MEASURE_SYNONYMS +
         # chunker_bim._PERMIT_MEASURE_EXTRACT + the two _*_measure_for_level helpers).
         self.permit_measures: dict[str, dict] = dict(data.get("permit_measures") or {})
-        self.bim_query_knowledge: dict[str, dict] = dict(data.get("bim_query_knowledge") or {})
+        knowledge = dict(data.get("bim_query_knowledge") or {})
+        _validate_bim_query_knowledge(knowledge)
+        self.bim_query_knowledge: dict[str, dict] = knowledge
         # CP-S3: Hebrew 2D-plan room labels (slug -> exact label terms). Consumed by
         # chunker_bim._extract_room_label_nodes via classify_room_label().
         self.room_labels: dict[str, list[str]] = dict(data.get("room_labels") or {})
@@ -292,8 +317,19 @@ class ConceptOntology:
             return None
         tl = term.lower().strip()
         ifc = self._element_alias.get(tl)
-        if ifc is None and tl.endswith("s"):
-            ifc = self._element_alias.get(tl[:-1])
+        if ifc is None:
+            candidates = []
+            if len(tl) > 4 and tl.endswith("ies"):
+                candidates.append(tl[:-3] + "y")
+            if len(tl) > 4 and tl.endswith("es"):
+                candidates.append(tl[:-2])
+            if len(tl) > 3 and tl.endswith("s"):
+                candidates.append(tl[:-1])
+            ifc = next(
+                (self._element_alias[candidate] for candidate in candidates
+                 if candidate in self._element_alias),
+                None,
+            )
         return list(ifc) if ifc is not None else None
 
     # -- ingest classification (mirror of the chunker_bim / backfill classifiers) -

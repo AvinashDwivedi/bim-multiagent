@@ -1,15 +1,16 @@
 import unittest
 
+from pydantic import ValidationError
+
 from bim_agents.models import (
-    BimTaskContract, Claim, PipelineReport, ProjectScope, RunArtifact, TaskConstraint,
+    BimRunContext, BimTaskContract, Claim, Evidence, EvidenceWorkPackage,
+    PipelineReport, ProjectScope, RunArtifact, TaskConstraint,
 )
 
 
 class ContractTests(unittest.TestCase):
     def test_run_context_records_append_only_workflow_artifacts(self):
         from bim_agents.graph_contract import load_graph_contract
-        from bim_agents.models import BimRunContext
-
         context = BimRunContext(
             bim=object(), scope=ProjectScope(client_id="client", project_id="project"),
             graph_contract=load_graph_contract(),
@@ -19,6 +20,7 @@ class ContractTests(unittest.TestCase):
             entity_concept="apartment",
             constraints=[TaskConstraint(concept="level", requested_value="ground floor")],
             questions_to_resolve=["What record represents one apartment?"],
+            required_outputs=["ground-floor apartment count"],
             success_criteria=["Use a unique apartment identity."],
         )
         artifact = RunArtifact(
@@ -34,6 +36,33 @@ class ContractTests(unittest.TestCase):
     def test_project_scope(self):
         scope = ProjectScope(client_id="client", project_id="project", allowed_sources=["a.ifc"])
         self.assertEqual(scope.allowed_sources, ["a.ifc"])
+
+    def test_work_packages_must_partition_required_outputs(self):
+        with self.assertRaises(ValidationError):
+            BimTaskContract(
+                goal="Count and list", operation="count", entity_concept="switches",
+                required_outputs=["count", "types"],
+                work_packages=[EvidenceWorkPackage(
+                    package_id="count", objective="Count switches",
+                    required_outputs=["count"],
+                )],
+                success_criteria=["Both outputs are verified"],
+            )
+
+    def test_evidence_ledger_rejects_duplicate_ids(self):
+        from bim_agents.graph_contract import load_graph_contract
+
+        context = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+        )
+        context.add_evidence(Evidence(
+            evidence_id="q1", kind="query", summary="first",
+        ))
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            context.add_evidence(Evidence(
+                evidence_id="q1", kind="query", summary="second",
+            ))
 
     def test_pipeline_report_uses_verified_contract(self):
         claim = Claim(statement="There are 2 spaces.", value=2, unit="spaces", basis="distinct IDs")

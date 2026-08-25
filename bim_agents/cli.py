@@ -10,11 +10,13 @@ from .runtime import answer_bim_question
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Run a project-scoped BIM calculation pipeline.")
     parser.add_argument("question", help="The BIM question to answer")
     parser.add_argument("--client-id", help="Client UUID for this request (overrides BIM_CLIENT_ID)")
     parser.add_argument("--project-id", help="Project UUID for this request (overrides BIM_PROJECT_ID)")
-    parser.add_argument("--timeout", type=float, default=None, help="Maximum total runtime in seconds (default: 240)")
+    parser.add_argument("--timeout", type=float, default=None, help="Maximum total runtime in seconds (default: 600)")
     parser.add_argument("--log-file", help="Also write detailed lifecycle logs to this file")
     parser.add_argument("--quiet", action="store_true", help="Hide progress logs")
     args = parser.parse_args()

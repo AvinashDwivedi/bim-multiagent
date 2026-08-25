@@ -66,7 +66,23 @@ class GraphDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(result["node_type_count"], 1)
         self.assertEqual(result["node_types"][0]["properties"], ["name", "source"])
-        self.assertEqual(result["relationship_pattern_count"], 0)
+        self.assertTrue(result["node_types"][0]["focus_match"])
+        self.assertEqual(result["relationship_pattern_count"], 2)
+        self.assertEqual(result["focus_mode"], "ranking_only")
+        self.assertFalse(result["focus_fallback_used"])
+
+    def test_unmatched_focus_never_erases_the_authorized_schema(self):
+        result = _project_graph_structure(
+            self.context,
+            include_properties=False,
+            focus="electrical switch",
+        )
+
+        self.assertEqual(result["node_type_count"], 1)
+        self.assertEqual(result["relationship_pattern_count"], 2)
+        self.assertIn("IfcWall", result["unique_node_labels"])
+        self.assertEqual(result["focus_match_count"], 0)
+        self.assertTrue(result["focus_fallback_used"])
 
 
 if __name__ == "__main__":

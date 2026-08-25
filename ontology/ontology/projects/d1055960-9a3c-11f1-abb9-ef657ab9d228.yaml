@@ -1,0 +1,30 @@
+# Project-scoped semantic mappings observed in the electrical Revit model.
+# These are classification/identity rules only; all counts and measurements
+# must still be queried and replayed from the authorized live graph.
+bim_query_knowledge:
+  lighting_switches:
+    entity_concept: lighting switches
+    aliases: [switch, switches, lighting switch, "מפסק", "מפסקים"]
+    label: IfcBuildingElementProxy
+    source_property: source
+    identity_property: GlobalID
+    category_property: Category
+    category_value: Lighting Devices
+    classification_property: Family
+    exact_family_values:
+      - ED_SwitchButton
+      - M_Lighting Switches_Y23
+      - "מפסק דו קוטבי"
+      - LD_Lighting Switch Water Proof
+    type_property: Type
+    counting_unit: physical lighting-switch instance
+    counting_unit_semantics: >-
+      Count distinct populated GlobalID values. The listed families are the complete
+      switch-specific branches observed under Lighting Devices; the broad category also
+      contains unrelated exit signs and must not be used alone.
+    related_excluded_branch:
+      category: Electrical Fixtures
+      family: Y_switch_Open door
+      semantics: >-
+        This is a door-opening/intercom switch, not a lighting switch. It may be reported
+        separately when the user explicitly requests the broader electrical-switch scope.

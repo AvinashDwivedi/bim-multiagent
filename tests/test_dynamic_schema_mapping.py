@@ -1,7 +1,8 @@
+import json
 import unittest
 
 from bim_agents.graph_contract import load_graph_contract
-from bim_agents.models import BimRunContext, ProjectScope
+from bim_agents.models import BimRunContext, BimTaskContract, ProjectScope
 from bim_agents.schema_mapping import (
     RegisteredSchemaMapping,
     SchemaFieldMapping,
@@ -13,9 +14,15 @@ from bim_agents.schema_mapping import (
 from bim_agents.tools import (
     BimFilter,
     BimQueryPlan,
+    PipelineContext,
     _entity_from_registered_mapping,
     _execute_plan,
+    _resolve_canonical_type,
+    _validate_hierarchy_binding_coverage,
+    _rank_hybrid_candidates,
     _rank_embedding_candidates,
+    inspect_queryable_node_types,
+    profile_project_classification_hierarchy,
 )
 
 
@@ -27,7 +34,7 @@ class _Ontology:
         return []
 
     def retrieval_terms_for(self, term):
-        return []
+        return ["lighting switch", "SwitchButton"] if "switch" in term else []
 
     def absence_notes_for_query(self, term):
         return []
@@ -48,7 +55,192 @@ class _Bim:
         raise AssertionError(f"Unexpected query: {cypher}")
 
 
+class _DiscoveryBim:
+    ontology = _Ontology()
+
+    def query(self, cypher, parameters=None):
+        if "RETURN labels(n) AS labels" in cypher:
+            return [{
+                "labels": ["BIMElement", "IfcBuildingElementProxy"],
+                "node_count": 37,
+                "property_key_groups": [[
+                    "source", "GlobalID", "name", "Category", "Family", "Type",
+                    *[f"Verbose Property {index}" for index in range(100)],
+                ]],
+                "sample_names": ["LD_Lighting Switch Water Proof:Single"],
+            }]
+        if "count(DISTINCT n) AS record_count" in cypher:
+            return [
+                {"value_0": "Lighting Devices", "value_1": "Emergency Exit Sign", "value_2": "Exit Sign", "record_count": 16},
+                {"value_0": "Lighting Devices", "value_1": "M_Lighting Switches", "value_2": "Single Pole", "record_count": 6},
+                {"value_0": "Lighting Devices", "value_1": "ED_SwitchButton", "value_2": "Button", "record_count": 4},
+            ]
+        raise AssertionError(f"Unexpected query: {cypher}")
+
+
+class _SplitSignatureDiscoveryBim(_DiscoveryBim):
+    def query(self, cypher, parameters=None):
+        if "RETURN labels(n) AS labels" in cypher:
+            return [
+                {
+                    "labels": ["BIMElement", "IfcBuildingElementProxy"],
+                    "node_count": 100,
+                    "property_key_groups": [["source", "GlobalID", "name"]],
+                    "sample_names": ["Generic proxy"],
+                },
+                {
+                    "labels": ["IfcBuildingElementProxy", "RevitElement"],
+                    "node_count": 37,
+                    "property_key_groups": [[
+                        "source", "GlobalID", "Category", "Family", "Type"
+                    ]],
+                    "sample_names": ["Lighting switch"],
+                },
+            ]
+        return super().query(cypher, parameters)
+
+
 class DynamicSchemaMappingTests(unittest.TestCase):
+    def _switch_mapping_proposal(self, classification_property):
+        classification_name = {
+            "Category": "category", "Family": "family",
+        }.get(classification_property, "switch_classification")
+        selected_values = {
+            "Category": ["Lighting Devices"],
+            "Family": ["M_Lighting Switches", "ED_SwitchButton"],
+        }.get(classification_property, ["Switches"])
+        return SchemaMappingProposal(
+            entity_name="switches", label="IfcBuildingElementProxy",
+            identity_property="GlobalID", source_property="source",
+            fields=[
+                SchemaFieldMapping(
+                    semantic_name=classification_name, property=classification_property,
+                    ontology_kind="canonical_type",
+                ),
+                *([SchemaFieldMapping(semantic_name="category", property="Category")]
+                  if classification_name != "category" else []),
+                *([SchemaFieldMapping(semantic_name="family", property="Family")]
+                  if classification_name != "family" else []),
+                SchemaFieldMapping(semantic_name="type", property="Type"),
+            ],
+            value_bindings=[SchemaValueBinding(
+                semantic_name=classification_name, property=classification_property,
+                user_concept="physical switches",
+                matches=[SchemaValueMatch(value=value, similarity=1.0) for value in selected_values],
+            )],
+            counting_unit="physical switch",
+            counting_unit_evidence="One populated unique GlobalID per modeled instance.",
+            reasoning_summary="Live classification and identity evidence.",
+        )
+
+    def _hierarchy_context(self):
+        context = BimRunContext(
+            bim=_DiscoveryBim(),
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=load_graph_contract(),
+        )
+        json.loads(profile_project_classification_hierarchy(
+            PipelineContext(context), "IfcBuildingElementProxy",
+            ["Category", "Family", "Type"], concept="switch", limit=10,
+        ))
+        return context
+
+    def test_secondary_classification_binding_cannot_omit_profiled_hierarchy(self):
+        with self.assertRaisesRegex(ValueError, "outside the profiled"):
+            _validate_hierarchy_binding_coverage(
+                self._hierarchy_context(),
+                self._switch_mapping_proposal("Identity Data_OmniClass Title"),
+            )
+
+    def test_polluted_broad_category_binding_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unrelated family/type"):
+            _validate_hierarchy_binding_coverage(
+                self._hierarchy_context(), self._switch_mapping_proposal("Category")
+            )
+
+    def test_complete_profiled_family_binding_passes_hierarchy_guard(self):
+        _validate_hierarchy_binding_coverage(
+            self._hierarchy_context(), self._switch_mapping_proposal("Family")
+        )
+
+    def test_classification_mapping_requires_hierarchy_profile(self):
+        context = BimRunContext(
+            bim=_DiscoveryBim(),
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=load_graph_contract(),
+        )
+        with self.assertRaisesRegex(ValueError, "Profile the observed"):
+            _validate_hierarchy_binding_coverage(
+                context, self._switch_mapping_proposal("Family")
+            )
+
+    def test_unresolved_plural_is_not_corrupted_into_invented_canonical_value(self):
+        context = BimRunContext(
+            bim=_Bim(),
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=load_graph_contract(),
+        )
+
+        canonical, _ = _resolve_canonical_type(context, "Switches")
+
+        self.assertEqual(canonical, "switches")
+        self.assertNotEqual(canonical, "switche")
+
+    def test_compact_inventory_omits_verbose_property_surface(self):
+        context = BimRunContext(
+            bim=_DiscoveryBim(),
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=load_graph_contract(),
+        )
+
+        result = json.loads(inspect_queryable_node_types(PipelineContext(context)))
+        item = result["node_types"][0]
+
+        self.assertEqual(item["property_count"], 106)
+        self.assertNotIn("properties", item)
+        self.assertIn("Category", item["suggested_properties"])
+        self.assertIn("Family", item["suggested_properties"])
+        self.assertLessEqual(len(item["suggested_properties"]), 24)
+
+    def test_classification_hierarchy_ranks_leaf_match_above_broad_category_noise(self):
+        context = BimRunContext(
+            bim=_DiscoveryBim(),
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=load_graph_contract(),
+        )
+
+        result = json.loads(profile_project_classification_hierarchy(
+            PipelineContext(context), "IfcBuildingElementProxy",
+            ["Category", "Family", "Type"], concept="switch", limit=10,
+        ))
+
+        self.assertEqual(result["candidate_branch_count"], 3)
+        self.assertIn(
+            result["branches"][0]["path"]["Family"],
+            {"M_Lighting Switches", "ED_SwitchButton"},
+        )
+        self.assertEqual(result["branches"][-1]["path"]["Family"], "Emergency Exit Sign")
+        self.assertFalse(result["branches"][0]["broad_only_match"])
+        self.assertTrue(result["branches"][-1]["broad_only_match"])
+        self.assertGreater(
+            result["branches"][0]["lexical_similarity"],
+            result["branches"][-1]["lexical_similarity"],
+        )
+
+    def test_classification_profiler_unions_properties_across_label_signatures(self):
+        context = BimRunContext(
+            bim=_SplitSignatureDiscoveryBim(),
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=load_graph_contract(),
+        )
+
+        result = json.loads(profile_project_classification_hierarchy(
+            PipelineContext(context), "IfcBuildingElementProxy",
+            ["Category", "Family", "Type"], concept="switch", limit=10,
+        ))
+
+        self.assertEqual(result["candidate_branch_count"], 3)
+
     def test_permit_knowledge_absence_can_be_queried_after_space_mapping(self):
         context = BimRunContext(
             bim=_Bim(),
@@ -78,6 +270,23 @@ class DynamicSchemaMappingTests(unittest.TestCase):
 
         self.assertEqual(ranked[0]["node_ref"], "space")
         self.assertGreater(ranked[0]["similarity"], ranked[1]["similarity"])
+
+    def test_hybrid_ranking_uses_expanded_cross_language_vocabulary(self):
+        candidates = [
+            {"node_ref": "wall", "embedding_text": "type: IfcWall; name: exterior wall"},
+            {"node_ref": "switch", "embedding_text": "category: Lighting Devices; family: lighting switch"},
+        ]
+
+        ranked = _rank_hybrid_candidates(
+            "user concept: מפסקים; BIM vocabulary: lighting switch | Lighting Devices",
+            [1.0, 0.0],
+            [[0.9, 0.1], [0.1, 0.9]],
+            candidates,
+        )
+
+        self.assertEqual(ranked[0]["node_ref"], "switch")
+        self.assertEqual(ranked[0]["lexical_similarity"], 1.0)
+        self.assertGreater(ranked[0]["similarity"], ranked[0]["embedding_similarity"])
 
     def test_count_executes_from_registered_live_mapping_without_contract_entity(self):
         mapping = RegisteredSchemaMapping(
@@ -131,6 +340,58 @@ class DynamicSchemaMappingTests(unittest.TestCase):
         self.assertIn("n.`space_key`", count_query)
         self.assertEqual(parameters["filter_0"], ["apartment"])
         self.assertEqual(parameters["filter_1"], ["00 begane grond"])
+
+    def test_registered_exact_value_binding_bypasses_canonical_singularization(self):
+        class SwitchBim(_Bim):
+            def query(self, cypher, parameters=None):
+                self.queries.append((cypher, parameters or {}))
+                if "count(DISTINCT n.`GlobalID`) AS count" in cypher:
+                    return [{"count": 21}]
+                raise AssertionError(f"Unexpected query: {cypher}")
+
+        mapping = RegisteredSchemaMapping(
+            mapping_id="mapping-switches",
+            proposal=SchemaMappingProposal(
+                entity_name="switches", label="IfcBuildingElementProxy",
+                identity_property="GlobalID", source_property="source",
+                fields=[SchemaFieldMapping(
+                    semantic_name="classification",
+                    property="Identity Data_OmniClass Title",
+                    ontology_kind="canonical_type",
+                )],
+                value_bindings=[SchemaValueBinding(
+                    semantic_name="classification",
+                    property="Identity Data_OmniClass Title",
+                    user_concept="physical switches",
+                    matches=[SchemaValueMatch(value="Switches", similarity=1.0)],
+                )],
+                counting_unit="physical switch",
+                counting_unit_evidence="GlobalID is unique per modeled switch.",
+                reasoning_summary="Observed exact live classification and identity.",
+            ),
+            node_count=459, populated_identity_count=459, distinct_identity_count=459,
+        )
+        bim = SwitchBim()
+        context = BimRunContext(
+            bim=bim,
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=load_graph_contract(),
+            task_contract=BimTaskContract(
+                goal="Count switches", operation="count", entity_concept="switches",
+                required_outputs=["switch count"], success_criteria=["Verified count"],
+            ),
+            schema_mappings={mapping.mapping_id: mapping},
+        )
+        plan = BimQueryPlan(
+            entity="switches", mapping_id=mapping.mapping_id, operation="count",
+            filters=[BimFilter(field="classification", operator="equals", value="Switches")],
+            answer_key="switch-count", satisfies=["switch count"],
+        )
+
+        result = _execute_plan(context, plan)
+
+        self.assertEqual(result["claim"]["value"], 21)
+        self.assertEqual(bim.queries[-1][1]["filter_0"], ["switches"])
 
     def test_count_traverses_registered_relationship_path(self):
         mapping = RegisteredSchemaMapping(

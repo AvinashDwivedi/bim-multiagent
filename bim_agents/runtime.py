@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 from typing import Any
@@ -12,10 +13,209 @@ from bim_context import BimContext, Settings
 
 from .graph_contract import load_graph_contract, validate_live_schema
 from .guardrails import pipeline_report_from_evidence
+from .knowledge import (
+    LearnedKnowledgeStore, activate_promoted_knowledge, compute_live_schema_fingerprint,
+    curate_verified_mappings, default_knowledge_path,
+)
 from .models import BimRunContext, PipelineReport, ProjectScope
 from .observability import AgentRunHooks, PipelineEvents
+from .orchestration import run_evidence_workstreams
 from .registry import build_agent_registry
-from .tools import ensure_bim_verification, ensure_compliance_evidence
+from .tools import (
+    PipelineContext, define_bim_task, ensure_bim_verification, ensure_compliance_evidence,
+    inspect_completion_gates,
+)
+
+
+def _is_budget_exhaustion(exc: Exception) -> bool:
+    """Recognize a guardrail error even when the Agents SDK wraps it as UserError."""
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        message = str(current).casefold()
+        if "bim run guardrail stopped execution" in message or "agent start budget exceeded" in message:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _budget_exhaustion_diagnostic(context: BimRunContext) -> tuple[str, str]:
+    if context.tool_calls > context.max_tool_calls:
+        return (
+            "tool_call_budget_exhausted",
+            f"Tool-call budget exhausted ({context.tool_calls} calls; limit {context.max_tool_calls}).",
+        )
+    if context.llm_calls > context.max_llm_calls:
+        return (
+            "llm_call_budget_exhausted",
+            f"Model-call budget exhausted ({context.llm_calls} calls; limit {context.max_llm_calls}).",
+        )
+    over_agent = next(
+        (
+            (name, count) for name, count in context.agent_starts_by_name.items()
+            if count > context.max_starts_per_agent
+        ),
+        None,
+    )
+    if over_agent:
+        name, count = over_agent
+        return (
+            "agent_start_budget_exhausted",
+            f"Agent-start budget exhausted for {name} ({count} starts; limit {context.max_starts_per_agent}).",
+        )
+    if context.agent_starts > context.max_agent_starts:
+        return (
+            "agent_start_budget_exhausted",
+            f"Total agent-start budget exhausted ({context.agent_starts} starts; limit {context.max_agent_starts}).",
+        )
+    return (
+        "investigation_budget_exhausted",
+        "The investigation work budget was exhausted before a more specific counter was available.",
+    )
+
+
+def _agent_work_timeout(total_timeout: float, reserve_seconds: float | None = None) -> float:
+    """Reserve part of the public timeout for replay, guardrails, curation, and serialization."""
+    if total_timeout <= 0:
+        raise ValueError("BIM run timeout must be positive.")
+    configured = (
+        float(os.getenv("BIM_FINALIZATION_RESERVE_SECONDS", "30"))
+        if reserve_seconds is None else reserve_seconds
+    )
+    reserve = min(max(configured, 0.0), total_timeout * 0.2)
+    return max(total_timeout - reserve, min(total_timeout, 0.1))
+
+
+async def _run_parallel_workstreams(*workstreams):
+    """Compatibility helper; active scheduling lives in orchestration.py."""
+    return await asyncio.gather(*workstreams)
+
+
+def _has_relevant_promoted_mapping(context: BimRunContext) -> bool:
+    """Compatibility predicate for deployments migrating from challenger mode."""
+    if context.task_contract is None:
+        return False
+    ontology = context.bim.ontology
+    terms = [context.question, context.task_contract.entity_concept]
+    for value in list(terms):
+        for method_name in ("keyword_synonyms_for", "retrieval_terms_for"):
+            method = getattr(ontology, method_name, None)
+            if callable(method):
+                terms.extend(str(item) for item in (method(value) or []))
+    tokens = set(re.findall(r"[^\W_]{3,}", " ".join(terms).casefold(), flags=re.UNICODE))
+    for record in context.learned_knowledge.values():
+        if getattr(record, "status", None) != "promoted":
+            continue
+        payload = getattr(record, "payload", {}) or {}
+        proposal = payload.get("proposal") or {}
+        record_text = " ".join([
+            str(getattr(record, "concept", "")),
+            *(str(item) for item in (getattr(record, "aliases", []) or [])),
+            str(proposal.get("entity_name") or ""),
+        ]).casefold()
+        if tokens & set(re.findall(r"[^\W_]{3,}", record_text, flags=re.UNICODE)):
+            return True
+    return False
+
+
+def _should_run_parallel_challenger(context: BimRunContext) -> bool:
+    """Legacy configuration parser; the DAG scheduler does not launch challengers."""
+    if os.getenv("BIM_PARALLEL_CHALLENGER_ENABLED", "1") == "0":
+        return False
+    mode = os.getenv("BIM_PARALLEL_CHALLENGER_MODE", "always").strip().casefold()
+    if mode == "always":
+        return True
+    if mode == "auto":
+        return _has_relevant_promoted_mapping(context)
+    if mode in {"off", "never"}:
+        return False
+    raise ValueError("BIM_PARALLEL_CHALLENGER_MODE must be always, auto, or off.")
+
+
+def _answer_query_ids(context: BimRunContext) -> list[str]:
+    result = []
+    for evidence_id, evidence in context.evidence.items():
+        if evidence.kind != "query":
+            continue
+        payload = json.loads(evidence.payload)
+        plan = payload.get("plan") or {}
+        if (
+            plan.get("role", "answer_producing") == "answer_producing"
+            and plan.get("include_in_answer", True) is not False
+        ):
+            result.append(evidence_id)
+    return result
+
+
+def _merge_isolated_workstream(
+    root: BimRunContext, branch: BimRunContext, *, workstream_id: str,
+) -> list[str]:
+    """Validate then atomically commit a completed isolated worker delta."""
+    answer_ids = _answer_query_ids(branch)
+    if not answer_ids:
+        return []
+    mapping_conflict = None
+    for mapping_id in sorted(branch.schema_mappings):
+        mapping = branch.schema_mappings[mapping_id]
+        existing = root.schema_mappings.get(mapping_id)
+        if existing is not None:
+            existing_dump = getattr(existing, "model_dump", lambda **_: existing)(mode="json")
+            mapping_dump = getattr(mapping, "model_dump", lambda **_: mapping)(mode="json")
+            if existing_dump != mapping_dump:
+                mapping_conflict = mapping_id
+                break
+    if mapping_conflict is not None:
+        root.failure_categories.append("parallel_mapping_conflict")
+        root.runtime_limitations.append(
+            f"Isolated workstream {workstream_id} conflicted on mapping {mapping_conflict}."
+        )
+        return []
+    evidence_conflict = None
+    for evidence_id in sorted(branch.evidence):
+        evidence = branch.evidence[evidence_id]
+        existing = root.evidence.get(evidence_id)
+        if existing is not None and existing.model_dump(mode="json") != evidence.model_dump(mode="json"):
+            evidence_conflict = evidence_id
+            break
+    if evidence_conflict is not None:
+        root.failure_categories.append("parallel_evidence_conflict")
+        root.runtime_limitations.append(
+            f"Isolated workstream {workstream_id} conflicted on evidence {evidence_conflict}."
+        )
+        return []
+
+    # Stage artifact IDs before mutating authoritative state. Collisions are
+    # namespaced deterministically so one branch cannot overwrite another.
+    staged_artifacts: list[tuple[str, Any]] = []
+    for artifact_id in sorted(branch.artifacts):
+        if artifact_id == "task-contract":
+            continue
+        artifact = branch.artifacts[artifact_id]
+        committed_id = artifact_id
+        if committed_id in root.artifacts:
+            committed_id = f"{workstream_id}-{artifact_id}"
+        if committed_id in root.artifacts or any(key == committed_id for key, _ in staged_artifacts):
+            root.failure_categories.append("parallel_artifact_conflict")
+            root.runtime_limitations.append(
+                f"Isolated workstream {workstream_id} produced a duplicate artifact ID."
+            )
+            return []
+        staged_artifacts.append((committed_id, artifact))
+
+    with root._lock:
+        for mapping_id in sorted(branch.schema_mappings):
+            root.schema_mappings.setdefault(mapping_id, branch.schema_mappings[mapping_id])
+        for evidence_id in sorted(branch.evidence):
+            root.evidence.setdefault(evidence_id, branch.evidence[evidence_id])
+        for committed_id, artifact in staged_artifacts:
+            root.artifacts[committed_id] = artifact.model_copy(update={"artifact_id": committed_id})
+        root.llm_calls += branch.llm_calls
+        root.tool_calls += branch.tool_calls
+        root.agent_starts += branch.agent_starts
+        for name, count in branch.agent_starts_by_name.items():
+            root.agent_starts_by_name[name] = root.agent_starts_by_name.get(name, 0) + count
+    return answer_ids
 
 
 def _redact_text(value: str, sensitive_values: list[str]) -> str:
@@ -129,11 +329,21 @@ async def answer_bim_question(
             ),
             graph_contract=contract,
             question=question,
-            max_llm_calls=int(os.getenv("BIM_MAX_LLM_CALLS", "20")),
-            max_tool_calls=int(os.getenv("BIM_MAX_TOOL_CALLS", "30")),
+            max_llm_calls=int(os.getenv("BIM_MAX_LLM_CALLS", "48")),
+            max_tool_calls=int(os.getenv("BIM_MAX_TOOL_CALLS", "60")),
             max_agent_starts=int(os.getenv("BIM_MAX_AGENT_STARTS", "30")),
             max_starts_per_agent=int(os.getenv("BIM_MAX_STARTS_PER_AGENT", "6")),
         )
+        if os.getenv("BIM_LEARNING_ENABLED", "1") != "0":
+            try:
+                context.knowledge_store = LearnedKnowledgeStore(default_knowledge_path())
+                context.schema_fingerprint = compute_live_schema_fingerprint(context)
+                activated = activate_promoted_knowledge(context)
+                events.stage("knowledge_loaded", compatible_records=len(activated))
+            except Exception:
+                context.knowledge_store = None
+                context.failure_categories.append("learned_knowledge_unavailable")
+                events.stage("knowledge_unavailable")
         capability_gap = _capability_gap(question, contract, project_knowledge)
         if capability_gap:
             report = PipelineReport(
@@ -148,7 +358,7 @@ async def answer_bim_question(
         run_hooks = AgentRunHooks(events)
         registry = build_agent_registry(
             model or os.getenv("BIM_AGENT_MODEL", "gpt-5.6-sol"),
-            worker_model=worker_model or os.getenv("BIM_AGENT_WORKER_MODEL", "gpt-5.6-terra"),
+            worker_model=worker_model or os.getenv("BIM_AGENT_WORKER_MODEL", "gpt-5.6-sol"),
             hooks=run_hooks,
             project_knowledge=project_knowledge,
         )
@@ -157,23 +367,60 @@ async def answer_bim_question(
             "Use only the configured authorized BIM scope. Do not expose scope identifiers or credentials."
         )
         events.stage("pipeline_start", question=question)
-        timeout = timeout_seconds or float(os.getenv("BIM_RUN_TIMEOUT_SECONDS", "240"))
+        timeout = (
+            timeout_seconds if timeout_seconds is not None
+            else float(os.getenv("BIM_RUN_TIMEOUT_SECONDS", "600"))
+        )
+        work_timeout = _agent_work_timeout(timeout)
+
         try:
             with trace("BIM graph-to-Cypher answer", metadata={"authorized_scope": "true"}):
-                async with asyncio.timeout(timeout):
-                    run_result = await Runner.run(
-                        registry.supervisor,
+                async with asyncio.timeout(work_timeout):
+                    architect_result = await Runner.run(
+                        registry.task_architect,
                         scoped_input,
                         context=context,
-                        max_turns=int(os.getenv("BIM_SUPERVISOR_MAX_TURNS", "24")),
+                        max_turns=1,
                         hooks=run_hooks,
                     )
-                    completion = run_result.final_output
-                    context.completion_status = getattr(completion, "status", None)
-                    if getattr(completion, "status", None) == "insufficient_evidence":
+                    define_bim_task(PipelineContext(context), architect_result.final_output)
+                    events.stage(
+                        "workstream_schedule_start",
+                        run_id=context.run_id,
+                        workstreams=len(context.task_contract.work_packages) or 1,
+                    )
+                    outcomes = await run_evidence_workstreams(
+                        settings=settings,
+                        root=context,
+                        registry=registry,
+                        events=events,
+                        merge=lambda root, branch: _merge_isolated_workstream(
+                            root, branch, workstream_id=branch.workstream_id
+                        ),
+                    )
+                    merged_ids = [
+                        evidence_id for outcome in outcomes for evidence_id in outcome.evidence_ids
+                    ]
+                    for outcome in outcomes:
                         context.runtime_limitations.extend(
-                            str(item) for item in getattr(completion, "limitations", []) if str(item).strip()
+                            item for item in outcome.limitations if item.strip()
                         )
+                        if outcome.status in {"turn_limit", "error", "merge_rejected"}:
+                            category = "workstream_" + outcome.status
+                            if category not in context.failure_categories:
+                                context.failure_categories.append(category)
+                    context.completion_status = (
+                        "ready_for_verification" if merged_ids else "insufficient_evidence"
+                    )
+                    events.stage(
+                        "workstream_schedule_end",
+                        run_id=context.run_id,
+                        completed=sum(item.status == "query_completed" for item in outcomes),
+                        evidence=len(merged_ids),
+                    )
+        except asyncio.CancelledError:
+            events.stage("run_cancelled")
+            raise
         except MaxTurnsExceeded:
             context.failure_categories.append("agent_turn_limit")
             context.runtime_limitations.append(
@@ -198,11 +445,40 @@ async def answer_bim_question(
                 "The model service connection failed; completed evidence was retained."
             )
             events.stage("model_connection_error")
+        except Exception as exc:
+            if not _is_budget_exhaustion(exc):
+                raise
+            context.failure_categories.append("investigation_budget_exhausted")
+            budget_category, budget_detail = _budget_exhaustion_diagnostic(context)
+            if budget_category not in context.failure_categories:
+                context.failure_categories.append(budget_category)
+            context.runtime_limitations.append(
+                "The investigation reached its configured work budget; completed evidence was retained. "
+                + budget_detail
+            )
+            events.stage("investigation_budget_exhausted", category=budget_category)
         if re.search(r"\b(compliance|comply|compliant|requirement|requirements)\b", question, re.I):
             evidence_id = ensure_compliance_evidence(context)
             if evidence_id:
                 events.stage("compliance_evidence", evidence_id=evidence_id)
         ensure_bim_verification(context)
+        gates = json.loads(inspect_completion_gates(PipelineContext(context)))
+        if not gates.get("ready_to_respond"):
+            context.completion_status = "insufficient_evidence"
+            missing = gates.get("missing") or []
+            if missing:
+                context.runtime_limitations.append(
+                    "Completion gates remain open: " + ", ".join(str(item) for item in missing) + "."
+                )
+        try:
+            curation = curate_verified_mappings(context)
+            events.stage(
+                "knowledge_curated", status=curation.status,
+                learned_records=len(curation.knowledge_ids),
+            )
+        except Exception:
+            context.failure_categories.append("knowledge_curation_failed")
+            events.stage("knowledge_curation_failed")
         report = pipeline_report_from_evidence(context)
         events.stage("pipeline_end", verification_status=report.verification_status)
         return redact_pipeline_report(report, settings)

@@ -387,6 +387,67 @@ concepts:
     keyword_synonyms: [section, block, wing, zone, tower, sectie, blok, בלוק, כנף]
     retrieval_terms: [section, block, tower, sectie, blok]
 
+  # Cross-discipline MEP vocabulary. These aliases translate user language into
+  # common IFC/Revit family/category terms; they do not assert a project mapping.
+  electrical_switch:
+    kind: concept
+    label: "electrical / lighting switch"
+    aliases: ["electrical switch", "lighting switch", switch, מפסק, מפסקים]
+    keyword_synonyms: [switch, switches, מפסק, מפסקים]
+    retrieval_terms: ["Lighting Devices", "Electrical Fixtures", "lighting switch",
+                      "switch button", switch]
+
+  cable_tray:
+    kind: concept
+    label: "cable tray and cable-tray segment"
+    aliases: ["cable tray", "cable trays", tray, trays, "מגש כבלים", "מגשי כבלים", מגש, מגשים]
+    keyword_synonyms: ["cable tray", tray, trays, מגש, מגשים]
+    retrieval_terms: ["Cable Tray", "Cable Tray with Fittings", "Wire Mesh Cable Tray",
+                      "Channel Cable Tray", cabletray]
+
+  electrical_conduit:
+    kind: concept
+    label: "electrical conduit segment"
+    aliases: ["electrical conduit", conduit, conduits, "צינור חשמל", "צינורות חשמל", צינור, צינורות]
+    keyword_synonyms: [conduit, conduits, צינור, צינורות]
+    retrieval_terms: [Conduit, "Conduit without Fittings", HDPE, RNC, EMT, IMC, RMC]
+
+  socket_outlet:
+    kind: concept
+    label: "electrical socket / outlet / socket box"
+    aliases: [socket, sockets, outlet, outlets, "socket box", שקע, שקעים, "קופסת שקעים"]
+    keyword_synonyms: [socket, outlet, שקע, שקעים]
+    retrieval_terms: [socket, outlet, receptacle, "Socket box", Floor_Box]
+
+  lighting_device:
+    kind: concept
+    label: "lighting fixture or luminaire"
+    aliases: ["lighting fixture", "lighting device", luminaire, light, "גוף תאורה", "גופי תאורה"]
+    keyword_synonyms: [light, lighting, luminaire, "גוף תאורה", "גופי תאורה"]
+    retrieval_terms: ["Lighting Fixtures", luminaire, light, LED, EmLighting]
+
+  electrical_panel:
+    kind: concept
+    label: "electrical panel / switchboard"
+    aliases: ["electrical panel", panel, switchboard, "לוח חשמל", "לוחות חשמל", לוח, לוחות]
+    keyword_synonyms: [panel, switchboard, לוח, לוחות]
+    retrieval_terms: ["Electrical Equipment", panel, switchboard, Panel, Circuit]
+
+  electrical_endpoint:
+    kind: concept
+    label: "electrical endpoint such as socket, switch, or lighting fixture"
+    aliases: ["electrical endpoint", endpoint, endpoints, "נקודת קצה", "נקודות קצה"]
+    keyword_synonyms: [endpoint, endpoints, "נקודת קצה", "נקודות קצה"]
+    retrieval_terms: [socket, outlet, switch, "lighting fixture", luminaire]
+
+  electrical_connectivity:
+    kind: concept
+    label: "electrical circuit, panel assignment, and physical connector continuity"
+    aliases: ["electrical connectivity", connectivity, continuity, circuit, circuits,
+              "חיבור חשמלי", המשכיות, מעגל, מעגלים]
+    keyword_synonyms: [connectivity, continuity, circuit, המשכיות, מעגל]
+    retrieval_terms: [Panel, "Circuit Number", IfcSystem, port, connector, CONNECTS]
+
 
 # =============================================================================
 # PERMIT MEASURES + ROOM LABELS — MOVED to the Proceed/Hebrew PROJECT overlay (CP-C3).

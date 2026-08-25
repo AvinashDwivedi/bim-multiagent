@@ -16,8 +16,14 @@ from pydantic import BaseModel, Field
 from .graph_contract import QueryEntity, QueryField
 from .geometry import calculate_project_geometry
 from .cypher_handler import CypherQueryHandler
-from .models import BimRunContext, BimTaskContract, Evidence, RunArtifact
-from .schema_mapping import RegisteredSchemaMapping, SchemaMappingProposal
+from .models import (
+    BimRunContext, BimTaskContract, CompletionGateReport, Evidence,
+    InvestigationAction, InvestigationHypothesis, InvestigationObservation, RunArtifact,
+)
+from .schema_mapping import (
+    RegisteredSchemaMapping, SchemaFieldMapping, SchemaMappingProposal,
+    SchemaValueBinding, SchemaValueMatch,
+)
 
 
 Operation = Literal[
@@ -88,14 +94,6 @@ class BimQueryPlan(BaseModel):
     )
 
 
-class KnowledgeQueryPlan(BaseModel):
-    fact: str = Field(description="Exact fact key from the active project knowledge catalog.")
-    include_in_answer: bool = True
-    role: QueryRole = "answer_producing"
-    answer_key: str = ""
-    satisfies: list[str] = Field(default_factory=list)
-
-
 class GeometryQueryPlan(BaseModel):
     calculation: Literal["section_heights", "facade_opening_percentage"]
     include_in_answer: bool = True
@@ -113,6 +111,17 @@ def define_bim_task(
     if not contract.goal.strip() or not contract.entity_concept.strip():
         raise ValueError("The task goal and entity concept cannot be blank.")
     ctx.context.task_contract = contract
+    ctx.context.notebook.goal = contract.goal
+    ctx.context.notebook.required_outputs = list(contract.required_outputs)
+    ctx.context.notebook.unresolved_questions = list(contract.questions_to_resolve)
+    ctx.context.notebook.phase = "explore"
+    # Model-assigned complexity may increase capacity, but must never lower the
+    # deployment-configured budget. A linguistically simple count can still need
+    # nested schema discovery, mapping, query planning, and deterministic replay.
+    if contract.complexity == "complex":
+        ctx.context.max_llm_calls = max(ctx.context.max_llm_calls, 35)
+        ctx.context.max_tool_calls = max(ctx.context.max_tool_calls, 55)
+        ctx.context.max_agent_starts = max(ctx.context.max_agent_starts, 45)
     artifact = RunArtifact(
         artifact_id="task-contract",
         kind="task_contract",
@@ -124,6 +133,135 @@ def define_bim_task(
     return artifact.model_dump_json()
 
 
+def register_investigation_hypothesis(
+    ctx: PipelineContext, hypothesis: InvestigationHypothesis
+) -> str:
+    """Register one falsifiable interpretation before testing it against the graph."""
+    if any(item.hypothesis_id == hypothesis.hypothesis_id for item in ctx.context.notebook.hypotheses):
+        raise ValueError(f"Hypothesis {hypothesis.hypothesis_id!r} already exists.")
+    ctx.context.notebook.hypotheses.append(hypothesis)
+    ctx.context.notebook.phase = "analyze"
+    return hypothesis.model_dump_json()
+
+
+def record_investigation_observation(
+    ctx: PipelineContext, observation: InvestigationObservation
+) -> str:
+    """Record what a completed action established before another action is selected."""
+    notebook = ctx.context.notebook
+    if notebook.next_action and notebook.next_action.action_id != observation.action_id:
+        raise ValueError("The observation must correspond to the currently selected action.")
+    known_evidence = set(ctx.context.evidence) | set(ctx.context.artifacts)
+    unknown = sorted(set(observation.evidence_ids) - known_evidence)
+    if unknown:
+        raise ValueError("Observation references unknown evidence: " + ", ".join(unknown))
+    notebook.observations.append(observation)
+    for hypothesis in notebook.hypotheses:
+        if hypothesis.hypothesis_id in observation.supports_hypotheses:
+            hypothesis.status = "supported"
+            hypothesis.evidence_ids = list(dict.fromkeys(hypothesis.evidence_ids + observation.evidence_ids))
+        if hypothesis.hypothesis_id in observation.contradicts_hypotheses:
+            hypothesis.status = "rejected"
+            hypothesis.evidence_ids = list(dict.fromkeys(hypothesis.evidence_ids + observation.evidence_ids))
+            notebook.rejected_interpretations.append(hypothesis.statement)
+    notebook.unresolved_questions = list(dict.fromkeys(
+        notebook.unresolved_questions + observation.new_questions
+    ))
+    notebook.next_action = None
+    notebook.phase = "analyze"
+    artifact = RunArtifact(
+        artifact_id=f"observation-{len(notebook.observations)}",
+        kind="investigation_observation", producer="Pipeline",
+        summary=observation.result_summary, payload=observation.model_dump(mode="json"),
+    )
+    ctx.context.add_artifact(artifact)
+    return artifact.model_dump_json()
+
+
+def select_investigation_action(ctx: PipelineContext, action: InvestigationAction) -> str:
+    """Select one bounded next action after observing the previous action's result."""
+    notebook = ctx.context.notebook
+    if notebook.next_action is not None:
+        raise ValueError(
+            "Record an observation for the current action before selecting another action."
+        )
+    notebook.next_action = action
+    notebook.phase = action.phase
+    artifact = RunArtifact(
+        artifact_id=f"action-{action.action_id}", kind="investigation_action",
+        producer="Pipeline", summary=action.objective, payload=action.model_dump(mode="json"),
+    )
+    ctx.context.add_artifact(artifact)
+    return artifact.model_dump_json()
+
+
+def inspect_completion_gates(ctx: PipelineContext) -> str:
+    """Evaluate whether the investigation may respond or must continue exploring."""
+    notebook = ctx.context.notebook
+    query_payloads = [
+        json.loads(item.payload) for item in ctx.context.evidence.values() if item.kind == "query"
+    ]
+    verification_payloads = [
+        json.loads(item.payload) for item in ctx.context.evidence.values() if item.kind == "verification"
+    ]
+    checks = [
+        check for payload in verification_payloads for check in payload.get("checks") or []
+    ]
+    verified_checks = [check for check in checks if check.get("verified") is True]
+    semantic = [item for check in verified_checks for item in check.get("semantic_checks") or []]
+    passed_names = {item.get("name") for item in semantic if item.get("passed") is True}
+    verified_outputs = {
+        str(output)
+        for check in verified_checks
+        if check.get("plan", {}).get("role", "answer_producing")
+        in {"answer_producing", "supporting"}
+        for output in check.get("plan", {}).get("satisfies") or []
+    }
+    answer_values: dict[str, set[tuple[str, str]]] = {}
+    for payload in query_payloads:
+        plan = payload.get("plan") or {}
+        key = str(plan.get("answer_key") or "").strip()
+        if key and plan.get("role", "answer_producing") == "answer_producing":
+            claim = payload.get("claim") or {}
+            answer_values.setdefault(key, set()).add((str(claim.get("value")), str(claim.get("unit"))))
+    contradictions = [key for key, values in answer_values.items() if len(values) > 1]
+    required = set(notebook.required_outputs)
+    missing_outputs = sorted(required - verified_outputs)
+    report = CompletionGateReport(
+        scope_verified=bool(ctx.context.scope.allowed_sources),
+        entity_verified=bool(query_payloads),
+        identity_verified="identity_integrity" in passed_names,
+        classification_verified="classification_purity" in passed_names,
+        units_verified=all(
+            (payload.get("claim") or {}).get("unit") is not None
+            for payload in query_payloads
+            if (payload.get("plan") or {}).get("role", "answer_producing") == "answer_producing"
+        ),
+        required_outputs_verified=not missing_outputs,
+        contradictions_resolved=not contradictions,
+        replay_verified=bool(verified_checks) and "replay_stability" in passed_names,
+        ready_to_respond=False,
+        missing=(
+            [f"required output: {item}" for item in missing_outputs]
+            + [f"contradiction: {item}" for item in contradictions]
+        ),
+    )
+    report.ready_to_respond = all([
+        report.scope_verified, report.entity_verified, report.identity_verified,
+        report.classification_verified, report.units_verified,
+        report.required_outputs_verified, report.contradictions_resolved, report.replay_verified,
+    ])
+    for name in (
+        "scope_verified", "entity_verified", "identity_verified", "classification_verified",
+        "units_verified", "required_outputs_verified", "contradictions_resolved", "replay_verified",
+    ):
+        if not getattr(report, name) and name not in report.missing:
+            report.missing.append(name)
+    notebook.verified_outputs = sorted(verified_outputs)
+    notebook.phase = "respond" if report.ready_to_respond else "analyze"
+    return report.model_dump_json()
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
@@ -131,6 +269,31 @@ def _json(value: Any) -> str:
 def _normalize(value: str | None) -> str:
     text = "".join(ch for ch in (value or "") if unicodedata.category(ch) != "Cf")
     return " ".join(text.casefold().strip().split())
+
+
+def _expanded_semantic_text(context: BimRunContext, concept: str) -> str:
+    """Expand multilingual user vocabulary before embedding it against model-language text."""
+    terms = [concept]
+    ontology = context.bim.ontology
+    for method_name in ("keyword_synonyms_for", "retrieval_terms_for"):
+        method = getattr(ontology, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            terms.extend(str(item) for item in (method(concept) or []) if str(item).strip())
+        except (TypeError, ValueError):
+            continue
+    keyword_method = getattr(ontology, "keyword_synonyms_for", None)
+    if callable(keyword_method):
+        for token in re.findall(r"[^\W\d_]+", concept, flags=re.UNICODE):
+            try:
+                terms.extend(
+                    str(item) for item in (keyword_method(token) or []) if str(item).strip()
+                )
+            except (TypeError, ValueError):
+                continue
+    unique = list(dict.fromkeys(term.strip() for term in terms if term.strip()))
+    return "user concept: " + concept + "; BIM vocabulary: " + " | ".join(unique[:40])
 
 
 def _level_number(value: str) -> int | None:
@@ -177,7 +340,9 @@ def _resolve_canonical_type(ctx: BimRunContext, term: str) -> tuple[str, dict[st
     ontology = ctx.bim.ontology
     space_function = ontology.resolve_space_function(term)
     ifc_classes = ontology.resolve_element_classes(term) or []
-    canonical_type = space_function or _normalize(term).removesuffix("s")
+    # Never invent a canonical value by trimming arbitrary stored/user text. In
+    # particular, ``Switches`` must not become the nonexistent ``switche``.
+    canonical_type = space_function or _normalize(term)
     return canonical_type, {
         "original_term": term,
         "canonical_type": canonical_type,
@@ -207,6 +372,29 @@ def _catalog(ctx: BimRunContext) -> dict[str, Any]:
                     "unit": field.unit,
                 }
                 for field_name, field in entity.fields.items()
+            },
+        }
+    for mapping_id, registered in ctx.schema_mappings.items():
+        if not isinstance(registered, RegisteredSchemaMapping):
+            continue
+        proposal = registered.proposal
+        entities[proposal.entity_name] = {
+            "description": "Live-revalidated learned project mapping.",
+            "mapping_id": mapping_id,
+            "operations": common_operations,
+            "identity": proposal.identity_property,
+            "counting_unit": proposal.counting_unit,
+            "fields": {
+                field.semantic_name: {
+                    "type": field.data_type,
+                    "description": f"Mapped live property {field.property}.",
+                    "unit": field.unit,
+                }
+                for field in proposal.fields
+            },
+            "exact_value_bindings": {
+                binding.semantic_name: [match.value for match in binding.matches]
+                for binding in proposal.value_bindings
             },
         }
     return {
@@ -343,26 +531,40 @@ def _project_graph_structure(
             "sample_names": row.get("sample_names") or [],
             "contract_relationship_types": contract_relationship_types,
         })
-    normalized_focus = _normalize(focus)
-    if normalized_focus:
-        node_types = [
-            node_type for node_type in node_types
-            if normalized_focus in _normalize(" ".join([
-                *node_type["labels"],
-                *[str(name) for name in node_type["sample_names"]],
-                *node_type["properties"],
-            ]))
-        ]
-        relationship_types = [
-            relationship for relationship in relationship_types
-            if normalized_focus in _normalize(" ".join([
-                relationship["type"],
-                *relationship["from_labels"],
-                *relationship["to_labels"],
-                *[str(name) for name in relationship["sample_names"]],
-                *relationship["property_keys"],
-            ]))
-        ]
+    focus_phrases: list[str] = []
+    if _normalize(focus):
+        try:
+            expanded_focus = _expanded_semantic_text(ctx, focus)
+        except (AttributeError, TypeError, ValueError):
+            expanded_focus = focus
+        for item in re.split(r"[|;,]", expanded_focus):
+            item = re.sub(r"^(?:user concept|bim vocabulary)\s*:\s*", "", item, flags=re.I)
+            normalized = _normalize(item).replace("_", " ")
+            if len(normalized) >= 2:
+                focus_phrases.append(normalized)
+        focus_phrases = list(dict.fromkeys(focus_phrases))[:40]
+
+    def focus_matches(values: list[Any]) -> bool:
+        haystack = _normalize(" ".join(str(value) for value in values)).replace("_", " ")
+        return bool(focus_phrases) and any(phrase in haystack for phrase in focus_phrases)
+
+    for node_type in node_types:
+        node_type["focus_match"] = focus_matches([
+            *node_type["labels"], *node_type["sample_names"], *node_type["properties"],
+        ])
+    for relationship in relationship_types:
+        relationship["focus_match"] = focus_matches([
+            relationship["type"], *relationship["from_labels"], *relationship["to_labels"],
+            *relationship["sample_names"], *relationship["property_keys"],
+        ])
+    if focus_phrases:
+        node_types.sort(key=lambda item: (-int(item["focus_match"]), -item["node_count"], item["labels"]))
+        relationship_types.sort(key=lambda item: (
+            -int(item["focus_match"]), -item["relationship_count"], item["type"]
+        ))
+    focus_match_count = sum(int(item["focus_match"]) for item in node_types) + sum(
+        int(item["focus_match"]) for item in relationship_types
+    )
     unique_node_labels = sorted({
         label for node_type in node_types for label in node_type["labels"]
     })
@@ -373,6 +575,10 @@ def _project_graph_structure(
         "project_id": ctx.scope.project_id,
         "authorized_source_count": len(ctx.scope.allowed_sources),
         "focus": focus or None,
+        "focus_terms": focus_phrases,
+        "focus_mode": "ranking_only" if focus_phrases else None,
+        "focus_match_count": focus_match_count,
+        "focus_fallback_used": bool(focus_phrases and focus_match_count == 0),
         "properties_included": include_properties,
         "node_types": node_types,
         "relationship_types": relationship_types,
@@ -385,8 +591,9 @@ def _project_graph_structure(
         "trusted_scope_property": path.source_property,
         "scope_note": "Only nodes and relationships belonging to the authorized project are included.",
         "usage_note": (
-            "Use these live names to select a contract-backed declarative query plan. "
-            "Do not generate or execute raw Cypher."
+            "Focus only ranks results and never removes authorized schema. If focus_fallback_used is "
+            "true, inspect the complete ranked inventory and use semantic search. Use live names to "
+            "select a contract-backed declarative query plan; never generate or execute raw Cypher."
         ),
     }
 
@@ -520,6 +727,7 @@ def _compile_filters(
     label: str,
     source_property: str,
     filters: list[BimFilter],
+    exact_value_fields: set[str] | None = None,
 ) -> tuple[list[str], dict[str, Any], list[dict[str, Any]], list[str]]:
     clauses: list[str] = []
     parameters: dict[str, Any] = {"allowed_sources": ctx.scope.allowed_sources}
@@ -530,9 +738,14 @@ def _compile_filters(
         prop = f"n.`{field.property}`"
         key = f"filter_{index}"
         requested_values = _raw_filter_values(item)
-        values, notes = _semantic_values(
-            ctx, label, source_property, field, requested_values
-        )
+        if item.field in (exact_value_fields or set()):
+            # Registered value bindings are observations from the live graph,
+            # not free text. Preserve them byte-for-byte through compilation.
+            values, notes = requested_values, []
+        else:
+            values, notes = _semantic_values(
+                ctx, label, source_property, field, requested_values
+            )
         limitations.extend(notes)
         normalized_filters.append({
             "field": item.field,
@@ -618,6 +831,43 @@ def _rank_embedding_candidates(
             **candidate,
             "similarity": round(_cosine_similarity(query_embedding, embedding), 6),
         })
+    return sorted(ranked, key=lambda item: (-item["similarity"], item["node_ref"]))
+
+
+def _rank_hybrid_candidates(
+    semantic_text: str,
+    query_embedding: list[float],
+    candidate_embeddings: list[list[float]],
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Combine multilingual embeddings with deterministic exact/token vocabulary matches."""
+    ranked = _rank_embedding_candidates(query_embedding, candidate_embeddings, candidates)
+    phrases = []
+    for item in re.split(r"[|;,]", semantic_text):
+        item = re.sub(r"^(?:user concept|bim vocabulary)\s*:\s*", "", item, flags=re.I)
+        normalized = _normalize(item).replace("_", " ")
+        if len(normalized) >= 2:
+            phrases.append(normalized)
+    phrase_tokens = [set(re.findall(r"\w+", phrase)) for phrase in phrases]
+    for item in ranked:
+        target = _normalize(str(item.get("embedding_text") or "")).replace("_", " ")
+        target_tokens = set(re.findall(r"\w+", target))
+        exact = any(
+            re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", target) is not None
+            for phrase in phrases
+        )
+        lexical = 1.0 if exact else max(
+            (
+                len(tokens & target_tokens) / len(tokens)
+                for tokens in phrase_tokens if tokens
+            ),
+            default=0.0,
+        )
+        embedding_similarity = float(item["similarity"])
+        item["embedding_similarity"] = embedding_similarity
+        item["lexical_similarity"] = round(lexical, 6)
+        lexical_score = 1.0 if exact else lexical * 0.98
+        item["similarity"] = round(max(embedding_similarity, lexical_score), 6)
     return sorted(ranked, key=lambda item: (-item["similarity"], item["node_ref"]))
 
 
@@ -886,8 +1136,11 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
             registered_mapping if isinstance(registered_mapping, RegisteredSchemaMapping) else None,
             label,
         )
+        exact_value_fields = {
+            binding.semantic_name for binding in registered_mapping.proposal.value_bindings
+        } if isinstance(registered_mapping, RegisteredSchemaMapping) else set()
         clauses, parameters, normalized_filters, limitations = _compile_filters(
-            ctx, entity, label, source_property, plan.filters
+            ctx, entity, label, source_property, plan.filters, exact_value_fields
         )
         limitations.extend(_classification_limitations(
             ctx, entity, label, source_property, normalized_filters
@@ -1245,49 +1498,114 @@ def get_bim_query_catalog(ctx: PipelineContext) -> str:
 
 
 def get_project_knowledge_catalog(ctx: PipelineContext) -> str:
-    """Return active-scope interpretation rules and curated facts without scope identifiers."""
+    """Return active-scope semantic mappings and calculation rules without identifiers."""
     knowledge = ctx.context.bim.ontology.bim_query_knowledge
     return _json({"knowledge": knowledge, "scope": "active client/project only"})
 
 
-def query_project_knowledge(ctx: PipelineContext, plan: KnowledgeQueryPlan) -> str:
-    """Retrieve one curated active-project fact as auditable evidence."""
-    facts = ctx.context.bim.ontology.bim_query_knowledge.get("facts") or {}
-    fact = facts.get(plan.fact)
-    if not isinstance(fact, dict):
-        raise ValueError(f"No active project knowledge fact named {plan.fact!r}.")
-    if "value" not in fact or not str(fact.get("statement") or "").strip():
-        raise ValueError("A project knowledge fact requires value and statement fields.")
-    claim = {
-        "statement": str(fact["statement"]),
-        "value": fact["value"],
-        "unit": str(fact.get("unit") or "fact"),
-        "basis": str(fact.get("basis") or "curated active-project knowledge"),
-    }
-    stable = {"plan": plan.model_dump(mode="json"), "claim": claim, "fact": plan.fact}
-    result = {
-        **stable,
-        "rows": [{"fact": plan.fact, "value": fact["value"]}],
-        "matched_count": 1,
-        "limitations": [],
-        "capability": "project_knowledge",
-        "result_digest": hashlib.sha256(
-            json.dumps(stable, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        ).hexdigest(),
-    }
-    evidence_id = f"query-{uuid4().hex[:10]}"
-    ctx.context.add_evidence(Evidence(
-        evidence_id=evidence_id, kind="query", summary=claim["statement"], payload=_json(result)
-    ))
-    ctx.context.add_artifact(RunArtifact(
-        artifact_id=f"plan-{evidence_id}", kind="query_plan", producer="Query Planner",
-        summary=claim["statement"], payload={"evidence_id": evidence_id, **result},
-    ))
-    return _json({"evidence_id": evidence_id, **result})
+_CONSTRAINT_FIELD_ALIASES = {
+    "floor": "level", "storey": "level", "story": "level", "level": "level",
+    "function": "type", "usage": "type", "classification": "type", "category": "type",
+    "kind": "type", "segment": "segment", "sector": "segment", "material": "material",
+    "height": "height", "width": "width", "area": "area", "diameter": "diameter",
+}
+
+
+def _constraint_field(concept: str) -> str:
+    tokens = re.findall(r"[^\W_]+", _normalize(concept), flags=re.UNICODE)
+    for token in tokens:
+        if token in _CONSTRAINT_FIELD_ALIASES:
+            return _CONSTRAINT_FIELD_ALIASES[token]
+    return _normalize(concept).replace(" ", "_")
+
+
+def _plan_constraint_coverage(
+    context: BimRunContext, plan: BimQueryPlan,
+) -> tuple[bool, list[str]]:
+    """Prove every architect constraint is represented by a query boundary."""
+    contract = context.task_contract
+    if plan.entity == "permit_knowledge":
+        # Requirements are selected by authorized project scope; model-element
+        # constraints are applied to the separately queried modelled condition.
+        return True, []
+    if contract is None or not contract.constraints:
+        return True, []
+    registered = context.schema_mappings.get(plan.mapping_id)
+    missing: list[str] = []
+    for constraint in contract.constraints:
+        governance_concept = _normalize(constraint.concept)
+        if any(term in governance_concept for term in (
+            "authorized scope", "authorised scope", "configured scope", "project scope",
+        )) or governance_concept in {"scope", "authorization", "authorisation"}:
+            # Source authorization is injected by the compiler and verified as
+            # its own semantic check; it is intentionally not a model field.
+            continue
+        target_field = _constraint_field(constraint.concept)
+        candidates = [
+            item for item in plan.filters
+            if _constraint_field(item.field) == target_field
+            or target_field in _normalize(item.field).replace(" ", "_")
+        ]
+        covered = bool(candidates)
+        requested = _normalize(constraint.requested_value)
+        if covered and requested:
+            raw_values = [_normalize(value) for item in candidates for value in _raw_filter_values(item)]
+            value_covered = any(
+                requested == value or requested in value or value in requested
+                for value in raw_values if value
+            )
+            numeric_requested = re.findall(r"-?\d+(?:[.,]\d+)?", requested)
+            numeric_filter = [
+                number for value in raw_values
+                for number in re.findall(r"-?\d+(?:[.,]\d+)?", value)
+            ]
+            value_covered = value_covered or bool(
+                numeric_requested and set(numeric_requested) & set(numeric_filter)
+            )
+            if isinstance(registered, RegisteredSchemaMapping):
+                value_covered = value_covered or any(
+                    _constraint_field(binding.semantic_name) == target_field
+                    and (
+                        requested in _normalize(binding.user_concept)
+                        or _normalize(binding.user_concept) in requested
+                    )
+                    for binding in registered.proposal.value_bindings
+                )
+            covered = value_covered
+        if not covered:
+            missing.append(f"{constraint.concept}={constraint.requested_value}")
+    return not missing, missing
+
+
+def _validate_answer_metadata(ctx: PipelineContext, plan: Any) -> None:
+    required_outputs = set(
+        ctx.context.task_contract.required_outputs if ctx.context.task_contract else []
+    )
+    role = getattr(plan, "role", "answer_producing")
+    if role not in {"answer_producing", "supporting"} or not required_outputs:
+        return
+    if role == "answer_producing" and not str(getattr(plan, "answer_key", "")).strip():
+        raise ValueError("An answer-producing plan requires a stable answer_key.")
+    satisfies = set(getattr(plan, "satisfies", []) or [])
+    if not satisfies:
+        raise ValueError("An evidentiary plan must declare which required_outputs it satisfies.")
+    unknown = sorted(satisfies - required_outputs)
+    if unknown:
+        raise ValueError(
+            "Plan satisfies values must exactly match the task contract: " + ", ".join(unknown)
+        )
+    if isinstance(plan, BimQueryPlan):
+        covered, missing_constraints = _plan_constraint_coverage(ctx.context, plan)
+        if not covered:
+            raise ValueError(
+                "The query plan omits required task constraints: "
+                + ", ".join(missing_constraints)
+            )
 
 
 def query_project_geometry(ctx: PipelineContext, plan: GeometryQueryPlan) -> str:
     """Run one named, scoped Revit-geometry derivation as auditable evidence."""
+    _validate_answer_metadata(ctx, plan)
     report = calculate_project_geometry(
         plan.calculation, ctx.context.bim, ctx.context.scope.allowed_sources,
         ctx.context.bim.ontology.bim_query_knowledge,
@@ -1351,7 +1669,28 @@ def _observed_node_type(ctx: BimRunContext, label: str) -> dict[str, Any]:
     matches = [item for item in inventory["node_types"] if label in item["labels"]]
     if not matches:
         raise ValueError(f"Label {label!r} was not observed in the authorized project.")
-    return max(matches, key=lambda item: item["node_count"])
+    # Neo4j groups nodes by their complete label signature.  A BIM label can
+    # therefore occur in several inventory rows, each with different
+    # properties.  Treat the requested label as the union of those signatures;
+    # selecting only the largest row can incorrectly hide valid live fields.
+    return {
+        "labels": sorted({
+            observed_label
+            for item in matches
+            for observed_label in item.get("labels", [])
+        }),
+        "node_count": sum(int(item.get("node_count") or 0) for item in matches),
+        "properties": sorted({
+            prop
+            for item in matches
+            for prop in item.get("properties", [])
+        }),
+        "sample_names": list(dict.fromkeys(
+            sample
+            for item in matches
+            for sample in item.get("sample_names", [])
+        ))[:3],
+    }
 
 
 def _queryable_node_inventory(ctx: BimRunContext) -> dict[str, Any]:
@@ -1391,8 +1730,167 @@ def _queryable_node_inventory(ctx: BimRunContext) -> dict[str, Any]:
 
 
 def inspect_queryable_node_types(ctx: PipelineContext) -> str:
-    """Return a compact cached inventory of authorized node labels, properties, counts, and names."""
-    return _json(_queryable_node_inventory(ctx.context))
+    """Return a compact inventory while retaining the complete property surface internally."""
+    inventory = _queryable_node_inventory(ctx.context)
+    priority_names = (
+        "GlobalID", "id", "object_id", "name", "long_name", "Category", "Family",
+        "Family and Type", "Type", "Type Id", "canonical_type", "object_type",
+        "Level", "Schedule Level", "Service Type", "Length", "Area", "source",
+    )
+    priority = {name.casefold(): index for index, name in enumerate(priority_names)}
+    compact_types = []
+    for item in inventory["node_types"]:
+        properties = item.get("properties") or []
+        suggested = sorted(
+            (
+                name for name in properties
+                if name.casefold() in priority
+                or re.search(
+                    r"(^|[ _-])(category|family|type|name|globalid|level|service|length|area)($|[ _-])",
+                    name,
+                    re.I,
+                )
+            ),
+            key=lambda name: (priority.get(name.casefold(), len(priority)), len(name), name),
+        )[:24]
+        compact_types.append({
+            "labels": item["labels"],
+            "node_count": item["node_count"],
+            "property_count": len(properties),
+            "suggested_properties": suggested,
+            "sample_names": item["sample_names"],
+        })
+    return _json({
+        "trusted_scope_property": inventory["trusted_scope_property"],
+        "node_types": compact_types,
+        "scope": inventory["scope"],
+        "usage_note": (
+            "Only high-value property names are shown. Use search_properties for the complete "
+            "observed property surface of a selected label."
+        ),
+    })
+
+
+def _lexical_semantic_score(semantic_text: str, target: str) -> float:
+    def tokens(value: str) -> set[str]:
+        value = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", value)
+        normalized_tokens = set()
+        for token in re.findall(r"\w+", _normalize(value).replace("_", " ")):
+            if len(token) > 4 and token.endswith("ies"):
+                token = token[:-3] + "y"
+            elif len(token) > 4 and token.endswith("es"):
+                token = token[:-2]
+            elif len(token) > 3 and token.endswith("s"):
+                token = token[:-1]
+            normalized_tokens.add(token)
+        return normalized_tokens
+
+    phrases = []
+    for item in re.split(r"[|;,]", semantic_text):
+        item = re.sub(r"^(?:user concept|bim vocabulary)\s*:\s*", "", item, flags=re.I)
+        normalized = _normalize(item).replace("_", " ")
+        if len(normalized) >= 2:
+            phrases.append(normalized)
+    normalized_target = _normalize(target).replace("_", " ")
+    target_tokens = tokens(target)
+    if any(
+        re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", normalized_target) is not None
+        for phrase in phrases
+    ):
+        return 1.0
+    return round(max(
+        (
+            len(tokens(phrase) & target_tokens) / len(tokens(phrase))
+            for phrase in phrases if tokens(phrase)
+        ),
+        default=0.0,
+    ), 6)
+
+
+def profile_project_classification_hierarchy(
+    ctx: PipelineContext,
+    label: str,
+    properties: list[str],
+    concept: str = "",
+    limit: int = 30,
+) -> str:
+    """Profile exact scoped category/family/type branches before choosing classification filters."""
+    node_type = _observed_node_type(ctx.context, label)
+    requested = list(dict.fromkeys(properties))
+    if not requested or len(requested) > 3:
+        raise ValueError("Profile between one and three hierarchy properties.")
+    unknown = set(requested) - set(node_type["properties"])
+    if unknown:
+        raise ValueError(f"Properties were not observed on {label!r}: {sorted(unknown)}")
+    if any("`" in prop or any(ord(ch) < 32 for ch in prop) for prop in requested):
+        raise ValueError("Live property names contain unsafe characters.")
+    limit = max(1, min(limit, 50))
+    cache_key = "classification_hierarchy:" + hashlib.sha256(
+        _json([label, requested, concept, limit]).encode("utf-8")
+    ).hexdigest()
+    cached = ctx.context.schema_discovery.get(cache_key)
+    if isinstance(cached, dict):
+        return _json(cached)
+    source_property = ctx.context.graph_contract.authorization_path.source_property
+    projections = ", ".join(
+        f"n.`{property_name}` AS value_{index}"
+        for index, property_name in enumerate(requested)
+    )
+    rows = ctx.context.bim.query(
+        f"MATCH (n:`{label}`) WHERE n.`{source_property}` IN $allowed_sources "
+        f"RETURN {projections}, count(DISTINCT n) AS record_count "
+        "ORDER BY record_count DESC LIMIT $candidate_limit",
+        {"allowed_sources": ctx.context.scope.allowed_sources, "candidate_limit": 300},
+    )
+    expanded = _expanded_semantic_text(ctx.context, concept) if concept.strip() else ""
+    branches = []
+    for row in rows:
+        path = {
+            property_name: _clean_value(row.get(f"value_{index}"))
+            for index, property_name in enumerate(requested)
+        }
+        component_scores = [
+            _lexical_semantic_score(expanded, str(value)) if expanded and value not in (None, "") else 0.0
+            for value in path.values()
+        ]
+        weighted_scores = [
+            score * ((index + 1) / len(requested))
+            for index, score in enumerate(component_scores)
+        ]
+        hierarchy_score = round(max(weighted_scores, default=0.0), 6)
+        matching_indices = [index for index, score in enumerate(component_scores) if score > 0]
+        branches.append({
+            "path": path,
+            "record_count": int(row.get("record_count") or 0),
+            "lexical_similarity": hierarchy_score,
+            "component_similarities": dict(zip(requested, component_scores)),
+            "deepest_matching_property": (
+                requested[max(matching_indices)] if matching_indices else None
+            ),
+            "broad_only_match": bool(
+                matching_indices and max(matching_indices) == 0 and len(requested) > 1
+            ),
+        })
+    if expanded:
+        branches.sort(key=lambda item: (-item["lexical_similarity"], -item["record_count"], _json(item["path"])))
+    else:
+        branches.sort(key=lambda item: (-item["record_count"], _json(item["path"])))
+    result = {
+        "label": label,
+        "properties": requested,
+        "concept": concept or None,
+        "expanded_concept": expanded or None,
+        "candidate_branch_count": len(rows),
+        "branches": branches[:limit],
+        "scope": "authorized project only",
+        "usage_note": (
+            "These are exact observed diagnostic branches. When a broad category contains unrelated "
+            "families, bind the relevant leaf values through search_property_values, register the "
+            "mapping, and execute a fresh answer-producing query."
+        ),
+    }
+    ctx.context.schema_discovery[cache_key] = result
+    return _json(result)
 
 
 def profile_project_properties(
@@ -1448,7 +1946,7 @@ def semantic_search_project_nodes(
     label: str,
     name_properties: list[str],
     top_k: int = 5,
-    candidate_limit: int = 200,
+    candidate_limit: int = 500,
 ) -> str:
     """Rank authorized live nodes by embedding similarity over their labels and observed name fields."""
     if not query.strip():
@@ -1464,7 +1962,7 @@ def semantic_search_project_nodes(
     if any("`" in prop or any(ord(ch) < 32 for ch in prop) for prop in properties):
         raise ValueError("Live property names contain unsafe characters.")
     top_k = max(1, min(top_k, 20))
-    candidate_limit = max(top_k, min(candidate_limit, 500))
+    candidate_limit = max(top_k, min(candidate_limit, 1000))
     source_property = ctx.context.graph_contract.authorization_path.source_property
     model = os.getenv("BIM_EMBEDDING_MODEL", "text-embedding-3-small")
     cache_key = "semantic_nodes:" + hashlib.sha256(
@@ -1473,11 +1971,13 @@ def semantic_search_project_nodes(
     cached = ctx.context.schema_discovery.get(cache_key)
     if isinstance(cached, dict):
         return _json(cached)
+    expanded_query = _expanded_semantic_text(ctx.context, query)
     rows = ctx.context.bim.query(
         f"MATCH (n:`{label}`) WHERE n.`{source_property}` IN $allowed_sources "
-        "RETURN elementId(n) AS node_ref, labels(n) AS labels, "
-        "[property IN $name_properties | n[property]] AS name_values "
-        "ORDER BY node_ref LIMIT $candidate_limit",
+        "WITH labels(n) AS labels, [property IN $name_properties | n[property]] AS name_values, "
+        "min(elementId(n)) AS node_ref, count(n) AS population "
+        "RETURN node_ref, labels, name_values, population "
+        "ORDER BY population DESC, toString(name_values) LIMIT $candidate_limit",
         {
             "allowed_sources": ctx.context.scope.allowed_sources,
             "name_properties": properties,
@@ -1495,18 +1995,24 @@ def semantic_search_project_nodes(
             "labels": labels,
             "name_values": values,
             "embedding_text": text_value,
+            "population": int(row.get("population") or 0),
         }
         candidates.append(candidate)
         texts.append(text_value)
     if not candidates:
         return _json({"query": query, "matches": [], "scope": "authorized project only"})
-    response = OpenAI().embeddings.create(model=model, input=[query, *texts], encoding_format="float")
+    response = OpenAI().embeddings.create(
+        model=model, input=[expanded_query, *texts], encoding_format="float"
+    )
     vectors = [list(item.embedding) for item in response.data]
     if len(vectors) != len(candidates) + 1:
         raise RuntimeError("Embedding provider returned an incomplete result set.")
-    ranked = _rank_embedding_candidates(vectors[0], vectors[1:], candidates)[:top_k]
+    ranked = _rank_hybrid_candidates(
+        expanded_query, vectors[0], vectors[1:], candidates
+    )[:top_k]
     result = {
         "query": query,
+        "expanded_query": expanded_query,
         "label": label,
         "name_properties": properties,
         "embedding_model": model,
@@ -1524,7 +2030,7 @@ def _project_property_candidates(ctx: BimRunContext, label: str) -> list[dict[st
     if isinstance(cached, list):
         return cached
     node_type = _observed_node_type(ctx, label)
-    properties = list(node_type["properties"])[:60]
+    properties = sorted(set(node_type["properties"]))
     if not properties:
         return []
     source_property = ctx.graph_contract.authorization_path.source_property
@@ -1591,10 +2097,11 @@ def semantic_search_project_properties(
     cached = ctx.context.schema_discovery.get(cache_key)
     if isinstance(cached, dict):
         return _json(cached)
+    semantic_queries = [_expanded_semantic_text(ctx.context, concept) for concept in requested_concepts]
     texts = [candidate["embedding_text"] for candidate in candidates]
     response = OpenAI().embeddings.create(
         model=model,
-        input=[*requested_concepts, *texts],
+        input=[*semantic_queries, *texts],
         encoding_format="float",
     )
     vectors = [list(item.embedding) for item in response.data]
@@ -1604,7 +2111,9 @@ def semantic_search_project_properties(
     candidate_vectors = vectors[len(requested_concepts):]
     matches = {}
     for concept, vector in zip(requested_concepts, vectors[:len(requested_concepts)]):
-        ranked = _rank_embedding_candidates(vector, candidate_vectors, candidates)[:top_k]
+        ranked = _rank_hybrid_candidates(
+            semantic_queries[len(matches)], vector, candidate_vectors, candidates
+        )[:top_k]
         matches[concept] = [
             {**item, "meets_threshold": item["similarity"] >= similarity_threshold}
             for item in ranked
@@ -1613,6 +2122,7 @@ def semantic_search_project_properties(
         "label": label,
         "embedding_model": model,
         "property_count": len(candidates),
+        "expanded_concepts": dict(zip(requested_concepts, semantic_queries)),
         "similarity_threshold": similarity_threshold,
         "matches_by_concept": matches,
         "scope": "authorized project only",
@@ -1675,9 +2185,10 @@ def semantic_search_property_values(
         }
         ctx.context.schema_discovery[cache_key] = result
         return _json(result)
+    semantic_queries = [_expanded_semantic_text(ctx.context, concept) for concept in requested_concepts]
     response = OpenAI().embeddings.create(
         model=model,
-        input=[*requested_concepts, *[item["embedding_text"] for item in candidates]],
+        input=[*semantic_queries, *[item["embedding_text"] for item in candidates]],
         encoding_format="float",
     )
     vectors = [list(item.embedding) for item in response.data]
@@ -1686,7 +2197,9 @@ def semantic_search_property_values(
     candidate_vectors = vectors[len(requested_concepts):]
     matches = {}
     for concept, vector in zip(requested_concepts, vectors[:len(requested_concepts)]):
-        ranked = _rank_embedding_candidates(vector, candidate_vectors, candidates)[:top_k]
+        ranked = _rank_hybrid_candidates(
+            semantic_queries[len(matches)], vector, candidate_vectors, candidates
+        )[:top_k]
         matches[concept] = [
             {**item, "meets_threshold": item["similarity"] >= similarity_threshold}
             for item in ranked
@@ -1695,6 +2208,7 @@ def semantic_search_property_values(
         "label": label,
         "property": property,
         "embedding_model": model,
+        "expanded_concepts": dict(zip(requested_concepts, semantic_queries)),
         "similarity_threshold": similarity_threshold,
         "candidate_count": len(candidates),
         "matches_by_concept": matches,
@@ -1702,6 +2216,108 @@ def semantic_search_property_values(
     }
     ctx.context.schema_discovery[cache_key] = result
     return _json(result)
+
+
+def _validate_hierarchy_binding_coverage(
+    context: BimRunContext, proposal: SchemaMappingProposal,
+) -> None:
+    """Prevent a secondary classification field from silently dropping BIM branches."""
+    fields_by_name = {field.semantic_name: field for field in proposal.fields}
+    classification_bindings = [
+        binding for binding in proposal.value_bindings
+        if (
+            (fields_by_name.get(binding.semantic_name) is not None)
+            and fields_by_name[binding.semantic_name].ontology_kind
+            in {"canonical_type", "ifc_class"}
+        )
+    ]
+    hierarchy_fields = {
+        field.semantic_name: field.property
+        for field in proposal.fields
+        if field.semantic_name.casefold() in {"category", "family", "type"}
+    }
+    if not classification_bindings or len(hierarchy_fields) < 2:
+        return
+    hierarchy_properties = set(hierarchy_fields.values())
+    profiles = [
+        value for key, value in context.schema_discovery.items()
+        if key.startswith("classification_hierarchy:")
+        and isinstance(value, dict)
+        and value.get("label") == proposal.label
+        and hierarchy_properties.issubset(set(value.get("properties") or []))
+    ]
+    if not profiles:
+        raise ValueError(
+            "Profile the observed category/family/type hierarchy before registering "
+            "this entity classification."
+        )
+    for binding in classification_bindings:
+        relevant_profile = next(
+            (
+                profile for profile in profiles
+                if _lexical_semantic_score(
+                    str(profile.get("expanded_concept") or profile.get("concept") or ""),
+                    binding.user_concept,
+                ) > 0
+                if any(
+                    float(branch.get("lexical_similarity") or 0.0) > 0
+                    and not branch.get("broad_only_match", False)
+                    for branch in profile.get("branches") or []
+                )
+            ),
+            None,
+        )
+        if relevant_profile is not None and binding.property not in hierarchy_properties:
+            raise ValueError(
+                f"Classification binding {binding.property!r} is outside the profiled "
+                "category/family/type hierarchy and can silently omit supported entity branches. "
+                "Bind an exact profiled hierarchy value instead."
+            )
+        if relevant_profile is None:
+            continue
+        selected_values = {_normalize(match.value) for match in binding.matches}
+        branches = relevant_profile.get("branches") or []
+        relevant_branches = [
+            branch for branch in branches
+            if float(branch.get("lexical_similarity") or 0.0) > 0
+            and not branch.get("broad_only_match", False)
+        ]
+        selected_branches = [
+            branch for branch in relevant_branches
+            if _normalize((branch.get("path") or {}).get(binding.property)) in selected_values
+        ]
+        if not selected_branches:
+            raise ValueError(
+                "The selected exact classification values do not cover any supported "
+                "profiled hierarchy branch."
+            )
+        first_property = (relevant_profile.get("properties") or [None])[0]
+        if binding.property == first_property:
+            polluted = [
+                branch for branch in branches
+                if _normalize((branch.get("path") or {}).get(binding.property)) in selected_values
+                and branch.get("broad_only_match", False)
+            ]
+            if polluted:
+                raise ValueError(
+                    "The selected category also contains unrelated family/type branches; "
+                    "bind the complete supported leaf values instead."
+                )
+        else:
+            selected_parents = {
+                _normalize((branch.get("path") or {}).get(first_property))
+                for branch in selected_branches
+            }
+            missing_siblings = [
+                branch for branch in relevant_branches
+                if _normalize((branch.get("path") or {}).get(first_property)) in selected_parents
+                and _normalize((branch.get("path") or {}).get(binding.property)) not in selected_values
+            ]
+            if missing_siblings:
+                raise ValueError(
+                    "The selected leaf classification values omit supported sibling branches "
+                    "inside the same BIM category."
+                )
 
 
 def register_schema_mapping(
@@ -1774,6 +2390,7 @@ def register_schema_mapping(
             raise ValueError(
                 f"Value binding {binding.semantic_name!r} must reference its mapped semantic field."
             )
+    _validate_hierarchy_binding_coverage(ctx.context, proposal)
     required_evidence = {
         "identity": proposal.identity_property,
         **{
@@ -1908,11 +2525,183 @@ def register_schema_mapping(
     return registered.model_dump_json()
 
 
+def activate_project_knowledge_mapping(ctx: PipelineContext, knowledge_key: str) -> str:
+    """Live-validate and activate one server-governed project semantic mapping.
+
+    Unlike open-ended schema discovery, the caller selects only a key. Labels,
+    properties, exact values, and counting semantics come from project-scoped
+    trusted configuration and are still checked against the authorized graph.
+    """
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", knowledge_key):
+        raise ValueError("Project mapping keys must be safe identifiers.")
+    knowledge = ctx.context.bim.ontology.bim_query_knowledge.get(knowledge_key)
+    if not isinstance(knowledge, dict):
+        raise ValueError(f"No governed project mapping named {knowledge_key!r} exists.")
+    required_keys = {
+        "entity_concept", "label", "source_property", "identity_property",
+        "classification_property", "exact_family_values", "counting_unit",
+        "counting_unit_semantics",
+    }
+    missing = sorted(required_keys - set(knowledge))
+    if missing:
+        raise ValueError("The governed project mapping is incomplete: " + ", ".join(missing))
+    label = str(knowledge["label"])
+    source_property = str(knowledge["source_property"])
+    identity_property = str(knowledge["identity_property"])
+    classification_property = str(knowledge["classification_property"])
+    type_property = str(knowledge.get("type_property") or "")
+    category_property = str(knowledge.get("category_property") or "")
+    category_value = str(knowledge.get("category_value") or "")
+    exact_values = [str(value) for value in knowledge["exact_family_values"] if str(value)]
+    identifiers = [label, source_property, identity_property, classification_property]
+    identifiers.extend(value for value in (type_property, category_property) if value)
+    if any("`" in value or any(ord(character) < 32 for character in value) for value in identifiers):
+        raise ValueError("The governed project mapping contains unsafe identifiers.")
+    if source_property != ctx.context.graph_contract.authorization_path.source_property:
+        raise ValueError("The governed mapping must use the trusted authorization property.")
+    if not exact_values:
+        raise ValueError("The governed mapping requires exact classification values.")
+
+    observed = _observed_node_type(ctx.context, label)
+    required_properties = {
+        source_property, identity_property, classification_property,
+        *(value for value in (type_property, category_property) if value),
+    }
+    unknown = required_properties - set(observed["properties"])
+    if unknown:
+        raise ValueError("Governed mapping properties are absent from the live graph: " + str(sorted(unknown)))
+    rows = ctx.context.bim.query(
+        f"MATCH (n:`{label}`) WHERE n.`{source_property}` IN $allowed_sources "
+        f"RETURN count(DISTINCT n) AS node_count, "
+        f"count(DISTINCT CASE WHEN n.`{identity_property}` IS NOT NULL THEN n END) AS populated_count, "
+        f"count(DISTINCT n.`{identity_property}`) AS distinct_count, "
+        f"collect(DISTINCT CASE WHEN n.`{classification_property}` IN $exact_values "
+        + (
+            f"AND n.`{category_property}` = $category_value "
+            if category_property and category_value else ""
+        )
+        + f"THEN n.`{classification_property}` END) AS observed_values",
+        {
+            "allowed_sources": ctx.context.scope.allowed_sources,
+            "exact_values": exact_values,
+            "category_value": category_value,
+        },
+    )
+    row = rows[0] if rows else {}
+    node_count = int(row.get("node_count") or 0)
+    populated = int(row.get("populated_count") or 0)
+    distinct = int(row.get("distinct_count") or 0)
+    if not node_count or populated != node_count or distinct != node_count:
+        raise ValueError("The governed identity is not populated and unique across the live label.")
+    observed_values = {str(value) for value in row.get("observed_values") or [] if value is not None}
+    if observed_values != set(exact_values):
+        raise ValueError(
+            "The governed exact classification boundary changed; expected "
+            + str(sorted(exact_values)) + ", observed " + str(sorted(observed_values))
+        )
+
+    fields = []
+    if category_property:
+        fields.append(SchemaFieldMapping(
+            semantic_name="category", property=category_property,
+            ontology_kind="canonical_type",
+        ))
+    fields.append(SchemaFieldMapping(
+        semantic_name="family", property=classification_property,
+        ontology_kind="canonical_type",
+    ))
+    if type_property:
+        fields.append(SchemaFieldMapping(
+            semantic_name="type", property=type_property,
+            ontology_kind="canonical_type",
+        ))
+    value_bindings = []
+    if category_property and category_value:
+        value_bindings.append(SchemaValueBinding(
+            semantic_name="category",
+            property=category_property,
+            user_concept=f"{knowledge['entity_concept']} category",
+            matches=[SchemaValueMatch(value=category_value, similarity=1.0)],
+        ))
+    value_bindings.append(SchemaValueBinding(
+        semantic_name="family",
+        property=classification_property,
+        user_concept=str(knowledge["entity_concept"]),
+        matches=[SchemaValueMatch(value=value, similarity=1.0) for value in exact_values],
+    ))
+    proposal = SchemaMappingProposal(
+        entity_name=str(knowledge["entity_concept"]).replace(" ", "_"),
+        label=label,
+        identity_property=identity_property,
+        source_property=source_property,
+        fields=fields,
+        value_bindings=value_bindings,
+        counting_unit=str(knowledge["counting_unit"]),
+        counting_unit_evidence=str(knowledge["counting_unit_semantics"]),
+        reasoning_summary=(
+            f"Activated governed project mapping {knowledge_key!r} after live identity and exact-value validation."
+        ),
+    )
+    digest_input = {"project_id": ctx.context.scope.project_id, "proposal": proposal.model_dump(mode="json")}
+    mapping_id = "mapping-" + hashlib.sha256(_json(digest_input).encode("utf-8")).hexdigest()[:12]
+    existing = ctx.context.schema_mappings.get(mapping_id)
+    if isinstance(existing, RegisteredSchemaMapping):
+        return existing.model_dump_json()
+    registered = RegisteredSchemaMapping(
+        mapping_id=mapping_id,
+        proposal=proposal,
+        node_count=node_count,
+        populated_identity_count=populated,
+        distinct_identity_count=distinct,
+    )
+    ctx.context.schema_mappings[mapping_id] = registered
+    ctx.context.add_artifact(RunArtifact(
+        artifact_id=mapping_id, kind="mapping", producer="Schema Mapper",
+        summary=f"Activated governed live mapping {knowledge_key}.",
+        payload=registered.model_dump(mode="json"),
+    ))
+    return registered.model_dump_json()
+
+
 def query_bim(ctx: PipelineContext, plan: BimQueryPlan) -> str:
     """Execute one validated, project-scoped declarative BIM query plan; raw Cypher is never accepted."""
     if ctx.context.task_contract is None:
         raise ValueError("The pipeline must define the BIM task contract before querying.")
+    missing_probe = any(item.operator == "is_missing" for item in plan.filters)
+    if missing_probe:
+        plan.role = "supporting"
+        plan.include_in_answer = False
+    elif plan.operation == "distinct" and not plan.satisfies:
+        plan.role = "exploratory"
+        plan.include_in_answer = False
+    _validate_answer_metadata(ctx, plan)
     result = _execute_plan(ctx.context, plan)
+    diagnostics: list[str] = []
+    if result.get("matched_count") == 0:
+        diagnostics.append(
+            "zero_match: no records matched this exact entity/classification/filter hypothesis"
+        )
+    if any("missing data, not a zero" in item for item in result.get("limitations") or []):
+        diagnostics.append("missing_metric: entities exist but the requested metric is unpopulated")
+    if plan.answer_key:
+        current_signature = (
+            str((result.get("claim") or {}).get("value")),
+            str((result.get("claim") or {}).get("unit")),
+        )
+        previous_signatures = set()
+        for evidence in ctx.context.evidence.values():
+            if evidence.kind != "query":
+                continue
+            previous = json.loads(evidence.payload)
+            previous_plan = previous.get("plan") or {}
+            if previous_plan.get("answer_key") == plan.answer_key:
+                previous_claim = previous.get("claim") or {}
+                previous_signatures.add((str(previous_claim.get("value")), str(previous_claim.get("unit"))))
+        if previous_signatures and current_signature not in previous_signatures:
+            diagnostics.append(
+                "contradiction: this answer_key produced a value different from earlier evidence"
+            )
+    result["diagnostics"] = diagnostics
     evidence_id = f"query-{uuid4().hex[:10]}"
     ctx.context.add_evidence(Evidence(
         evidence_id=evidence_id,
@@ -1953,39 +2742,6 @@ def _verify_query_evidence(
     for evidence_id in available_evidence_ids:
         evidence = context.evidence[evidence_id]
         original = json.loads(evidence.payload)
-        if original.get("capability") == "project_knowledge":
-            plan = KnowledgeQueryPlan.model_validate(original["plan"])
-            facts = context.bim.ontology.bim_query_knowledge.get("facts") or {}
-            fact = facts.get(plan.fact) or {}
-            claim = {
-                "statement": str(fact.get("statement") or ""),
-                "value": fact.get("value"),
-                "unit": str(fact.get("unit") or "fact"),
-                "basis": str(fact.get("basis") or "curated active-project knowledge"),
-            }
-            stable = {"plan": plan.model_dump(mode="json"), "claim": claim, "fact": plan.fact}
-            digest = hashlib.sha256(
-                json.dumps(stable, sort_keys=True, ensure_ascii=False).encode("utf-8")
-            ).hexdigest()
-            replay_ok = digest == original.get("result_digest") and bool(claim["statement"])
-            semantic_checks = [
-                {"name": "replay_stability", "passed": replay_ok,
-                 "explanation": "The scoped knowledge fact is unchanged." if replay_ok else "The scoped knowledge fact changed."},
-                {"name": "authorized_scope", "passed": bool(context.scope.allowed_sources),
-                 "explanation": "The fact was loaded from the active client/project overlay."},
-            ]
-            # Keep the same complete semantic-check vocabulary used by graph queries.
-            for name in ("identity_integrity", "constraint_binding", "counting_unit", "boundary_exactness",
-                         "source_deduplication", "classification_purity", "constraint_coverage"):
-                semantic_checks.append({"name": name, "passed": True,
-                                        "explanation": "Satisfied by the scoped knowledge fact contract."})
-            checks.append({
-                "evidence_id": evidence_id, "verified": all(x["passed"] for x in semantic_checks),
-                "expected_digest": original.get("result_digest"), "actual_digest": digest,
-                "claim": claim, "limitations": [], "plan": plan.model_dump(mode="json"),
-                "semantic_checks": semantic_checks,
-            })
-            continue
         if original.get("capability") == "project_geometry":
             plan = GeometryQueryPlan.model_validate(original["plan"])
             report = calculate_project_geometry(
@@ -2104,6 +2860,26 @@ def _verify_query_evidence(
                     if classification_ok else
                     "A requested classification is not constrained by its exact mapped boundary."
                 )
+            answer_producing = (
+                plan.role == "answer_producing" and plan.include_in_answer is not False
+            )
+            unexpected_zero = (
+                answer_producing
+                and bool(registered.proposal.value_bindings)
+                and int(rerun.get("matched_count") or 0) == 0
+            )
+            if unexpected_zero:
+                classification_ok = False
+                classification_explanation = (
+                    "The exact live-mapped classification produced zero records. "
+                    "This is an unresolved mapping contradiction, not a verified absence."
+                )
+        constraints_ok, missing_constraints = _plan_constraint_coverage(context, plan)
+        constraint_explanation = (
+            "Every task constraint is represented by a query filter."
+            if constraints_ok else
+            "Missing task constraints: " + ", ".join(missing_constraints) + "."
+        )
         semantic_checks = [
             {"name": "replay_stability", "passed": replay_ok,
              "explanation": "The rerun result digest matches the original." if replay_ok
@@ -2122,8 +2898,8 @@ def _verify_query_evidence(
              "explanation": source_dedup_explanation},
             {"name": "classification_purity", "passed": classification_ok,
              "explanation": classification_explanation},
-            {"name": "constraint_coverage", "passed": binding_ok,
-             "explanation": binding_explanation},
+            {"name": "constraint_coverage", "passed": binding_ok and constraints_ok,
+             "explanation": constraint_explanation if binding_ok else binding_explanation},
         ]
         checks.append({
             "evidence_id": evidence_id,
@@ -2133,6 +2909,10 @@ def _verify_query_evidence(
             "claim": rerun["claim"],
             "limitations": rerun.get("limitations", []),
             "plan": rerun["plan"],
+            "matched_count": rerun.get("matched_count"),
+            "diagnostics": (
+                ["zero_match"] if int(rerun.get("matched_count") or 0) == 0 else []
+            ),
             "semantic_checks": semantic_checks,
         })
     return {
@@ -2189,6 +2969,10 @@ def ensure_compliance_evidence(context: BimRunContext) -> str | None:
             return evidence_id
     if context.task_contract is None:
         return None
+    requirement_outputs = [
+        output for output in context.task_contract.required_outputs
+        if re.search(r"\b(compliance|requirement|permit|applicable)\b", output, re.I)
+    ]
     return json.loads(query_bim(
         PipelineContext(context),
         BimQueryPlan(
@@ -2196,6 +2980,9 @@ def ensure_compliance_evidence(context: BimRunContext) -> str | None:
             operation="list",
             select=["name", "summary", "knowledge"],
             limit=20,
+            role="supporting" if requirement_outputs else "exploratory",
+            include_in_answer=False,
+            satisfies=requirement_outputs,
         ),
     ))["evidence_id"]
 

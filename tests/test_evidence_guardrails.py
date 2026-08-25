@@ -7,6 +7,10 @@ from bim_agents.guardrails import pipeline_report_from_evidence, verification_re
 from bim_agents.models import (
     BimRunContext, BimTaskContract, Evidence, ProjectScope, RunArtifact,
 )
+from bim_agents.schema_mapping import (
+    RegisteredSchemaMapping, SchemaFieldMapping, SchemaMappingProposal,
+    SchemaValueBinding, SchemaValueMatch,
+)
 from bim_agents.tools import (
     BimFilter, BimQueryPlan, _verify_query_evidence, ensure_bim_verification,
     ensure_compliance_evidence,
@@ -14,6 +18,57 @@ from bim_agents.tools import (
 
 
 class EvidenceGuardrailTests(unittest.TestCase):
+    def test_zero_from_exact_live_mapping_fails_classification_purity(self):
+        mapping = RegisteredSchemaMapping(
+            mapping_id="mapping-switches",
+            proposal=SchemaMappingProposal(
+                entity_name="switches", label="IfcBuildingElementProxy",
+                identity_property="GlobalID", source_property="source",
+                fields=[SchemaFieldMapping(
+                    semantic_name="classification", property="OmniClass",
+                    ontology_kind="canonical_type",
+                )],
+                value_bindings=[SchemaValueBinding(
+                    semantic_name="classification", property="OmniClass",
+                    user_concept="switches",
+                    matches=[SchemaValueMatch(value="Switches", similarity=1.0)],
+                )],
+                counting_unit="physical switch",
+                counting_unit_evidence="GlobalID is unique per instance.",
+                reasoning_summary="Live mapping.",
+            ),
+            node_count=20, populated_identity_count=20, distinct_identity_count=20,
+        )
+        context = BimRunContext(
+            bim=object(),
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=load_graph_contract(), schema_mappings={mapping.mapping_id: mapping},
+        )
+        plan = BimQueryPlan(
+            entity="switches", mapping_id=mapping.mapping_id, operation="count",
+            filters=[BimFilter(field="classification", operator="equals", value="Switches")],
+            answer_key="switch-count",
+        )
+        context.add_evidence(Evidence(
+            evidence_id="query-zero", kind="query", summary="zero",
+            payload=json.dumps({"plan": plan.model_dump(mode="json"), "result_digest": "same"}),
+        ))
+        rerun = {
+            "plan": plan.model_dump(mode="json"), "result_digest": "same",
+            "claim": {"statement": "0 switches", "value": 0, "basis": "test"},
+            "matched_count": 0, "limitations": [],
+        }
+
+        with patch("bim_agents.tools._execute_plan", return_value=rerun):
+            result = _verify_query_evidence(context, ["query-zero"])
+
+        self.assertFalse(result["verified"])
+        purity = next(
+            check for check in result["checks"][0]["semantic_checks"]
+            if check["name"] == "classification_purity"
+        )
+        self.assertFalse(purity["passed"])
+        self.assertIn("unresolved mapping contradiction", purity["explanation"])
     def test_runtime_recovers_verification_from_valid_query_evidence(self):
         context = BimRunContext(
             bim=object(),
@@ -280,6 +335,47 @@ class EvidenceGuardrailTests(unittest.TestCase):
         self.assertIn("Two tray types", report.answer)
         self.assertIn("material availability", " ".join(report.limitations))
 
+    def test_verified_supporting_probe_can_satisfy_missing_data_output(self):
+        context = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+            task_contract=BimTaskContract(
+                goal="Count apartments", operation="count", entity_concept="apartments",
+                required_outputs=["apartment count", "missing identity status"],
+                success_criteria=["Count and missing data are replayed"],
+            ),
+        )
+        answer = BimQueryPlan(
+            entity="spaces", operation="count", answer_key="apartment-count",
+            satisfies=["apartment count"],
+        )
+        missing = BimQueryPlan(
+            entity="spaces", operation="count", role="supporting",
+            include_in_answer=False, satisfies=["missing identity status"],
+        )
+        context.add_evidence(Evidence(
+            evidence_id="verification-complete-with-probe", kind="verification", summary="complete",
+            payload=json.dumps({"checks": [
+                {
+                    "evidence_id": "q-answer", "verified": True,
+                    "plan": answer.model_dump(mode="json"),
+                    "claim": {"statement": "There are 8 apartments.", "value": 8, "basis": "test"},
+                    "semantic_checks": [],
+                },
+                {
+                    "evidence_id": "q-missing", "verified": True,
+                    "plan": missing.model_dump(mode="json"),
+                    "claim": {"statement": "No identities are missing.", "value": 0, "basis": "test"},
+                    "semantic_checks": [],
+                },
+            ]}),
+        ))
+
+        report = pipeline_report_from_evidence(context)
+
+        self.assertEqual(report.verification_status, "verified")
+        self.assertEqual(report.answer, "There are 8 apartments.")
+
     def test_pipeline_report_exposes_ordered_artifact_trace(self):
         context = BimRunContext(
             bim=object(),
@@ -344,8 +440,9 @@ class EvidenceGuardrailTests(unittest.TestCase):
         report = pipeline_report_from_evidence(context)
 
         self.assertEqual(report.verification_status, "insufficient_evidence")
-        self.assertTrue(report.answer.startswith("Gross floor area is not assessable"))
-        self.assertIn("Verified diagnostic facts", report.answer)
+        self.assertTrue(report.answer.startswith("There are 0 BVO apartment records"))
+        self.assertIn("Unresolved verification notes", report.answer)
+        self.assertIn("Gross floor area is not assessable", report.answer)
 
     def test_compliance_evidence_is_added_when_requirements_query_is_missing(self):
         context = BimRunContext(
@@ -356,6 +453,7 @@ class EvidenceGuardrailTests(unittest.TestCase):
                 goal="Assess compliance",
                 operation="list",
                 entity_concept="ground-floor functions",
+                required_outputs=["applicable compliance requirements"],
                 success_criteria=["Check scoped requirements"],
             ),
         )

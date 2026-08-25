@@ -1,13 +1,6 @@
 # Project-scoped BIM query knowledge for this Revit model. These are interpretation
 # rules over observed graph fields and quantities, not global IFC assumptions.
 bim_query_knowledge:
-  facts:
-    middle_and_free_sector_apartments:
-      value: 70
-      unit: apartments
-      statement: There are 70 residential apartments in the combined middle-segment and free-sector project scope.
-      basis: Curated project-program requirement; distinct from raw Revit space-record counts.
-
   area_plan:
     floor_plate_basis: BVO
     floor_plate_type: residential_zone
@@ -44,7 +37,7 @@ bim_query_knowledge:
     semantics: >-
       Equal repeated upper-floor facade schedules define the typical tower floor.
       Opening percentage is external window/door area divided by opening area plus
-      oriented Klimaatgevel opaque area. The observed result is about 45 percent.
+      oriented Klimaatgevel opaque area.
 
   residential_records:
     segment_code: MSH
@@ -53,13 +46,13 @@ bim_query_knowledge:
     physical_unit_identity: graph_distinct_identity
     physical_unit_identity_property: EenheidNummer
     physical_unit_identity_semantics: >-
-      EenheidNummer is the Revit dwelling-unit number. It has 100 distinct values
-      across 105 apartment-space records; both levels of each duplex share one value.
+      EenheidNummer is the Revit dwelling-unit number. Both levels of a duplex share
+      one value, so physical dwelling counts must use distinct populated values.
     duplex_counting_rule: >-
       Two space records representing the lower and upper portions of one duplex count
       as one physical apartment, not two apartments.
     semantics: >-
       Apartment counts must use distinct EenheidNummer values from Neo4j. Never count
       apartment-space records as physical dwellings because both levels of a duplex
-      share one dwelling-unit number. Combined middle/free-sector program scope is a
-      separately curated project fact, not a raw Revit record count.
+      share one dwelling-unit number. Segment counts must be calculated from explicit
+      graph classifications whose project meaning has been established.

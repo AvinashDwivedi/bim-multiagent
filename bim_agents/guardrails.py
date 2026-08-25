@@ -118,6 +118,11 @@ def verification_report_from_evidence(context: BimRunContext) -> VerificationRep
     for check in payload.get("checks") or []:
         plan = check.get("plan") or {}
         include_in_answer = _is_answer_plan(plan)
+        if (
+            check.get("verified") is True
+            and plan.get("role", "answer_producing") in {"answer_producing", "supporting"}
+        ):
+            satisfied_outputs.update(str(item) for item in plan.get("satisfies") or [])
         if include_in_answer:
             limitations.extend(check.get("limitations") or [])
         semantic_checks.extend(
@@ -130,7 +135,6 @@ def verification_report_from_evidence(context: BimRunContext) -> VerificationRep
                 [str(check.get("evidence_id")), evidence_id],
             )
             verified_entries.append((claim, plan))
-            satisfied_outputs.update(str(item) for item in plan.get("satisfies") or [])
         elif include_in_answer:
             failed_checks = [
                 item.get("name", "unknown_check")
@@ -205,7 +209,13 @@ def pipeline_report_from_evidence(context: BimRunContext) -> PipelineReport:
         if verification.status != "verified" or (
             context.completion_status == "insufficient_evidence" and context.runtime_limitations
         ):
-            answer = "\n\n".join(context.runtime_limitations + ["Verified diagnostic facts:\n" + verified_answer])
+            # Lead with useful replay-verified facts. Open secondary gates are
+            # caveats, not a reason to bury the answer behind pipeline prose.
+            answer = verified_answer
+            if context.runtime_limitations:
+                answer += "\n\nUnresolved verification notes:\n- " + "\n- ".join(
+                    context.runtime_limitations
+                )
             status = "insufficient_evidence"
         else:
             answer = verified_answer
