@@ -21,6 +21,15 @@ class _Bim:
 
     def query(self, cypher, parameters):
         self.queries.append((cypher, parameters))
+        if "AS resolved_count" in cypher:
+            return [{
+                "candidate_count": 4,
+                "connected_count": 3,
+                "resolved_count": 2,
+                "missing_count": 1,
+                "unresolved_count": 1,
+                "linked_target_count": 2,
+            }]
         if "AS candidate_count" in cypher:
             if "AS connected_count" in cypher:
                 return [{"candidate_count": 4, "connected_count": 1}]
@@ -232,6 +241,52 @@ class MeasurementContractTests(unittest.TestCase):
         self.assertEqual(exists["matched_count"], 1)
         self.assertIn("AND (EXISTS { MATCH (n)<-[:`PORT_OF`]", bim.queries[-2][0])
         self.assertIn("AND (NOT (EXISTS { MATCH (n)<-[:`PORT_OF`]", bim.queries[-1][0])
+
+    def test_physical_topology_requires_identified_targets_and_exposes_conflicts(self):
+        context, bim = _context()
+        registered = context.schema_mappings["mapping-test"]
+        registered.proposal.relationship_bindings = [SchemaRelationshipBinding(
+            semantic_name="physical_connection",
+            purpose="Physical connection to an identified distribution port.",
+            evidence_kind="physical_topology",
+            target_identity_property="GlobalID",
+            target_cardinality="exactly_one",
+            steps=[SchemaRelationshipStep(
+                from_label="IfcFlowSegment", relationship_type="PORT_OF",
+                to_label="IfcDistributionPort", direction="incoming",
+                purpose="Traverse from segment to its port.",
+            )],
+        )]
+
+        result = _execute_plan(context, BimQueryPlan(
+            entity="tray_segments", mapping_id="mapping-test",
+            operation="relationship_coverage", relationship="physical_connection",
+            filters=_filters(),
+        ))
+
+        claim = result["claim"]
+        self.assertIn("OPTIONAL MATCH (n)<-[:`PORT_OF`]-(rb0:`IfcDistributionPort`)", bim.queries[0][0])
+        self.assertEqual(claim["value"], 2)
+        self.assertEqual(claim["coverage"]["candidate_count"], 4)
+        self.assertEqual(claim["coverage"]["matched_count"], 2)
+        self.assertEqual(claim["coverage"]["missing_count"], 1)
+        self.assertEqual(claim["coverage"]["unknown_count"], 1)
+        self.assertFalse(claim["coverage"]["exhaustive"])
+        self.assertIn("Raw records with a path: 3", claim["details"])
+        self.assertIn("target identity", claim["caveats"][0])
+
+    def test_physical_topology_binding_requires_target_identity(self):
+        with self.assertRaisesRegex(ValueError, "stable target_identity_property"):
+            SchemaRelationshipBinding(
+                semantic_name="physical_connection",
+                purpose="Physical path.",
+                evidence_kind="physical_topology",
+                steps=[SchemaRelationshipStep(
+                    from_label="IfcFlowSegment", relationship_type="PORT_OF",
+                    to_label="IfcDistributionPort", direction="incoming",
+                    purpose="Traverse to a port.",
+                )],
+            )
 
     def test_unknown_relationship_predicate_fails_closed(self):
         context, _ = _context()

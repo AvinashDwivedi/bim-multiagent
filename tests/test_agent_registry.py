@@ -2,7 +2,7 @@ import unittest
 
 from pydantic import ValidationError
 
-from agents.strict_schema import ensure_strict_json_schema
+from bim_agents.claude_runtime import ensure_strict_json_schema
 
 from bim_agents.registry import build_agent_registry
 from bim_agents.models import EvidenceWorkstreamResult

@@ -63,6 +63,31 @@ class ContractTests(unittest.TestCase):
             "population_missing",
         )
 
+    def test_missing_relationship_is_not_normalized_as_missing_components(self):
+        from bim_agents.graph_contract import load_graph_contract
+        from bim_agents.tools import PipelineContext, define_bim_task
+
+        output = "Components without a feeding-panel relationship"
+        spec = OutputSpec(
+            key="missing_panel_relationships", kind="relationship_coverage",
+            semantic_intent=SemanticIntent(absence_semantics="population_missing"),
+        )
+        context = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+        )
+        define_bim_task(PipelineContext(context), BimTaskContract(
+            goal="Find components without a feeding-panel relationship",
+            operation="relationship_coverage", entity_concept="electrical components",
+            required_outputs=[output], output_specs=[spec],
+            success_criteria=["Report the missing relationship count."],
+        ))
+
+        self.assertEqual(
+            context.task_contract.output_specs[0].semantic_intent.absence_semantics,
+            "property_missing",
+        )
+
     def test_run_context_records_append_only_workflow_artifacts(self):
         from bim_agents.graph_contract import load_graph_contract
         context = BimRunContext(
@@ -102,6 +127,132 @@ class ContractTests(unittest.TestCase):
                 )],
                 success_criteria=["Both outputs are verified"],
             )
+
+    def test_package_only_constraint_is_hoisted_without_leaking_to_sibling(self):
+        contract = BimTaskContract(
+            goal="Count all units and ground-floor units",
+            operation="count_distinct",
+            entity_concept="physical apartments",
+            required_outputs=["all units", "ground-floor units"],
+            work_packages=[
+                EvidenceWorkPackage(
+                    package_id="all_units", objective="Count all units",
+                    required_outputs=["all units"], constraints=[],
+                ),
+                EvidenceWorkPackage(
+                    package_id="ground_units", objective="Count ground-floor units",
+                    required_outputs=["ground-floor units"],
+                    constraints=[TaskConstraint(
+                        concept="level", requested_value="ground floor",
+                    )],
+                ),
+            ],
+            success_criteria=["Return both distinct dwelling counts."],
+        )
+
+        self.assertEqual(
+            contract.constraints,
+            [TaskConstraint(concept="level", requested_value="ground floor")],
+        )
+        self.assertEqual(contract.work_packages[0].constraints, [])
+
+    def test_blank_package_outputs_recover_from_unique_root_spec_keys(self):
+        contract = BimTaskContract.model_validate({
+            "goal": "Resolve facts and requirements",
+            "operation": "list",
+            "entity_concept": "functional spaces",
+            "required_outputs": ["function summary", "applicable requirements"],
+            "output_specs": [
+                {"key": "functions", "kind": "grouped_summary"},
+                {"key": "requirements", "kind": "list"},
+            ],
+            "work_packages": [
+                {
+                    "package_id": "facts", "objective": "Resolve functions",
+                    "required_outputs": ["function summary"],
+                    "output_specs": [{"key": "functions", "kind": "grouped_summary"}],
+                },
+                {
+                    "package_id": "requirements", "objective": "Resolve requirements",
+                    "required_outputs": [""],
+                    "output_specs": [{"key": "requirements", "kind": "list"}],
+                },
+            ],
+            "success_criteria": ["Resolve both outputs."],
+        })
+
+        self.assertEqual(
+            contract.work_packages[1].required_outputs,
+            ["applicable requirements"],
+        )
+        self.assertEqual(
+            contract.work_packages[1].output_specs[0].key,
+            "requirements",
+        )
+
+    def test_missing_package_outputs_recover_from_unique_root_spec_keys(self):
+        contract = BimTaskContract.model_validate({
+            "goal": "Resolve two outputs", "operation": "list",
+            "entity_concept": "elements",
+            "required_outputs": ["first output", "second output"],
+            "output_specs": [{"key": "first"}, {"key": "second"}],
+            "work_packages": [
+                {
+                    "package_id": "first", "objective": "Resolve first",
+                    "output_specs": [{"key": "first"}],
+                },
+                {
+                    "package_id": "second", "objective": "Resolve second",
+                    "required_outputs": ["second output"],
+                    "output_specs": [{"key": "second"}],
+                },
+            ],
+            "success_criteria": ["Resolve both outputs."],
+        })
+
+        self.assertEqual(contract.work_packages[0].required_outputs, ["first output"])
+
+    def test_blank_package_output_repair_rejects_unmatched_spec_key(self):
+        with self.assertRaisesRegex(ValidationError, "unique package output_spec keys"):
+            BimTaskContract.model_validate({
+                "goal": "Resolve output", "operation": "list",
+                "entity_concept": "elements", "required_outputs": ["result"],
+                "output_specs": [{"key": "root_result"}],
+                "work_packages": [{
+                    "package_id": "result", "objective": "Resolve output",
+                    "required_outputs": [""],
+                    "output_specs": [{"key": "different_key"}],
+                }],
+                "success_criteria": ["Resolve output."],
+            })
+
+    def test_blank_package_output_repair_rejects_ambiguous_root_spec_key(self):
+        with self.assertRaisesRegex(ValidationError, "unique package output_spec keys"):
+            BimTaskContract.model_validate({
+                "goal": "Resolve outputs", "operation": "list",
+                "entity_concept": "elements",
+                "required_outputs": ["first", "second"],
+                "output_specs": [{"key": "shared"}, {"key": "shared"}],
+                "work_packages": [{
+                    "package_id": "result", "objective": "Resolve one output",
+                    "required_outputs": [""],
+                    "output_specs": [{"key": "shared"}],
+                }],
+                "success_criteria": ["Resolve outputs."],
+            })
+
+    def test_blank_package_output_repair_rejects_missing_package_specs(self):
+        with self.assertRaisesRegex(ValidationError, "without package output_specs"):
+            BimTaskContract.model_validate({
+                "goal": "Resolve output", "operation": "list",
+                "entity_concept": "elements", "required_outputs": ["result"],
+                "output_specs": [{"key": "result"}],
+                "work_packages": [{
+                    "package_id": "result", "objective": "Resolve output",
+                    "required_outputs": [""],
+                }],
+                "success_criteria": ["Resolve output."],
+            })
 
     def test_work_package_dependency_cycles_are_rejected_at_contract_boundary(self):
         with self.assertRaisesRegex(ValidationError, "acyclic"):

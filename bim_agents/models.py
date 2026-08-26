@@ -260,12 +260,94 @@ class BimTaskContract(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def populate_output_labels(cls, data: Any) -> Any:
-        if isinstance(data, dict) and not data.get("required_outputs") and data.get("output_specs"):
-            data = dict(data)
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        if not data.get("required_outputs") and data.get("output_specs"):
             data["required_outputs"] = [
                 item.key if isinstance(item, OutputSpec) else item.get("key")
                 for item in data["output_specs"]
             ]
+
+        # Structured-output models can occasionally emit a blank package label while
+        # still supplying the correct typed output spec. Repair that mechanical defect
+        # before EvidenceWorkPackage validates, using only the root's explicit zipped
+        # label/spec-key table. No package prose or domain semantics participate.
+        root_outputs = list(data.get("required_outputs") or [])
+        root_specs = list(data.get("output_specs") or [])
+        if root_outputs and len(root_outputs) == len(root_specs):
+            labels_by_key: dict[str, list[str]] = {}
+            for label, spec in zip(root_outputs, root_specs, strict=True):
+                key = spec.key if isinstance(spec, OutputSpec) else spec.get("key")
+                normalized_key = str(key or "").strip()
+                if normalized_key:
+                    labels_by_key.setdefault(normalized_key, []).append(str(label))
+            repaired_packages = []
+            for package in data.get("work_packages") or []:
+                if not isinstance(package, dict):
+                    repaired_packages.append(package)
+                    continue
+                package = dict(package)
+                package_outputs = package.get("required_outputs")
+                needs_repair = (
+                    not package_outputs
+                    or any(not str(output or "").strip() for output in package_outputs)
+                )
+                if not needs_repair:
+                    repaired_packages.append(package)
+                    continue
+                package_specs = list(package.get("output_specs") or [])
+                if not package_specs:
+                    raise ValueError(
+                        "blank or missing work package required_outputs cannot be repaired "
+                        "without package output_specs."
+                    )
+                recovered: list[str] = []
+                seen_keys: set[str] = set()
+                for spec in package_specs:
+                    key = spec.key if isinstance(spec, OutputSpec) else spec.get("key")
+                    normalized_key = str(key or "").strip()
+                    matches = labels_by_key.get(normalized_key, [])
+                    if not normalized_key or len(matches) != 1 or normalized_key in seen_keys:
+                        raise ValueError(
+                            "blank or missing work package required_outputs require unique "
+                            "package output_spec keys matched to root output_specs."
+                        )
+                    recovered.append(matches[0])
+                    seen_keys.add(normalized_key)
+                package["required_outputs"] = recovered
+                repaired_packages.append(package)
+            data["work_packages"] = repaired_packages
+
+        # A scoped package may legitimately own a constraint that does not apply
+        # to a sibling package (for example, ``ground floor`` in a total-versus-
+        # ground-floor comparison). Structured-output models occasionally emit that
+        # boundary only on the package. Hoist the package union to the root contract
+        # before the strict partition validator runs; package projection still
+        # prevents the boundary from leaking into sibling queries.
+        constraints = list(data.get("constraints") or [])
+
+        def constraint_key(item: Any) -> tuple[str, str]:
+            if isinstance(item, dict):
+                concept = item.get("concept", "")
+                requested = item.get("requested_value", "")
+            else:
+                concept = getattr(item, "concept", "")
+                requested = getattr(item, "requested_value", "")
+            return str(concept).casefold().strip(), str(requested).casefold().strip()
+
+        seen = {constraint_key(item) for item in constraints}
+        for package in data.get("work_packages") or []:
+            package_constraints = (
+                package.get("constraints") if isinstance(package, dict)
+                else getattr(package, "constraints", None)
+            )
+            for constraint in package_constraints or []:
+                key = constraint_key(constraint)
+                if key not in seen:
+                    constraints.append(constraint)
+                    seen.add(key)
+        data["constraints"] = constraints
         return data
 
     @model_validator(mode="after")
@@ -612,7 +694,10 @@ class WorkstreamDiagnostic(BaseModel):
     status: str
     attempts: int = Field(default=0, ge=0)
     typed_output_failures: int = Field(default=0, ge=0)
+    verification_rejections: int = Field(default=0, ge=0)
     recovery_strategy: str = ""
+    failure_category: str = ""
+    error_type: str = ""
     required_outputs: list[str] = Field(default_factory=list)
     satisfied_outputs: list[str] = Field(default_factory=list)
 

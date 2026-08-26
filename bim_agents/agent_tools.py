@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from agents import RunContextWrapper, function_tool
+from .claude_runtime import RunContextWrapper, function_tool
 
 from .models import (
     BimRunContext, BimTaskContract, InvestigationAction,

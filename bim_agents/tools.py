@@ -11,7 +11,6 @@ from threading import Lock
 from typing import Any, Literal
 from uuid import uuid4
 
-from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from .graph_contract import QueryEntity, QueryField
@@ -233,6 +232,13 @@ def _normalize_contract_semantics(contract: BimTaskContract) -> BimTaskContract:
         if output in requirements_outputs:
             intent.absence_semantics = "population_missing"
         elif (
+            spec.kind == "relationship_coverage"
+            and explicit_absence.search(f"{normalized.goal} {output}")
+        ):
+            # The absent thing is a relationship/property on an existing governed
+            # component population, not an absent component population.
+            intent.absence_semantics = "property_missing"
+        elif (
             spec.kind == "coverage"
             and intent.absence_semantics != "unspecified"
             and not explicit_absence.search(f"{normalized.goal} {output}")
@@ -401,11 +407,14 @@ def inspect_completion_gates(ctx: PipelineContext) -> str:
         for output in check.get("plan", {}).get("satisfies") or []
     }
     answer_values: dict[str, set[tuple[str, str]]] = {}
-    for payload in query_payloads:
-        plan = payload.get("plan") or {}
+    # Only independently verified claims can create a terminal contradiction.
+    # Rejected exploratory/correction attempts remain in the audit trail but must
+    # not poison a later verified repair that uses the same stable answer key.
+    for check in verified_checks:
+        plan = check.get("plan") or {}
         key = str(plan.get("answer_key") or "").strip()
         if key and plan.get("role", "answer_producing") == "answer_producing":
-            claim = payload.get("claim") or {}
+            claim = check.get("claim") or {}
             answer_values.setdefault(key, set()).add((str(claim.get("value")), str(claim.get("unit"))))
     contradictions = [key for key, values in answer_values.items() if len(values) > 1]
     required = set(notebook.required_outputs)
@@ -949,6 +958,18 @@ def _registered_match_clause(mapping: RegisteredSchemaMapping | None, label: str
 def _relationship_exists_expression(
     mapping: RegisteredSchemaMapping, semantic_name: str,
 ) -> tuple[str, list[str]]:
+    binding = _relationship_binding(mapping, semantic_name)
+    pattern, variables = _relationship_match_pattern(mapping, binding)
+    scoped = " AND ".join(
+        f"{variable}.`{mapping.proposal.source_property}` IN $allowed_sources"
+        for variable in variables
+    )
+    return "EXISTS { MATCH " + pattern + (f" WHERE {scoped}" if scoped else "") + " }", variables
+
+
+def _relationship_binding(
+    mapping: RegisteredSchemaMapping, semantic_name: str,
+) -> SchemaRelationshipBinding:
     binding = next(
         (
             item for item in mapping.proposal.relationship_bindings
@@ -963,6 +984,12 @@ def _relationship_exists_expression(
         )
     if binding.steps[0].from_label != mapping.proposal.label:
         raise ValueError("A relationship binding must start at the mapped entity label.")
+    return binding
+
+
+def _relationship_match_pattern(
+    mapping: RegisteredSchemaMapping, binding: SchemaRelationshipBinding,
+) -> tuple[str, list[str]]:
     pattern = ["(n)"]
     variables: list[str] = []
     previous = mapping.proposal.label
@@ -978,11 +1005,7 @@ def _relationship_exists_expression(
             if step.direction == "outgoing" else f"<-{relationship}-{target}"
         )
         previous = step.to_label
-    scoped = " AND ".join(
-        f"{variable}.`{mapping.proposal.source_property}` IN $allowed_sources"
-        for variable in variables
-    )
-    return "EXISTS { MATCH " + "".join(pattern) + (f" WHERE {scoped}" if scoped else "") + " }", variables
+    return "".join(pattern), variables
 
 
 def _field(entity: QueryEntity, name: str) -> QueryField:
@@ -1151,13 +1174,42 @@ def _rank_embedding_candidates(
     return sorted(ranked, key=lambda item: (-item["similarity"], item["node_ref"]))
 
 
+def _local_semantic_embedding(value: str, dimensions: int = 384) -> list[float]:
+    """Build a deterministic local vector from words and character n-grams.
+
+    Anthropic does not expose an embeddings endpoint. Ontology expansion supplies
+    the cross-language vocabulary; signed feature hashing then provides fuzzy,
+    network-free similarity without retaining an OpenAI runtime dependency.
+    """
+    normalized = _normalize(value).replace("_", " ")
+    words = re.findall(r"\w+", normalized, flags=re.UNICODE)
+    features = [f"word:{word}" for word in words]
+    for word in words:
+        padded = f"  {word}  "
+        features.extend(
+            f"char:{padded[index:index + 3]}"
+            for index in range(max(len(padded) - 2, 0))
+        )
+    vector = [0.0] * dimensions
+    for feature in features:
+        digest = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
+        bucket = int.from_bytes(digest[:4], "big") % dimensions
+        sign = 1.0 if digest[4] & 1 else -1.0
+        vector[bucket] += sign
+    return vector
+
+
+def _local_semantic_embeddings(values: list[str]) -> list[list[float]]:
+    return [_local_semantic_embedding(value) for value in values]
+
+
 def _rank_hybrid_candidates(
     semantic_text: str,
     query_embedding: list[float],
     candidate_embeddings: list[list[float]],
     candidates: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Combine multilingual embeddings with deterministic exact/token vocabulary matches."""
+    """Combine local fuzzy vectors with deterministic exact/token vocabulary matches."""
     ranked = _rank_embedding_candidates(query_embedding, candidate_embeddings, candidates)
     phrases = []
     for item in re.split(r"[|;,]", semantic_text):
@@ -1501,45 +1553,136 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
         if plan.operation == "relationship_coverage":
             if not isinstance(registered_mapping, RegisteredSchemaMapping):
                 raise ValueError("relationship_coverage requires a registered live mapping.")
-            exists_expression, _ = _relationship_exists_expression(
-                registered_mapping, plan.relationship
-            )
-            rows = cypher.execute(
-                f"{match_clause} WHERE {where} "
-                f"RETURN count(DISTINCT {identity}) AS candidate_count, "
-                f"count(DISTINCT CASE WHEN {exists_expression} THEN {identity} END) AS connected_count",
-                parameters,
-            )
-            candidate_count = int(rows[0].get("candidate_count") or 0) if rows else 0
-            connected_count = int(rows[0].get("connected_count") or 0) if rows else 0
-            missing_count = max(candidate_count - connected_count, 0)
-            matched_count = connected_count
-            claim = {
-                "statement": (
-                    f"The registered {plan.relationship.replace('_', ' ')} path exists for "
-                    f"{connected_count} of {candidate_count} project-scoped {entity_name}; "
-                    f"{missing_count} records have no such path."
-                ),
-                "value": connected_count,
-                "unit": "connected records",
-                "basis": (
-                    f"Exhaustive coverage of the live-validated {plan.relationship!r} relationship "
-                    f"binding rooted at {label}."
-                ),
-                "coverage": {
-                    "candidate_count": candidate_count,
-                    "evaluated_count": candidate_count,
-                    "matched_count": connected_count,
-                    "missing_count": missing_count,
-                    "unknown_count": 0,
-                    "excluded_count": 0,
-                    "exhaustive": True,
-                },
-                "method": "relationship_coverage",
-                "source_tags": [
-                    f"relationship:{plan.relationship}", f"{label}.{identity_property}",
-                ],
-            }
+            binding = _relationship_binding(registered_mapping, plan.relationship)
+            if binding.target_identity_property:
+                relationship_pattern, relationship_variables = _relationship_match_pattern(
+                    registered_mapping, binding
+                )
+                target = relationship_variables[-1]
+                target_identity = f"{target}.`{binding.target_identity_property}`"
+                relationship_scope = " AND ".join(
+                    f"{variable}.`{source_property}` IN $allowed_sources"
+                    for variable in relationship_variables
+                )
+                cardinality_ok = (
+                    "target_node_count > 0"
+                    if binding.target_cardinality == "any"
+                    else "target_node_count = 1"
+                )
+                valid_topology = (
+                    f"target_node_count = target_identity_count AND ({cardinality_ok})"
+                )
+                rows = cypher.execute(
+                    f"{match_clause} WHERE {where} "
+                    f"WITH DISTINCT n, {identity} AS root_identity "
+                    f"OPTIONAL MATCH {relationship_pattern} "
+                    + (f"WHERE {relationship_scope} " if relationship_scope else "")
+                    + f"WITH root_identity, count(DISTINCT {target}) AS target_node_count, "
+                    f"count(DISTINCT CASE WHEN {target_identity} IS NOT NULL "
+                    f"AND trim(toString({target_identity})) <> '' THEN {target_identity} END) "
+                    f"AS target_identity_count "
+                    f"RETURN count(root_identity) AS candidate_count, "
+                    f"sum(CASE WHEN target_node_count > 0 THEN 1 ELSE 0 END) AS connected_count, "
+                    f"sum(CASE WHEN {valid_topology} THEN 1 ELSE 0 END) AS resolved_count, "
+                    f"sum(CASE WHEN target_node_count = 0 THEN 1 ELSE 0 END) AS missing_count, "
+                    f"sum(CASE WHEN target_node_count > 0 AND NOT ({valid_topology}) "
+                    f"THEN 1 ELSE 0 END) AS unresolved_count, "
+                    f"sum(target_identity_count) AS linked_target_count",
+                    parameters,
+                )
+                row = rows[0] if rows else {}
+                candidate_count = int(row.get("candidate_count") or 0)
+                connected_count = int(row.get("connected_count") or 0)
+                resolved_count = int(row.get("resolved_count") or 0)
+                missing_count = int(row.get("missing_count") or 0)
+                unresolved_count = int(row.get("unresolved_count") or 0)
+                linked_target_count = int(row.get("linked_target_count") or 0)
+                matched_count = resolved_count
+                exhaustive = unresolved_count == 0
+                caveats = []
+                if unresolved_count:
+                    caveats.append(
+                        f"{unresolved_count} records have a relationship edge but its target identity "
+                        "or required cardinality is unresolved; they are reported as unknown, not connected."
+                    )
+                statement = (
+                    f"The registered {plan.relationship.replace('_', ' ')} topology resolves to an "
+                    f"identified target for {resolved_count} of {candidate_count} project-scoped "
+                    f"{entity_name}; {missing_count} have no path and {unresolved_count} have an "
+                    "unresolved or conflicting path."
+                )
+                claim = {
+                    "statement": statement,
+                    "value": resolved_count,
+                    "unit": "topology-validated connected records",
+                    "basis": (
+                        f"Coverage of the live-validated {plan.relationship!r} binding rooted at "
+                        f"{label}, requiring populated {binding.steps[-1].to_label}."
+                        f"{binding.target_identity_property} target identities and "
+                        f"{binding.target_cardinality.replace('_', ' ')} target cardinality."
+                    ),
+                    "details": [
+                        f"Raw records with a path: {connected_count}",
+                        f"Resolved target identities across paths: {linked_target_count}",
+                    ],
+                    "coverage": {
+                        "candidate_count": candidate_count,
+                        "evaluated_count": candidate_count - unresolved_count,
+                        "matched_count": resolved_count,
+                        "missing_count": missing_count,
+                        "unknown_count": unresolved_count,
+                        "excluded_count": 0,
+                        "exhaustive": exhaustive,
+                    },
+                    "method": f"{binding.evidence_kind}_relationship_coverage",
+                    "source_tags": [
+                        f"relationship:{plan.relationship}",
+                        f"relationship-evidence:{binding.evidence_kind}",
+                        f"{label}.{identity_property}",
+                        f"{binding.steps[-1].to_label}.{binding.target_identity_property}",
+                    ],
+                    "caveats": caveats,
+                }
+            else:
+                exists_expression, _ = _relationship_exists_expression(
+                    registered_mapping, plan.relationship
+                )
+                rows = cypher.execute(
+                    f"{match_clause} WHERE {where} "
+                    f"RETURN count(DISTINCT {identity}) AS candidate_count, "
+                    f"count(DISTINCT CASE WHEN {exists_expression} THEN {identity} END) AS connected_count",
+                    parameters,
+                )
+                candidate_count = int(rows[0].get("candidate_count") or 0) if rows else 0
+                connected_count = int(rows[0].get("connected_count") or 0) if rows else 0
+                missing_count = max(candidate_count - connected_count, 0)
+                matched_count = connected_count
+                claim = {
+                    "statement": (
+                        f"The registered {plan.relationship.replace('_', ' ')} path exists for "
+                        f"{connected_count} of {candidate_count} project-scoped {entity_name}; "
+                        f"{missing_count} records have no such path."
+                    ),
+                    "value": connected_count,
+                    "unit": "connected records",
+                    "basis": (
+                        f"Exhaustive coverage of the live-validated {plan.relationship!r} relationship "
+                        f"binding rooted at {label}."
+                    ),
+                    "coverage": {
+                        "candidate_count": candidate_count,
+                        "evaluated_count": candidate_count,
+                        "matched_count": connected_count,
+                        "missing_count": missing_count,
+                        "unknown_count": 0,
+                        "excluded_count": 0,
+                        "exhaustive": True,
+                    },
+                    "method": "relationship_coverage",
+                    "source_tags": [
+                        f"relationship:{plan.relationship}", f"{label}.{identity_property}",
+                    ],
+                }
         elif plan.operation == "coverage":
             covered = _field(entity, plan.coverage_field)
             rows = cypher.execute(
@@ -1955,8 +2098,8 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
             group = _field(entity, plan.group_by)
             numeric_distinct = plan.operation == "distinct" and group.data_type == "number"
             group_expression = (
-                f"toFloat(n.`{group.property}`)" if numeric_distinct
-                else f"n.`{group.property}`"
+                f"round(toFloat(n.`{group.property}`), 4)"
+                if numeric_distinct else f"n.`{group.property}`"
             )
             candidate_rows = cypher.execute(
                 f"{match_clause} WHERE {where} "
@@ -2170,7 +2313,7 @@ def get_project_knowledge_catalog(ctx: PipelineContext) -> str:
 _CONSTRAINT_FIELD_ALIASES = {
     "floor": "level", "storey": "level", "story": "level", "level": "level",
     "function": "type", "usage": "type", "classification": "type", "category": "type",
-    "kind": "type", "type": "type", "segment": "segment", "sector": "segment",
+    "family": "type", "kind": "type", "type": "type", "segment": "segment", "sector": "segment",
     "material": "material",
     "height": "height", "width": "width", "area": "area", "diameter": "diameter",
 }
@@ -2178,9 +2321,19 @@ _CONSTRAINT_FIELD_ALIASES = {
 
 def _constraint_field(concept: str) -> str:
     tokens = re.findall(r"[^\W_]+", _normalize(concept), flags=re.UNICODE)
-    for token in tokens:
-        if token in _CONSTRAINT_FIELD_ALIASES:
-            return _CONSTRAINT_FIELD_ALIASES[token]
+    aliases = {
+        _CONSTRAINT_FIELD_ALIASES[token]
+        for token in tokens if token in _CONSTRAINT_FIELD_ALIASES
+    }
+    # Compound concepts must prefer their semantic head over an incidental word.
+    # In particular, ``gross floor area`` is an area boundary, not a floor/level
+    # boundary. This ordering is independent of the word order emitted by the task
+    # architect and is shared by planning and deterministic verification.
+    for semantic_field in (
+        "area", "height", "width", "diameter", "material", "segment", "type", "level",
+    ):
+        if semantic_field in aliases:
+            return semantic_field
     return _normalize(concept).replace(" ", "_")
 
 
@@ -2415,10 +2568,18 @@ def _validate_answer_metadata(ctx: PipelineContext, plan: Any) -> None:
             }
             for spec in specs:
                 if spec.kind == "measurement" and (
-                    plan.operation not in numeric_operations or not plan.metric
+                    (
+                        plan.operation not in numeric_operations
+                        or not plan.metric
+                    )
+                    and not (
+                        plan.operation == "distinct"
+                        and bool(plan.group_by or plan.group_by_fields)
+                    )
                 ):
                     raise ValueError(
-                        f"Output {spec.key!r} requires a numeric aggregate and metric."
+                        f"Output {spec.key!r} requires a numeric aggregate/metric "
+                        "or a distinct numeric value field."
                     )
                 if spec.kind == "grouped_summary" and plan.operation not in {
                     "group_count", "group_summary", "multi_group_count", "multi_group_summary",
@@ -2518,10 +2679,17 @@ def _validate_answer_metadata(ctx: PipelineContext, plan: Any) -> None:
                 )
             )
             if measurement_requested and (
-                plan.operation not in numeric_operations or not plan.metric
+                (
+                    plan.operation not in numeric_operations or not plan.metric
+                )
+                and not (
+                    plan.operation == "distinct"
+                    and bool(plan.group_by or plan.group_by_fields)
+                )
             ):
                 raise ValueError(
-                    "A numeric measurement output requires an aggregate operation and metric."
+                    "A numeric measurement output requires an aggregate operation and metric "
+                    "or a distinct numeric value field."
                 )
 
 
@@ -2984,7 +3152,7 @@ def semantic_search_project_nodes(
     top_k: int = 5,
     candidate_limit: int = 500,
 ) -> str:
-    """Rank authorized live nodes by embedding similarity over their labels and observed name fields."""
+    """Rank authorized live nodes using ontology-expanded local semantic similarity."""
     if not query.strip():
         raise ValueError("Semantic node search requires a non-empty concept.")
     node_type = _observed_node_type(ctx.context, label)
@@ -3000,7 +3168,7 @@ def semantic_search_project_nodes(
     top_k = max(1, min(top_k, 20))
     candidate_limit = max(top_k, min(candidate_limit, 1000))
     source_property = ctx.context.graph_contract.authorization_path.source_property
-    model = os.getenv("BIM_EMBEDDING_MODEL", "text-embedding-3-small")
+    model = "local-feature-hashing-v1"
     cache_key = "semantic_nodes:" + hashlib.sha256(
         _json([query, label, properties, top_k, candidate_limit, model]).encode("utf-8")
     ).hexdigest()
@@ -3037,12 +3205,7 @@ def semantic_search_project_nodes(
         texts.append(text_value)
     if not candidates:
         return _json({"query": query, "matches": [], "scope": "authorized project only"})
-    response = OpenAI().embeddings.create(
-        model=model, input=[expanded_query, *texts], encoding_format="float"
-    )
-    vectors = [list(item.embedding) for item in response.data]
-    if len(vectors) != len(candidates) + 1:
-        raise RuntimeError("Embedding provider returned an incomplete result set.")
+    vectors = _local_semantic_embeddings([expanded_query, *texts])
     ranked = _rank_hybrid_candidates(
         expanded_query, vectors[0], vectors[1:], candidates
     )[:top_k]
@@ -3123,7 +3286,7 @@ def semantic_search_project_properties(
     candidates = _project_property_candidates(ctx.context, label)
     if not candidates:
         return _json({"label": label, "matches_by_concept": {}, "scope": "authorized project only"})
-    model = os.getenv("BIM_EMBEDDING_MODEL", "text-embedding-3-small")
+    model = "local-feature-hashing-v1"
     similarity_threshold = float(os.getenv("BIM_SCHEMA_SIMILARITY_THRESHOLD", "0.35"))
     if not -1.0 <= similarity_threshold <= 1.0:
         raise ValueError("BIM_SCHEMA_SIMILARITY_THRESHOLD must be between -1 and 1.")
@@ -3135,15 +3298,7 @@ def semantic_search_project_properties(
         return _json(cached)
     semantic_queries = [_expanded_semantic_text(ctx.context, concept) for concept in requested_concepts]
     texts = [candidate["embedding_text"] for candidate in candidates]
-    response = OpenAI().embeddings.create(
-        model=model,
-        input=[*semantic_queries, *texts],
-        encoding_format="float",
-    )
-    vectors = [list(item.embedding) for item in response.data]
-    expected = len(requested_concepts) + len(candidates)
-    if len(vectors) != expected:
-        raise RuntimeError("Embedding provider returned an incomplete result set.")
+    vectors = _local_semantic_embeddings([*semantic_queries, *texts])
     candidate_vectors = vectors[len(requested_concepts):]
     matches = {}
     for concept, vector in zip(requested_concepts, vectors[:len(requested_concepts)]):
@@ -3186,7 +3341,7 @@ def semantic_search_property_values(
         raise ValueError("Search between one and six value concepts.")
     top_k = max(1, min(top_k, 20))
     value_limit = max(top_k, min(value_limit, 500))
-    model = os.getenv("BIM_EMBEDDING_MODEL", "text-embedding-3-small")
+    model = "local-feature-hashing-v1"
     similarity_threshold = float(os.getenv("BIM_SCHEMA_SIMILARITY_THRESHOLD", "0.35"))
     if not -1.0 <= similarity_threshold <= 1.0:
         raise ValueError("BIM_SCHEMA_SIMILARITY_THRESHOLD must be between -1 and 1.")
@@ -3222,14 +3377,9 @@ def semantic_search_property_values(
         ctx.context.schema_discovery[cache_key] = result
         return _json(result)
     semantic_queries = [_expanded_semantic_text(ctx.context, concept) for concept in requested_concepts]
-    response = OpenAI().embeddings.create(
-        model=model,
-        input=[*semantic_queries, *[item["embedding_text"] for item in candidates]],
-        encoding_format="float",
+    vectors = _local_semantic_embeddings(
+        [*semantic_queries, *[item["embedding_text"] for item in candidates]]
     )
-    vectors = [list(item.embedding) for item in response.data]
-    if len(vectors) != len(requested_concepts) + len(candidates):
-        raise RuntimeError("Embedding provider returned an incomplete result set.")
     candidate_vectors = vectors[len(requested_concepts):]
     matches = {}
     for concept, vector in zip(requested_concepts, vectors[:len(requested_concepts)]):
@@ -3429,6 +3579,14 @@ def register_schema_mapping(
                     f"Relationship binding {binding.semantic_name!r} contains an unobserved step."
                 )
             previous_label = step.to_label
+        if binding.target_identity_property:
+            target_type = _observed_node_type(ctx.context, binding.steps[-1].to_label)
+            if binding.target_identity_property not in set(target_type["properties"]):
+                raise ValueError(
+                    f"Relationship binding {binding.semantic_name!r} target identity property "
+                    f"{binding.target_identity_property!r} was not observed on "
+                    f"{binding.steps[-1].to_label!r}."
+                )
     observed = set(node_type["properties"])
     required = {
         proposal.identity_property,
@@ -3798,7 +3956,18 @@ def activate_project_knowledge_mapping(ctx: PipelineContext, knowledge_key: str)
             semantic_name=semantic_name,
             steps=steps,
             purpose=str(item.get("purpose") or "governed relationship evidence"),
+            evidence_kind=str(item.get("evidence_kind") or "unspecified"),
+            target_identity_property=str(item.get("target_identity_property") or ""),
+            target_cardinality=str(item.get("target_cardinality") or "any"),
         ))
+        target_identity_property = str(item.get("target_identity_property") or "")
+        if target_identity_property:
+            target_type = _observed_node_type(ctx.context, steps[-1].to_label)
+            if target_identity_property not in set(target_type["properties"]):
+                raise ValueError(
+                    f"Governed relationship binding {semantic_name!r} target identity property "
+                    f"{target_identity_property!r} changed in the live graph."
+                )
         relationship_names.add(semantic_name)
     proposal = SchemaMappingProposal(
         entity_name=str(knowledge["entity_concept"]).replace(" ", "_"),
@@ -4038,7 +4207,12 @@ def _measurement_anchor_set(*values: str) -> set[str]:
     text = " ".join(_normalize(value).replace("_", " ") for value in values if value)
     anchors: set[str] = set()
     terms = {
-        "area": ("area", "bvo", "gfa", "gross floor", "nvo", "vvo", "m2", "m²"),
+        # Preserve measurement basis instead of collapsing every area-like term
+        # into one permissive anchor. A generic area property does not prove that
+        # the authored value is gross/BVO or net/NVO/VVO.
+        "area": ("area", "m2", "m²"),
+        "gross_area": ("bvo", "gfa", "gross floor", "gross area"),
+        "net_area": ("nvo", "vvo", "net floor", "net area"),
         "length": ("length", "distance", "metre", "meter", "centimetre", "centimeter"),
         "vertical_position": ("elevation", "height above", "distance from floor", "offset"),
         "clear_height": ("clear height", "space height", "vertical extent"),
@@ -4150,9 +4324,18 @@ def _semantic_adequacy_checks(
         metric_field = plan.metric or plan.coverage_field or plan.group_by
         observed_metric_terms = {
             metric_field, plan.operation,
+            plan.group_by,
+            *plan.group_by_fields,
             *(item.field for item in plan.filters),
             *(value for item in plan.filters for value in _raw_filter_values(item)),
         }
+        # Derive compound measurement meaning from the typed executable plan, not
+        # from answer prose. ``group_summary`` and ``multi_group_summary`` compile
+        # to both a distinct-record count and a summed numeric metric for every
+        # grouping key. Their operation name alone does not contain the lexical
+        # token "count", even though that count is part of the returned structure.
+        if plan.operation in {"group_summary", "multi_group_summary"}:
+            observed_metric_terms.add("count")
         if isinstance(registered, RegisteredSchemaMapping) and metric_field:
             mapped = next(
                 (field for field in registered.proposal.fields if field.semantic_name == metric_field),
@@ -4160,6 +4343,20 @@ def _semantic_adequacy_checks(
             )
             if mapped:
                 observed_metric_terms.update([mapped.property, *mapped.aliases])
+        if isinstance(registered, RegisteredSchemaMapping):
+            grouping_names = {plan.group_by, *plan.group_by_fields} - {""}
+            for grouping_name in grouping_names:
+                mapped_group = next(
+                    (
+                        field for field in registered.proposal.fields
+                        if field.semantic_name == grouping_name
+                    ),
+                    None,
+                )
+                if mapped_group:
+                    observed_metric_terms.update([
+                        mapped_group.property, *mapped_group.aliases,
+                    ])
         observed_boundaries = {
             (_semantic_token(item.field), _semantic_token(value))
             for item in plan.filters
@@ -4286,14 +4483,51 @@ def _semantic_adequacy_checks(
             for boundary in plan.semantic_intent.population_boundary
             for value in boundary.exact_values
         )
-    boundary_ok = all(
-        any(
+    def boundary_is_executable(expected_field: str, expected_value: str) -> bool:
+        direct = any(
             _field_semantics_match(expected_field, observed_field)
             and _boundary_value_matches(
                 context, observed_field, expected_value, observed_value,
             )
             for observed_field, observed_value in observed_boundary_values
         )
+        if direct or not isinstance(plan, BimQueryPlan):
+            return direct
+
+        # A user's semantic boundary can be stored under a different physical
+        # schema dimension.  For example, "non-metallic" may be encoded in an
+        # exact Family-and-Type classification rather than a Material property.
+        # Accept that remap only through the full compiler-owned chain:
+        # typed boundary -> original task constraint -> registered binding ->
+        # exact executable filter.  Neither model prose nor lexical similarity to
+        # an arbitrary filter is sufficient on its own.
+        for binding in plan.constraint_bindings:
+            if not (
+                _field_semantics_match(expected_field, binding.concept)
+                and _boundary_value_matches(
+                    context, expected_field, expected_value, binding.requested_value,
+                )
+            ):
+                continue
+            exact_values = [str(value) for value in binding.exact_values if str(value)]
+            if not exact_values:
+                continue
+            executable = any(
+                _field_semantics_match(binding.semantic_field, observed_field)
+                and any(
+                    _boundary_value_matches(
+                        context, binding.semantic_field, exact_value, observed_value,
+                    )
+                    for exact_value in exact_values
+                )
+                for observed_field, observed_value in observed_boundary_values
+            )
+            if executable:
+                return True
+        return False
+
+    boundary_ok = all(
+        boundary_is_executable(expected_field, expected_value)
         for expected_field, expected_value in expected_boundaries
     )
     # Compiler-owned task-constraint coverage and governed classification checks
@@ -4302,6 +4536,15 @@ def _semantic_adequacy_checks(
     if isinstance(plan, BimQueryPlan):
         constraints_ok, _ = _plan_constraint_coverage(context, plan)
         boundary_ok = boundary_ok or constraints_ok and not expected_boundaries
+        permit_coverage = claim.get("coverage") or {}
+        if (
+            plan.entity == "permit_knowledge"
+            and bool(permit_coverage.get("exhaustive"))
+            and int(permit_coverage.get("candidate_count") or 0) == 0
+        ):
+            # An exhaustive empty project requirements population proves that no
+            # narrower model-element boundary can have an applicable record.
+            boundary_ok = True
     elif expected_boundaries and not plan.semantic_intent.population_boundary:
         # A named geometry recipe is an immutable, project-governed population
         # compiler. Its configured boundary was checked before execution; the worker
@@ -4351,8 +4594,8 @@ def _semantic_adequacy_checks(
         absence = next(iter(absence_expectations))
         if absence == "property_missing":
             absence_ok = (
-                exhaustive and candidate_count > 0 and populated_count == 0
-                and missing_count == candidate_count
+                exhaustive and candidate_count > 0 and missing_count > 0
+                and populated_count + missing_count == candidate_count
             )
         elif absence == "population_missing":
             absence_ok = exhaustive and candidate_count == 0
@@ -4574,7 +4817,7 @@ def _verify_query_evidence(
             coverage = (rerun.get("claim") or {}).get("coverage") or {}
             zero_population = int(
                 coverage.get("candidate_count")
-                if plan.operation in {"coverage", "relationship_coverage"}
+                if coverage.get("candidate_count") is not None
                 else rerun.get("matched_count") or 0
             ) == 0
             unexpected_zero = (
@@ -4615,6 +4858,44 @@ def _verify_query_evidence(
             or bool(relationship_names)
             and requested_relationships.issubset(relationship_names)
         )
+        relationship_explanation = (
+            "Every relationship predicate expands from a fixed live-validated mapping path."
+            if requested_relationships and relationship_ok else
+            "This plan does not use a relationship predicate."
+            if not requested_relationships else
+            "The plan references an unregistered relationship path."
+        )
+        if relationship_ok and requested_relationships and context.task_contract:
+            output_text = " ".join([
+                context.task_contract.goal,
+                *[
+                    output for output in plan.satisfies
+                    if output in context.task_contract.required_outputs
+                ],
+            ])
+            physical_topology_required = bool(re.search(
+                r"\b(?:physical topology|physical connect(?:ion|ivity)?|continuity|"
+                r"port[- ]to[- ]port|wiring path|network path)\b",
+                _normalize(output_text),
+            ))
+            if physical_topology_required:
+                selected_bindings = [
+                    binding for binding in registered.proposal.relationship_bindings
+                    if binding.semantic_name in requested_relationships
+                ]
+                relationship_ok = bool(selected_bindings) and all(
+                    binding.evidence_kind == "physical_topology"
+                    and bool(binding.target_identity_property)
+                    for binding in selected_bindings
+                )
+                relationship_explanation = (
+                    "Physical continuity uses a live-validated topology path ending at "
+                    "an independently identified target."
+                    if relationship_ok else
+                    "Physical continuity requires a physical_topology binding with an "
+                    "independently identified final target; a generic edge or assignment "
+                    "property is not sufficient."
+                )
         plausibility_flags = (rerun.get("claim") or {}).get("plausibility_flags") or []
         plausibility_ok = not any(item.get("severity") == "error" for item in plausibility_flags)
         semantic_checks = [
@@ -4643,13 +4924,7 @@ def _verify_query_evidence(
                  if coverage else "This operation does not claim property-absence coverage."
              )},
             {"name": "relationship_binding", "passed": relationship_ok,
-             "explanation": (
-                 "Every relationship predicate expands from a fixed live-validated mapping path."
-                 if requested_relationships and relationship_ok else
-                 "This plan does not use a relationship predicate."
-                 if not requested_relationships else
-                 "The plan references an unregistered relationship path."
-             )},
+             "explanation": relationship_explanation},
             {"name": "measurement_plausibility", "passed": plausibility_ok,
              "explanation": (
                  "No impossible numeric invariant was detected."

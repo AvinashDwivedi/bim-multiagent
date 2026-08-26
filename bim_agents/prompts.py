@@ -15,6 +15,12 @@ outputs, and observable success criteria. Do not answer the question and do not 
 properties, values, identities, units, or relationships. Complexity describes the evidence work, not how
 short the question is. A requested total is one required output; requested groupings, alternative scopes,
 measurement bases, missing-data checks, and compliance sides are separate outputs.
+Required outputs are only facts the user explicitly asked to receive. Do not invent defensive outputs such
+as classification coverage, population existence, entity identifiers, measurement-method confirmation,
+reference-level names, intermediate totals, or missing-property counts. Put those safeguards in success
+criteria instead. In particular, do not add a coverage output unless the user asks about missing/absent data
+or completeness, and do not add a compliance output unless the user asks about compliance. One grouped
+output may contain all requested group values; do not create one output per group plus an unrequested total.
 Make the requested semantic grain explicit in the contract text and typed outputs: physical instance versus
 type, individual object versus aggregate record, and requested population versus a merely related population.
 Likewise preserve the requested measurement basis and observation mode. Planned/type-defined values, actual
@@ -35,6 +41,19 @@ Questions asking whether a property is absent or how complete it is require the 
 explicit coverage field; a zero count over populated values is not proof of absence.
 Their required outputs must distinguish an empty governed population, an existing population with an
 unpopulated property, an exhaustive verified zero, and evidence that is genuinely unsupported.
+
+The runtime may provide trusted semantic capability hints selected from the active project ontology. They
+contain no answer values, but their matched concept, output shape, metric, grouping dimensions, counting unit,
+and semantic intent are binding planning constraints. Preserve them in the typed contract while leaving all
+counts and measurements for evidence workers to discover. When a capability defines one grouped summary with
+both classification counts and a numeric metric, keep both in the same atomic grouped output. When it defines a
+grouping dimension, do not turn that dimension into a request for one unspecified exact value.
+
+Preserve the user's domain noun before translating it. A translation may add the original noun in parentheses
+or use a matched governed concept, but it must not silently narrow or broaden the population (for example,
+switches are not automatically circuit breakers). This applies equally to Hebrew, Dutch, and English prompts.
+If the user names a category generically on/in a floor without supplying a floor identifier and the matched
+capability groups by floor, interpret the floor as a grouping dimension over all observed floors.
 
 Choose an operation that can produce every requested value: grouped counts plus grouped numeric areas or
 lengths require group_summary or multi_group_summary with the metric named in the outputs; a list or
@@ -65,6 +84,9 @@ and ordinary measurements; relationship for connectivity, containment, hosting, 
 geometry for a named governed geometry calculation; requirements for compliance or requirement evidence. Use auto
 only when the typed outputs make that choice unambiguous. Schema mapping is a runtime preflight, not a terminal
 package specialist. Never give one specialist outputs belonging to another evidence route.
+When a question explicitly concerns *planned* components and whether a feeding-panel assignment is populated,
+treat it as planned authoring-data coverage for the quantity specialist. Reserve the relationship specialist for
+questions that explicitly require physical ports, topology, continuity, containment, or host relationships.
 """
 
 
@@ -94,6 +116,18 @@ Workflow:
    executable but answers a related question is not a valid handoff.
 6. Register one mapping only after the label, identity, selected fields, relationship path, exact values,
    and counting unit are evidenced. Do not retry with speculative fields.
+
+For each relationship binding, explicitly classify its evidence_kind. A physical_topology binding must reach
+an independently identified final node: supply the observed target identity property and the expected target
+cardinality. A bare edge, a nullable Panel/Circuit property, spatial containment, and system membership are
+different evidence types and cannot substitute for one another. If the graph lacks the required relationship
+surface, preserve any separately verified property-assignment coverage and report physical topology unsupported.
+
+When a corrective exploration request reports a structural zero, colliding bindings, wrong grain, wrong
+measurement basis, incomplete grouping, or failed classification check, treat the prior mapping as a rejected
+hypothesis. Inspect alternative observed properties and their value distributions, compare their populations,
+and either produce a newly evidenced handoff or return a precise unsupported result. An executable query that
+repeats the rejected semantic interpretation is not a correction.
 
 For counts, prove that one distinct identity represents one requested physical object rather than a type,
 room, child record, fitting, duplicate source record, or multi-level representation. Preserve every exact
@@ -162,6 +196,10 @@ or appropriate numeric filter, copy required_outputs exactly into satisfies, and
 constraint_bindings unchanged. Stop immediately after producing the assigned evidence. Return query_completed
 only with produced query evidence IDs and the package ID; otherwise return unsupported with a precise limitation.
 Deterministic runtime code owns replay, completion gates, merge policy, and user-visible answer assembly.
+If the runtime supplies evidence-verification correction feedback, use the named failed checks as a bounded
+counterexample: preserve already verified evidence, change only the unresolved plan, and do not resubmit an
+identical rejected query. Return unsupported when the handoff itself lacks the field, relationship, grain, or
+measurement basis required to repair the evidence.
 """
 
 
@@ -191,6 +229,9 @@ relationship_coverage when both connected and missing populations are required. 
 similar nullable authoring properties establish assignment coverage, never physical connectivity. Keep logical
 assignment and physical continuity as separate typed claims and denominators. Do not execute ordinary quantities,
 geometry, or requirements.
+For physical topology, accept only a physical_topology relationship binding with a populated final-node identity.
+Treat paths with unidentified targets or a violated target cardinality as unknown/conflicting evidence, not as
+connected. Report raw edge presence only as diagnostic support; the direct value is topology-validated coverage.
 When several continuity outputs are requested, produce one bounded evidence claim per independent denominator
 (eligible, assigned, connected, indeterminate, disconnected) so a formatting failure cannot discard the entire
 analysis. Never infer an absent physical path from a missing authoring property alone.

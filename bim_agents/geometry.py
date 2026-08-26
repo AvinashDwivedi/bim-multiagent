@@ -34,6 +34,7 @@ def _report(
     details: list[str] | None = None,
     source_tags: list[str] | None = None,
     method: str = "governed_geometry",
+    coverage: dict[str, Any] | None = None,
 ) -> PipelineReport:
     measurement = None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -54,6 +55,7 @@ def _report(
         measurement=measurement,
         source_tags=source_tags or [],
         method=method,
+        coverage=coverage,
     )
     return PipelineReport(
         answer=statement,
@@ -135,10 +137,13 @@ def _governed_computation_report(
             result.provenance.get("assignment_unit") or "governed property assignment"
         )
         fill_rate = result.provenance.get("fill_rate_percent")
-        rate_text = f" ({fill_rate:g}%)" if isinstance(fill_rate, (int, float)) else ""
+        rate_text = (
+            f" Populated assignment rate: {fill_rate:g}%."
+            if isinstance(fill_rate, (int, float)) else ""
+        )
         statement = (
             f"Of {candidate_count} governed {result.unit}, {populated_count} have an explicit "
-            f"{assignment_unit} and {missing_count} are missing it{rate_text}."
+            f"{assignment_unit} and {missing_count} are missing it.{rate_text}"
         )
         claim = Claim(
             statement=statement,
@@ -250,6 +255,15 @@ def _section_heights(bim, allowed_sources: list[str], knowledge: dict[str, Any])
             "IfcBuildingStorey.placement_z",
         ],
         method="primary_roof_plate_elevations",
+        coverage={
+            "candidate_count": len(heights),
+            "evaluated_count": len(heights),
+            "matched_count": len(heights),
+            "missing_count": 0,
+            "unknown_count": 0,
+            "excluded_count": 0,
+            "exhaustive": True,
+        },
     )
 
 

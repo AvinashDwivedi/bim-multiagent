@@ -7,7 +7,7 @@ import os
 import re
 from typing import Any, Callable
 
-from agents import MaxTurnsExceeded, Runner
+from .claude_runtime import MaxTurnsExceeded, Runner
 
 from bim_context import BimContext, Settings
 
@@ -35,6 +35,7 @@ from .tools import (
     _measurement_dimension,
     activate_project_knowledge_mapping,
     define_bim_task,
+    ensure_bim_verification,
     query_bim,
     query_project_geometry,
 )
@@ -51,6 +52,7 @@ class WorkstreamOutcome:
     specialist: str = ""
     specialist_attempts: int = 0
     typed_output_failures: int = 0
+    verification_rejections: int = 0
     recovery_strategy: str = ""
     satisfied_outputs: list[str] = field(default_factory=list)
 
@@ -104,13 +106,44 @@ def _validate_workstream_completion(
     completion = EvidenceWorkstreamResult.model_validate(value)
     if completion.package_id != package.package_id:
         raise ValueError("Query worker returned a result for a different work package.")
-    unknown_ids = [
-        evidence_id for evidence_id in completion.evidence_ids
-        if evidence_id not in branch.evidence
-        or branch.evidence[evidence_id].kind != "query"
-    ]
+    unknown_ids = []
+    referenced_outputs: set[str] = set()
+    for evidence_id in completion.evidence_ids:
+        evidence = branch.evidence.get(evidence_id)
+        if (
+            evidence is None
+            or evidence.kind != "query"
+            or evidence.work_package_id not in {"", package.package_id}
+        ):
+            unknown_ids.append(evidence_id)
+            continue
+        try:
+            plan = json.loads(evidence.payload).get("plan") or {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            unknown_ids.append(evidence_id)
+            continue
+        if (
+            plan.get("role", "answer_producing") != "answer_producing"
+            or plan.get("include_in_answer", True) is False
+        ):
+            unknown_ids.append(evidence_id)
+            continue
+        referenced_outputs.update(
+            str(item) for item in plan.get("satisfies") or []
+            if str(item) in package.required_outputs
+        )
     if unknown_ids:
-        raise ValueError("Query worker returned unknown evidence IDs.")
+        raise ValueError(
+            "Query worker returned unknown, foreign-package, or non-answer evidence IDs."
+        )
+    if completion.status == "query_completed":
+        missing = sorted(set(package.required_outputs) - referenced_outputs)
+        if missing:
+            raise ValueError(
+                "Completed workstream evidence does not satisfy outputs: "
+                + ", ".join(missing)
+                + "."
+            )
     return completion
 
 
@@ -121,6 +154,200 @@ def _typed_repair_limit() -> int:
     except ValueError:
         configured = 1
     return min(max(configured, 0), 2)
+
+
+def _verification_repair_limit() -> int:
+    """Return the bounded number of evidence-driven query correction attempts."""
+    try:
+        configured = int(os.getenv("BIM_VERIFICATION_REPAIR_ATTEMPTS", "1"))
+    except ValueError:
+        configured = 1
+    return min(max(configured, 0), 2)
+
+
+def _repair_step_timeout() -> float:
+    """Bound one corrective model step so finalization can retain its checkpoint.
+
+    The public timeout is a limit for the whole investigation, not a useful budget
+    for any single remapping attempt.  A correction that stalls must yield to the
+    deterministic evidence checkpoint instead of consuming the finalization reserve.
+    """
+    try:
+        configured = float(os.getenv("BIM_REPAIR_STEP_TIMEOUT_SECONDS", "90"))
+    except ValueError:
+        configured = 90.0
+    return min(max(configured, 5.0), 180.0)
+
+
+def _package_verification_snapshot(
+    branch: BimRunContext,
+    package: EvidenceWorkPackage,
+) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+    """Verify branch evidence and return verified IDs, outputs, and compact failures.
+
+    Verification is performed while the worker is still recoverable.  The compact
+    failure records contain deterministic check names and explanations only; they
+    never expose graph credentials or sibling workstream state.
+    """
+    verification_id = ensure_bim_verification(branch)
+    if verification_id is None:
+        return [], [], [{"failed_checks": ["no_query_evidence"]}]
+    payload = json.loads(branch.evidence[verification_id].payload)
+    owned_outputs = set(package.required_outputs)
+    verified_ids: list[str] = []
+    verified_outputs: set[str] = set()
+    failures: list[dict[str, Any]] = []
+    for check in payload.get("checks") or []:
+        plan = check.get("plan") or {}
+        satisfies = {
+            str(item) for item in plan.get("satisfies") or []
+            if str(item) in owned_outputs
+        }
+        if not satisfies or plan.get("role", "answer_producing") != "answer_producing":
+            continue
+        evidence_id = str(check.get("evidence_id") or "")
+        if check.get("verified") is True:
+            if evidence_id:
+                verified_ids.append(evidence_id)
+            verified_outputs.update(satisfies)
+            continue
+        failed_checks = [
+            {
+                "name": str(item.get("name") or "semantic_check"),
+                "explanation": " ".join(str(item.get("explanation") or "").split())[:500],
+            }
+            for item in check.get("semantic_checks") or []
+            if item.get("passed") is not True
+        ]
+        failures.append({
+            "evidence_id": evidence_id,
+            "outputs": sorted(satisfies),
+            "failed_checks": failed_checks,
+            "diagnostics": list(check.get("diagnostics") or [])[:5],
+        })
+    absence_ids, absence_outputs = _verified_requirements_absence_snapshot(
+        branch, package, payload,
+    )
+    verified_ids.extend(absence_ids)
+    verified_outputs.update(absence_outputs)
+    if absence_outputs:
+        # The allowed measurement-basis failure is vacuous for an empty population,
+        # not a live semantic contradiction. Remove its provisional failure record so
+        # callers do not launch a pointless remapping repair after accepting absence.
+        failures = [
+            failure for failure in failures
+            if not set(failure.get("outputs") or []) <= set(absence_outputs)
+        ]
+    return list(dict.fromkeys(verified_ids)), sorted(verified_outputs), failures
+
+
+def _verified_requirements_absence_snapshot(
+    branch: BimRunContext,
+    package: EvidenceWorkPackage,
+    verification_payload: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    """Recognize a replay-verified empty requirements population as a typed result.
+
+    A zero-row requirements query cannot exhibit a requested requirement measurement
+    basis because there is no record from which to observe that basis. That one check
+    is therefore vacuous after replay, authorization, exhaustive population, and
+    projection checks have independently passed. Other semantic failures remain fatal.
+    """
+    if package.route_hint != "requirements" and not _is_compliance_package(package):
+        return [], []
+    owned = set(package.required_outputs)
+    evidence_ids: list[str] = []
+    outputs: set[str] = set()
+    required_checks = {
+        "replay_stability", "authorized_scope", "population_coverage",
+        "population_complete", "projection_answers_question",
+        "requested_outputs_present",
+    }
+    vacuous_on_empty = {"measurement_basis_matches"}
+    for check in verification_payload.get("checks") or []:
+        evidence_id = str(check.get("evidence_id") or "")
+        evidence = branch.evidence.get(evidence_id)
+        if not evidence or evidence.kind != "query":
+            continue
+        try:
+            query_payload = json.loads(evidence.payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        plan = query_payload.get("plan") or {}
+        claim = query_payload.get("claim") or {}
+        coverage = claim.get("coverage") or {}
+        satisfies = {
+            str(item) for item in plan.get("satisfies") or []
+            if str(item) in owned
+        }
+        if not satisfies or plan.get("role", "answer_producing") != "answer_producing":
+            continue
+        if not (
+            plan.get("entity") == "permit_knowledge"
+            and int(claim.get("value") or 0) == 0
+            and bool(coverage.get("exhaustive"))
+            and int(coverage.get("candidate_count") or 0) == 0
+        ):
+            continue
+        semantic_checks = check.get("semantic_checks") or []
+        passed = {
+            str(item.get("name") or "") for item in semantic_checks
+            if item.get("passed") is True
+        }
+        failed = {
+            str(item.get("name") or "") for item in semantic_checks
+            if item.get("passed") is not True
+        }
+        if not required_checks <= passed or failed - vacuous_on_empty:
+            continue
+        evidence_ids.append(evidence_id)
+        outputs.update(satisfies)
+    return list(dict.fromkeys(evidence_ids)), sorted(outputs)
+
+
+def _verification_repair_input(
+    original_input: str,
+    *,
+    package: EvidenceWorkPackage,
+    verified_ids: list[str],
+    verified_outputs: list[str],
+    failures: list[dict[str, Any]],
+) -> str:
+    """Give a specialist deterministic verification feedback for one bounded retry."""
+    missing = [
+        output for output in package.required_outputs if output not in verified_outputs
+    ]
+    return (
+        original_input
+        + "\nEvidence-verification correction:\n"
+        + "Independent replay and semantic checks rejected or did not cover part of the "
+        + "previous answer. Preserve verified evidence, inspect the failed check feedback, "
+        + "and submit a revised declarative plan only for unresolved outputs. Do not repeat "
+        + "an identical rejected plan. If the schema handoff cannot support the correction, "
+        + "return unsupported with that precise mapping gap.\n"
+        + json.dumps({
+            "verified_evidence_ids": verified_ids,
+            "verified_outputs": verified_outputs,
+            "missing_outputs": missing,
+            "verification_failures": failures[-4:],
+            "package_id": package.package_id,
+        }, ensure_ascii=False, sort_keys=True)
+    )
+
+
+def _verification_requires_remapping(failures: list[dict[str, Any]]) -> bool:
+    """Classify verifier failures owned by discovery rather than query planning."""
+    mapping_checks = {
+        "entity_grain_matches", "measurement_basis_matches", "population_complete",
+        "classification_purity", "constraint_binding", "constraint_coverage",
+        "relationship_binding", "counting_unit", "identity_integrity",
+    }
+    return any(
+        str(check.get("name") or "") in mapping_checks
+        for failure in failures
+        for check in failure.get("failed_checks") or []
+        if isinstance(check, dict)
+    )
 
 
 def _repair_input(
@@ -277,10 +504,26 @@ def _failed_dependencies(
     accepted = {"query_completed"}
     if policy == "allow_partial":
         accepted.add("partial_completed")
-    failed = [
-        dependency for dependency in package.depends_on
-        if finished[dependency].status not in accepted
-    ]
+    failed = []
+    for dependency in package.depends_on:
+        outcome = finished[dependency]
+        if outcome.status in accepted:
+            continue
+        # Defensive recovery for an older/partial outcome envelope: verified typed
+        # absence is a successful requirements-availability result, not incomplete
+        # evidence. The normal path now emits query_completed before reaching here.
+        dependency_package = getattr(outcome, "package", None)
+        dependency_branch = getattr(outcome, "branch", None)
+        satisfied = set(getattr(outcome, "satisfied_outputs", []) or [])
+        if (
+            dependency_package is not None
+            and dependency_package.route_hint == "requirements"
+            and set(dependency_package.required_outputs) <= satisfied
+            and dependency_branch is not None
+            and _scoped_requirements_are_absent(dependency_branch)
+        ):
+            continue
+        failed.append(dependency)
     if _is_compliance_package(package):
         # A comparison is meaningful only when it has two independently produced
         # inputs: model facts and applicable requirements. Keep this check typed and
@@ -311,6 +554,7 @@ def _worker_input(
     contract: BimTaskContract,
     package: EvidenceWorkPackage,
     specialist: str,
+    dependency_evidence: list[dict[str, Any]] | None = None,
 ) -> str:
     """Serialize only package-owned facts; root/sibling text is intentionally absent."""
     payload = {
@@ -322,6 +566,7 @@ def _worker_input(
         "required_outputs": list(package.required_outputs),
         "output_specs": [item.model_dump(mode="json") for item in package.output_specs],
         "route_hint": package.route_hint,
+        "dependency_evidence": dependency_evidence or [],
     }
     return (
         "Resolve only this immutable work package. Use only the configured authorized BIM scope. "
@@ -330,16 +575,55 @@ def _worker_input(
     )
 
 
+def _dependency_evidence_bundle(
+    package: EvidenceWorkPackage,
+    finished: dict[str, WorkstreamOutcome],
+) -> list[dict[str, Any]]:
+    """Build an immutable, verified-only bundle for a dependent workstream."""
+    bundle: list[dict[str, Any]] = []
+    for dependency_id in package.depends_on:
+        outcome = finished.get(dependency_id)
+        if outcome is None or outcome.branch is None:
+            continue
+        verification_payloads = [
+            json.loads(evidence.payload)
+            for evidence in outcome.branch.evidence.values()
+            if evidence.kind == "verification"
+        ]
+        latest = verification_payloads[-1] if verification_payloads else {}
+        for check in latest.get("checks") or []:
+            if check.get("verified") is not True:
+                continue
+            plan = check.get("plan") or {}
+            claim = check.get("claim") or {}
+            bundle.append({
+                "source_package_id": dependency_id,
+                "evidence_id": str(check.get("evidence_id") or ""),
+                "satisfies": list(plan.get("satisfies") or []),
+                "claim": {
+                    "value": claim.get("value"),
+                    "unit": claim.get("unit"),
+                    "basis": claim.get("basis"),
+                    "method": claim.get("method"),
+                    "coverage": claim.get("coverage"),
+                    "details": list(claim.get("details") or [])[:20],
+                },
+            })
+    return bundle
+
+
 def _execution_context(
     discovery: BimRunContext,
     contract: BimTaskContract,
     package: EvidenceWorkPackage,
     handoff: EvidenceHandoff,
+    specialist: SpecialistRole | None = None,
 ) -> BimRunContext:
     """Create a transcript-free context for exactly one terminal specialist."""
-    selected_mappings = {}
-    if handoff.mapping_id and handoff.mapping_id in discovery.schema_mappings:
-        selected_mappings[handoff.mapping_id] = discovery.schema_mappings[handoff.mapping_id]
+    # Mapping and query evidence are immutable package-local checkpoints.  Preserve
+    # them across the transcript-free scout -> specialist handoff so a later model
+    # failure, repair timeout, or cancellation cannot erase already computed facts.
+    selected_mappings = dict(discovery.schema_mappings)
     task_artifact = discovery.artifacts.get("task-contract")
     return BimRunContext(
         bim=discovery.bim,
@@ -349,9 +633,14 @@ def _execution_context(
         run_id=discovery.run_id,
         workstream_id=discovery.workstream_id,
         parent_workstream_id=discovery.parent_workstream_id,
-        active_specialist=resolve_package_specialist(package),
+        active_specialist=specialist or resolve_package_specialist(package),
         task_contract=contract,
-        artifacts={"task-contract": task_artifact} if task_artifact is not None else {},
+        evidence=dict(discovery.evidence),
+        artifacts={
+            artifact_id: artifact
+            for artifact_id, artifact in discovery.artifacts.items()
+            if artifact_id != "task-contract"
+        } | ({"task-contract": task_artifact} if task_artifact is not None else {}),
         schema_mappings=selected_mappings,
         schema_discovery={
             "active_constraint_bindings": [
@@ -684,6 +973,15 @@ def _registered_mapping_handoff(
             continue
         best = max(score for score, _ in candidates)
         winners = [binding for score, binding in candidates if score == best]
+        if len(winners) > 1:
+            # Governed mappings commonly expose both a broad category boundary
+            # and a narrower family/type boundary with overlapping aliases. An
+            # entity-type constraint belongs to the narrower classification.
+            classification_winners = [
+                binding for binding in winners if binding.semantic_name != "category"
+            ]
+            if len(classification_winners) == 1:
+                winners = classification_winners
         if len(winners) != 1:
             continue
         binding = winners[0]
@@ -1087,11 +1385,34 @@ def _deterministic_geometry_plan(
     config = configs[0]
     support_only = bool(config.get("support_only"))
     allowed_kinds = set(config.get("output_kinds") or [])
-    if (
-        not support_only
-        and allowed_kinds
-        and any(spec.kind not in allowed_kinds for spec in contract.output_specs)
-    ):
+
+    configured_dimensions: set[str] | None = None
+    if config.get("grouping_dimensions"):
+        configured_dimensions = {
+            _constraint_field(str(item))
+            for item in config.get("grouping_dimensions") or []
+        }
+    elif config.get("recipe") == "composite_grouped_count":
+        configured_dimensions = {
+            _constraint_field(str(item.get("group_property") or ""))
+            for item in config.get("components") or []
+            if isinstance(item, dict) and item.get("group_property")
+        }
+
+    def dimensions_fit(spec) -> bool:
+        if configured_dimensions is None or not spec.grouping_dimensions:
+            return True
+        requested = {_constraint_field(item) for item in spec.grouping_dimensions}
+        return requested.issubset(configured_dimensions)
+
+    satisfied_outputs = [
+        output
+        for output, spec in zip(
+            package.required_outputs, package.output_specs, strict=True,
+        )
+        if (not allowed_kinds or spec.kind in allowed_kinds) and dimensions_fit(spec)
+    ]
+    if not support_only and not satisfied_outputs:
         return None
     configured_intent = config.get("semantic_intent") or {}
     if not isinstance(configured_intent, dict):
@@ -1101,7 +1422,7 @@ def _deterministic_geometry_plan(
     return GeometryQueryPlan(
         calculation=handoff.calculation,
         answer_key=package.package_id,
-        satisfies=[] if support_only else list(package.required_outputs),
+        satisfies=[] if support_only else satisfied_outputs,
         role="supporting" if support_only else "answer_producing",
         include_in_answer=not support_only,
         semantic_intent=SemanticIntent.model_validate(configured_intent),
@@ -1136,6 +1457,32 @@ def trusted_governed_mapping_handoff(
             continue
         # Only complete governed mappings may enter the deterministic route.
         if not config.get("entity_concept") or not config.get("exact_family_values"):
+            continue
+        requested_grain_text = _normalized_route_text(" ".join([
+            contract.entity_concept,
+            package.objective,
+            *package.required_outputs,
+            contract.semantic_intent.entity_grain,
+            package.semantic_intent.entity_grain,
+            *(spec.semantic_intent.entity_grain for spec in package.output_specs),
+        ]))
+        configured_counting_unit = _normalized_route_text(
+            str(config.get("counting_unit") or "")
+        )
+        requests_individual_dwelling = bool(re.search(
+            r"(?<!\w)(?:apartment|home|dwelling|housing unit|residential unit)(?!\w)",
+            requested_grain_text,
+            flags=re.UNICODE,
+        ))
+        configured_as_floor_plate = bool(re.search(
+            r"(?<!\w)(?:floor plate|floorplate)(?!\w)",
+            configured_counting_unit,
+            flags=re.UNICODE,
+        ))
+        if requests_individual_dwelling and configured_as_floor_plate:
+            # A lexically attractive area-plan mapping is still the wrong entity
+            # for per-home thresholds and counts. Let the apartment/unit mapping
+            # compete instead of returning a replayable answer at the wrong grain.
             continue
         terms = {
             str(config.get("entity_concept") or "").strip(),
@@ -1281,10 +1628,12 @@ async def _run_one_workstream(
     root: BimRunContext,
     registry: BimAgentRegistry,
     package: EvidenceWorkPackage,
+    dependency_evidence: list[dict[str, Any]],
     package_count: int,
     budget_slot: int,
     events: PipelineEvents,
     semaphore: asyncio.Semaphore,
+    active_branches: dict[str, BimRunContext] | None = None,
 ) -> WorkstreamOutcome:
     async with semaphore:
         branch_bim = BimContext(settings)
@@ -1293,6 +1642,7 @@ async def _run_one_workstream(
         specialist_role = ""
         specialist_attempts = 0
         typed_output_failures = 0
+        verification_rejections = 0
         try:
             specialist_role = resolve_package_specialist(package)
             await asyncio.to_thread(branch_bim.connect)
@@ -1320,9 +1670,59 @@ async def _run_one_workstream(
                 ),
                 max_starts_per_agent=root.max_starts_per_agent,
             )
+            if active_branches is not None:
+                active_branches[workstream_id] = branch
             worker_contract = package_contract(root.task_contract, package)
             define_bim_task(PipelineContext(branch), worker_contract)
             hooks = AgentRunHooks(events)
+
+            async def run_scout(correction: dict[str, Any] | None = None) -> EvidenceHandoff:
+                scout_input = _worker_input(
+                    worker_contract, package, "schema_mapping", dependency_evidence,
+                )
+                if correction:
+                    scout_input += (
+                        "\nCorrective exploration request:\n"
+                        "A prior governed route produced only supporting or rejected evidence. "
+                        "Independently inspect alternative fields, values, relationships, or "
+                        "measurement bases for the unresolved outputs. Do not repeat a rejected "
+                        "mapping without new evidence.\n"
+                        + json.dumps(correction, ensure_ascii=False, sort_keys=True)
+                    )
+                try:
+                    if correction:
+                        async with asyncio.timeout(_repair_step_timeout()):
+                            result = await Runner.run(
+                                registry.schema_scout,
+                                scout_input,
+                                context=branch,
+                                max_turns=int(os.getenv("BIM_SCOUT_MAX_TURNS", "18")),
+                                hooks=hooks,
+                            )
+                    else:
+                        result = await Runner.run(
+                            registry.schema_scout,
+                            scout_input,
+                            context=branch,
+                            max_turns=int(os.getenv("BIM_SCOUT_MAX_TURNS", "18")),
+                            hooks=hooks,
+                        )
+                    resolved = EvidenceHandoff.model_validate(result.final_output)
+                    if resolved.package_id != package.package_id:
+                        raise ValueError(
+                            "Schema scout returned a handoff for a different work package."
+                        )
+                    return resolved
+                except MaxTurnsExceeded:
+                    checkpoint = _checkpoint_handoff(root, branch, package)
+                    if checkpoint is None:
+                        raise
+                    events.stage(
+                        "scout_checkpoint_recovered", run_id=root.run_id,
+                        workstream_id=workstream_id, mapping_id=checkpoint.mapping_id,
+                    )
+                    return checkpoint
+
             events.stage(
                 "workstream_start", run_id=root.run_id,
                 workstream_id=workstream_id, outputs=len(package.required_outputs),
@@ -1335,6 +1735,13 @@ async def _run_one_workstream(
                 evidence_id = json.loads(query_bim(
                     PipelineContext(branch), requirements_plan,
                 ))["evidence_id"]
+                verified_ids, satisfied_outputs, _ = _package_verification_snapshot(
+                    branch, package,
+                )
+                missing_outputs = [
+                    output for output in package.required_outputs
+                    if output not in satisfied_outputs
+                ]
                 events.stage(
                     "trusted_requirements_executed", run_id=root.run_id,
                     workstream_id=workstream_id,
@@ -1345,9 +1752,18 @@ async def _run_one_workstream(
                     ),
                 )
                 return WorkstreamOutcome(
-                    package, branch, "query_completed", evidence_ids=[evidence_id],
+                    package, branch,
+                    "partial_completed" if missing_outputs else "query_completed",
+                    evidence_ids=verified_ids or [evidence_id],
+                    limitations=(
+                        [
+                            "The scoped requirements query did not semantically verify: "
+                            + ", ".join(missing_outputs)
+                            + "."
+                        ] if missing_outputs else []
+                    ),
                     specialist=specialist_role,
-                    satisfied_outputs=list(package.required_outputs),
+                    satisfied_outputs=satisfied_outputs,
                 )
             handoff = trusted_geometry_handoff(root, package)
             if handoff is not None:
@@ -1367,23 +1783,7 @@ async def _run_one_workstream(
                     mapping_id=handoff.mapping_id,
                 )
             if handoff is None:
-                try:
-                    scout_result = await Runner.run(
-                        registry.schema_scout,
-                        _worker_input(worker_contract, package, "schema_mapping"),
-                        context=branch,
-                        max_turns=int(os.getenv("BIM_SCOUT_MAX_TURNS", "18")),
-                        hooks=hooks,
-                    )
-                    handoff = EvidenceHandoff.model_validate(scout_result.final_output)
-                except MaxTurnsExceeded:
-                    handoff = _checkpoint_handoff(root, branch, package)
-                    if handoff is None:
-                        raise
-                    events.stage(
-                        "scout_checkpoint_recovered", run_id=root.run_id,
-                        workstream_id=workstream_id, mapping_id=handoff.mapping_id,
-                    )
+                handoff = await run_scout()
             if handoff.package_id != package.package_id:
                 raise ValueError("Schema scout returned a handoff for a different work package.")
             if handoff.status == "unsupported":
@@ -1406,91 +1806,142 @@ async def _run_one_workstream(
                 evidence_id = json.loads(query_project_geometry(
                     PipelineContext(branch), deterministic_geometry,
                 ))["evidence_id"]
-                satisfied_outputs = list(deterministic_geometry.satisfies)
+                verified_ids, satisfied_outputs, verification_failures = (
+                    _package_verification_snapshot(branch, package)
+                )
                 missing_outputs = [
                     output for output in package.required_outputs
                     if output not in satisfied_outputs
                 ]
-                status = "partial_completed" if missing_outputs else "query_completed"
-                limitations = []
-                if missing_outputs:
-                    limitations.append(
-                        f"Workstream {workstream_id} verified a governed supporting "
-                        "calculation, but it cannot establish: "
-                        + ", ".join(missing_outputs)
-                        + "."
-                    )
                 events.stage(
                     "trusted_geometry_executed", run_id=root.run_id,
                     workstream_id=workstream_id, calculation=handoff.calculation,
-                    status=status,
+                    status="partial_completed" if missing_outputs else "query_completed",
                 )
-                return WorkstreamOutcome(
-                    package, branch, status, evidence_ids=[evidence_id],
-                    limitations=limitations,
-                    specialist=specialist_role,
-                    recovery_strategy=(
-                        "supporting_calculation_checkpoint" if missing_outputs else ""
-                    ),
-                    satisfied_outputs=satisfied_outputs,
+                if not missing_outputs:
+                    return WorkstreamOutcome(
+                        package, branch, "query_completed", evidence_ids=verified_ids,
+                        specialist=specialist_role,
+                        satisfied_outputs=satisfied_outputs,
+                    )
+                handoff = await run_scout({
+                    "prior_route": "geometry",
+                    "retained_evidence_ids": [evidence_id],
+                    "verified_outputs": satisfied_outputs,
+                    "missing_outputs": missing_outputs,
+                    "verification_failures": verification_failures[-4:],
+                })
+                events.stage(
+                    "partial_route_reopened", run_id=root.run_id,
+                    workstream_id=workstream_id, prior_route="geometry",
+                    missing_outputs=len(missing_outputs),
                 )
+                if handoff.status == "unsupported":
+                    return WorkstreamOutcome(
+                        package, branch, "partial_completed", evidence_ids=verified_ids,
+                        limitations=[
+                            f"Workstream {workstream_id} preserved a governed calculation "
+                            "but corrective exploration could not establish: "
+                            + ", ".join(missing_outputs)
+                            + ".",
+                            *handoff.limitations,
+                        ],
+                        specialist=specialist_role,
+                        recovery_strategy="supporting_calculation_checkpoint",
+                        satisfied_outputs=satisfied_outputs,
+                    )
             deterministic_plans = (
                 _deterministic_mapping_plans(branch, handoff, package)
                 if handoff.route == "live_mapping" else None
             )
             if deterministic_plans is not None:
+                # The trusted route is more specific than an architect's advisory
+                # hint. A stored numeric offset may be described as "geometry" by
+                # the user/model, but once a live mapping compiles it is an ordinary
+                # quantity query and must execute under that policy boundary.
+                specialist_role = "quantity"
+                branch.active_specialist = "quantity"
                 evidence_ids = [
                     json.loads(query_bim(PipelineContext(branch), plan))["evidence_id"]
                     for plan in deterministic_plans
                 ]
-                satisfied_outputs = list(dict.fromkeys(
-                    output for plan in deterministic_plans for output in plan.satisfies
-                ))
+                verified_ids, satisfied_outputs, verification_failures = (
+                    _package_verification_snapshot(branch, package)
+                )
                 missing_outputs = [
                     output for output in package.required_outputs
                     if output not in satisfied_outputs
                 ]
-                status = "partial_completed" if missing_outputs else "query_completed"
-                limitations = []
-                if missing_outputs:
-                    limitations.append(
-                        f"Workstream {workstream_id} verified a related governed population, "
-                        "but the active mapping could not bind every requested constraint: "
-                        + ", ".join(
-                            f"{item.concept}={item.requested_value}"
-                            for item in worker_contract.constraints
-                            if (
-                                _normalized_route_text(item.concept),
-                                _normalized_route_text(item.requested_value),
-                            ) not in {
-                                (
-                                    _normalized_route_text(binding.concept),
-                                    _normalized_route_text(binding.requested_value),
-                                )
-                                for binding in handoff.constraint_bindings
-                            }
-                        )
-                        + "."
-                    )
                 events.stage(
                     "trusted_mapping_executed", run_id=root.run_id,
-                    workstream_id=workstream_id, plans=len(deterministic_plans), status=status,
+                    workstream_id=workstream_id, plans=len(deterministic_plans),
+                    status="partial_completed" if missing_outputs else "query_completed",
                 )
-                return WorkstreamOutcome(
-                    package, branch, status, evidence_ids=evidence_ids,
-                    limitations=limitations,
-                    specialist=specialist_role,
-                    recovery_strategy=(
-                        "supporting_population_checkpoint" if missing_outputs else ""
-                    ),
-                    satisfied_outputs=satisfied_outputs,
+                if not missing_outputs:
+                    return WorkstreamOutcome(
+                        package, branch, "query_completed", evidence_ids=verified_ids,
+                        specialist=specialist_role,
+                        satisfied_outputs=satisfied_outputs,
+                    )
+                handoff = await run_scout({
+                    "prior_route": "live_mapping",
+                    "prior_mapping_id": handoff.mapping_id,
+                    "retained_evidence_ids": evidence_ids,
+                    "verified_outputs": satisfied_outputs,
+                    "missing_outputs": missing_outputs,
+                    "verification_failures": verification_failures[-4:],
+                })
+                events.stage(
+                    "partial_route_reopened", run_id=root.run_id,
+                    workstream_id=workstream_id, prior_route="live_mapping",
+                    missing_outputs=len(missing_outputs),
                 )
+                if handoff.status == "unsupported":
+                    unbound = [
+                        f"{item.concept}={item.requested_value}"
+                        for item in worker_contract.constraints
+                        if (
+                            _normalized_route_text(item.concept),
+                            _normalized_route_text(item.requested_value),
+                        ) not in {
+                            (
+                                _normalized_route_text(binding.concept),
+                                _normalized_route_text(binding.requested_value),
+                            )
+                            for binding in handoff.constraint_bindings
+                        }
+                    ]
+                    limitation = (
+                        f"Workstream {workstream_id} retained verified supporting evidence, "
+                        "but corrective exploration could not establish: "
+                        + ", ".join(missing_outputs)
+                        + "."
+                    )
+                    if unbound:
+                        limitation += " Unresolved constraints: " + ", ".join(unbound) + "."
+                    return WorkstreamOutcome(
+                        package, branch, "partial_completed", evidence_ids=verified_ids,
+                        limitations=[limitation, *handoff.limitations],
+                        specialist=specialist_role,
+                        recovery_strategy="supporting_population_checkpoint",
+                        satisfied_outputs=satisfied_outputs,
+                    )
+            if handoff.route != "geometry" and specialist_role == "geometry":
+                specialist_role = "quantity"
+                branch.active_specialist = "quantity"
             query_input = (
-                _worker_input(worker_contract, package, specialist_role)
+                _worker_input(
+                    worker_contract, package, specialist_role, dependency_evidence,
+                )
                 + "\nSchema handoff:\n"
                 + handoff.model_dump_json()
             )
-            branch = _execution_context(branch, worker_contract, package, handoff)
+            branch = _execution_context(
+                branch, worker_contract, package, handoff,
+                specialist=specialist_role,
+            )
+            if active_branches is not None:
+                active_branches[workstream_id] = branch
             specialist_agent = registry.execution_specialist(specialist_role)
             events.stage(
                 "specialist_selected", run_id=root.run_id,
@@ -1500,7 +1951,9 @@ async def _run_one_workstream(
             completion: EvidenceWorkstreamResult | None = None
             last_validation_error: Exception | None = None
             current_input = query_input
-            for attempt in range(_typed_repair_limit() + 1):
+            verification_repairs = 0
+            max_attempts = 1 + _typed_repair_limit() + _verification_repair_limit()
+            for attempt in range(max_attempts):
                 specialist_attempts += 1
                 query_result = await Runner.run(
                     specialist_agent,
@@ -1516,7 +1969,99 @@ async def _run_one_workstream(
                     completion = _validate_workstream_completion(
                         query_result.final_output, branch=branch, package=package,
                     )
-                    break
+                    if completion.status == "unsupported":
+                        break
+                    verified_ids, verified_outputs, verification_failures = (
+                        _package_verification_snapshot(branch, package)
+                    )
+                    missing_verified_outputs = [
+                        output for output in package.required_outputs
+                        if output not in verified_outputs
+                    ]
+                    if not missing_verified_outputs:
+                        completion = completion.model_copy(update={
+                            "evidence_ids": verified_ids,
+                        })
+                        break
+                    events.stage(
+                        "workstream_verification_rejected",
+                        run_id=root.run_id,
+                        workstream_id=workstream_id,
+                        specialist=specialist_role,
+                        attempt=attempt + 1,
+                        verified_outputs=len(verified_outputs),
+                        missing_outputs=len(missing_verified_outputs),
+                        failed_evidence=len(verification_failures),
+                    )
+                    verification_rejections += 1
+                    if verification_repairs >= _verification_repair_limit():
+                        last_validation_error = ValueError(
+                            "Evidence verification did not satisfy outputs: "
+                            + ", ".join(missing_verified_outputs)
+                            + "."
+                        )
+                        completion = None
+                        break
+                    verification_repairs += 1
+                    if _verification_requires_remapping(verification_failures):
+                        corrected_handoff = await run_scout({
+                            "prior_route": handoff.route,
+                            "prior_mapping_id": handoff.mapping_id,
+                            "verified_outputs": verified_outputs,
+                            "missing_outputs": missing_verified_outputs,
+                            "verification_failures": verification_failures[-4:],
+                        })
+                        if corrected_handoff.status == "unsupported":
+                            completion = EvidenceWorkstreamResult(
+                                status="unsupported",
+                                package_id=package.package_id,
+                                limitations=list(corrected_handoff.limitations),
+                            )
+                            events.stage(
+                                "workstream_remapping_unsupported", run_id=root.run_id,
+                                workstream_id=workstream_id,
+                                missing_outputs=len(missing_verified_outputs),
+                            )
+                            break
+                        handoff = corrected_handoff
+                        branch.schema_discovery["active_constraint_bindings"] = [
+                            item.model_dump(mode="json")
+                            for item in handoff.constraint_bindings
+                        ]
+                        if handoff.route != "geometry" and specialist_role == "geometry":
+                            specialist_role = "quantity"
+                            branch.active_specialist = "quantity"
+                            specialist_agent = registry.execution_specialist(specialist_role)
+                        query_input = (
+                            _worker_input(
+                                worker_contract, package, specialist_role,
+                                dependency_evidence,
+                            )
+                            + "\nSchema handoff:\n"
+                            + handoff.model_dump_json()
+                        )
+                        events.stage(
+                            "workstream_remapped_after_verification", run_id=root.run_id,
+                            workstream_id=workstream_id,
+                            route=handoff.route,
+                            mapping_id=handoff.mapping_id,
+                        )
+                    current_input = _verification_repair_input(
+                        query_input,
+                        package=package,
+                        verified_ids=verified_ids,
+                        verified_outputs=verified_outputs,
+                        failures=verification_failures,
+                    )
+                    completion = None
+                    events.stage(
+                        "workstream_verification_retry",
+                        run_id=root.run_id,
+                        workstream_id=workstream_id,
+                        specialist=specialist_role,
+                        next_attempt=attempt + 2,
+                    )
+                    continue
                 except Exception as validation_error:
                     typed_output_failures += 1
                     last_validation_error = validation_error
@@ -1545,10 +2090,11 @@ async def _run_one_workstream(
                             specialist=specialist_role,
                             specialist_attempts=specialist_attempts,
                             typed_output_failures=typed_output_failures,
+                            verification_rejections=verification_rejections,
                             recovery_strategy="deterministic_evidence_checkpoint",
                             satisfied_outputs=satisfied_outputs,
                         )
-                    if attempt >= _typed_repair_limit():
+                    if typed_output_failures > _typed_repair_limit():
                         break
                     current_input = _repair_input(
                         query_input,
@@ -1563,7 +2109,9 @@ async def _run_one_workstream(
                         next_attempt=attempt + 2,
                     )
             if completion is None:
-                retained_ids, satisfied_outputs = _answer_evidence_snapshot(branch, package)
+                retained_ids, satisfied_outputs, _ = _package_verification_snapshot(
+                    branch, package,
+                )
                 if retained_ids:
                     missing_outputs = [
                         output for output in package.required_outputs
@@ -1588,17 +2136,21 @@ async def _run_one_workstream(
                         specialist=specialist_role,
                         specialist_attempts=specialist_attempts,
                         typed_output_failures=typed_output_failures,
+                        verification_rejections=verification_rejections,
                         recovery_strategy="partial_evidence_checkpoint",
                         satisfied_outputs=satisfied_outputs,
                     )
                 assert last_validation_error is not None
                 raise last_validation_error
-            retained_ids, satisfied_outputs = _answer_evidence_snapshot(branch, package)
+            retained_ids, satisfied_outputs, _ = _package_verification_snapshot(
+                branch, package,
+            )
             events.stage(
                 "workstream_end", run_id=root.run_id, workstream_id=workstream_id,
                 status=completion.status, evidence=len(completion.evidence_ids),
                 specialist=specialist_role, attempts=specialist_attempts,
                 typed_output_failures=typed_output_failures,
+                verification_rejections=verification_rejections,
                 satisfied_outputs=len(satisfied_outputs),
             )
             return WorkstreamOutcome(
@@ -1610,13 +2162,16 @@ async def _run_one_workstream(
                 specialist=specialist_role,
                 specialist_attempts=specialist_attempts,
                 typed_output_failures=typed_output_failures,
+                verification_rejections=verification_rejections,
                 satisfied_outputs=satisfied_outputs,
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             if branch is not None:
-                retained_ids, satisfied_outputs = _answer_evidence_snapshot(branch, package)
+                retained_ids, satisfied_outputs, _ = _package_verification_snapshot(
+                    branch, package,
+                )
                 if retained_ids:
                     missing_outputs = [
                         output for output in package.required_outputs
@@ -1642,6 +2197,7 @@ async def _run_one_workstream(
                         specialist=specialist_role,
                         specialist_attempts=specialist_attempts,
                         typed_output_failures=typed_output_failures,
+                        verification_rejections=verification_rejections,
                         recovery_strategy=strategy,
                         satisfied_outputs=satisfied_outputs,
                     )
@@ -1662,6 +2218,7 @@ async def _run_one_workstream(
                 specialist=specialist_role,
                 specialist_attempts=specialist_attempts,
                 typed_output_failures=typed_output_failures,
+                verification_rejections=verification_rejections,
             )
         finally:
             await asyncio.to_thread(branch_bim.close)
@@ -1674,6 +2231,7 @@ async def run_evidence_workstreams(
     registry: BimAgentRegistry,
     events: PipelineEvents,
     merge: Callable[[BimRunContext, BimRunContext], list[str]],
+    active_branches: dict[str, BimRunContext] | None = None,
 ) -> list[WorkstreamOutcome]:
     """Schedule the architect DAG with isolated state and deterministic commits."""
     packages = evidence_work_packages(root.task_contract)
@@ -1715,10 +2273,12 @@ async def run_evidence_workstreams(
                 root=root,
                 registry=registry,
                 package=item,
+                dependency_evidence=_dependency_evidence_bundle(item, finished),
                 package_count=len(packages),
                 budget_slot=budget_slots[item.package_id],
                 events=events,
                 semaphore=semaphore,
+                active_branches=active_branches,
             )
             for item in runnable
         ))
@@ -1741,6 +2301,8 @@ async def run_evidence_workstreams(
                     satisfied_outputs=len(outcome.satisfied_outputs),
                     required_outputs=len(outcome.package.required_outputs),
                 )
+                if active_branches is not None:
+                    active_branches.pop(outcome.package.package_id, None)
             finished[outcome.package.package_id] = outcome
             ordered_outcomes.append(outcome)
             pending.pop(outcome.package.package_id)

@@ -1,4 +1,4 @@
-openai-agents>=0.8,<1
+claude-agent-sdk>=0.2.144,<0.3
 neo4j>=5.28,<7
 python-dotenv>=1.0,<2
 pydantic>=2.10,<3

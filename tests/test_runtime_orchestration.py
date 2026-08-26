@@ -1,7 +1,7 @@
 import json
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from bim_context import Settings
 from bim_agents.graph_contract import load_graph_contract
@@ -18,9 +18,12 @@ from bim_agents.models import (
 )
 from bim_agents.observability import PipelineEvents
 from bim_agents.orchestration import (
-    _branch_limit, _checkpoint_handoff, _deterministic_geometry_plan, _deterministic_mapping_plans,
+    WorkstreamOutcome, _branch_limit, _checkpoint_handoff, _dependency_evidence_bundle,
+    _deterministic_geometry_plan, _deterministic_mapping_plans,
+    _execution_context,
     _numeric_filter_request, _registered_mapping_handoff,
-    _deterministic_requirements_plan, _scoped_requirements_are_absent,
+    _deterministic_requirements_plan, _package_verification_snapshot,
+    _scoped_requirements_are_absent,
     evidence_work_packages,
     package_contract, resolve_package_specialist, run_evidence_workstreams,
     _dependency_policy, _failed_dependencies,
@@ -29,6 +32,7 @@ from bim_agents.orchestration import (
 from bim_agents.registry import build_agent_registry
 from bim_agents.runtime import _merge_isolated_workstream
 from bim_agents.schema_mapping import RegisteredSchemaMapping, SchemaFieldMapping, SchemaMappingProposal
+from bim_agents.tools import _constraint_field
 
 
 class FakeBimContext:
@@ -62,6 +66,87 @@ class RuntimeOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             success_criteria=["Both results are replayable"],
         )
 
+    def test_execution_context_preserves_package_evidence_checkpoint(self):
+        package = EvidenceWorkPackage(
+            package_id="count", objective="Count switches",
+            required_outputs=["switch count"],
+        )
+        contract = BimTaskContract(
+            goal=package.objective, operation="count", entity_concept="switches",
+            required_outputs=list(package.required_outputs), work_packages=[package],
+            success_criteria=["Return a replayable count."],
+        )
+        discovery = BimRunContext(
+            bim=object(),
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["m.ifc"]),
+            graph_contract=load_graph_contract(), question=package.objective,
+            workstream_id=package.package_id, task_contract=contract,
+        )
+        mapping = RegisteredSchemaMapping(
+            mapping_id="mapping-switches",
+            proposal=SchemaMappingProposal(
+                entity_name="switches", label="IfcProduct",
+                identity_property="GlobalID", source_property="source",
+                counting_unit="switch instance", counting_unit_evidence="Unique GlobalID.",
+                reasoning_summary="Validated mapping.",
+            ),
+            node_count=2, populated_identity_count=2, distinct_identity_count=2,
+        )
+        discovery.schema_mappings[mapping.mapping_id] = mapping
+        discovery.add_evidence(Evidence(
+            evidence_id="query-checkpoint", kind="query", summary="two switches",
+            payload='{"plan":{"role":"answer_producing","satisfies":["switch count"]}}',
+        ))
+        handoff = EvidenceHandoff(
+            package_id=package.package_id, status="ready_for_query",
+            route="live_mapping", entity="switches", mapping_id=mapping.mapping_id,
+            operation="count", evidence_summary="Mapped.",
+        )
+
+        execution = _execution_context(discovery, contract, package, handoff)
+
+        self.assertIn("query-checkpoint", execution.evidence)
+        self.assertIn(mapping.mapping_id, execution.schema_mappings)
+        self.assertIsNot(execution.evidence, discovery.evidence)
+
+    def test_dependency_bundle_contains_only_verified_claims(self):
+        dependency = EvidenceWorkPackage(
+            package_id="facts", objective="Compute facts", required_outputs=["fact"],
+        )
+        dependent = EvidenceWorkPackage(
+            package_id="comparison", objective="Compare evidence",
+            required_outputs=["comparison"], depends_on=["facts"],
+        )
+        branch = BimRunContext(
+            bim=object(),
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=load_graph_contract(),
+        )
+        branch.add_evidence(Evidence(
+            evidence_id="verification-facts", kind="verification", summary="review",
+            payload=json.dumps({"checks": [
+                {
+                    "evidence_id": "query-good", "verified": True,
+                    "plan": {"satisfies": ["fact"]},
+                    "claim": {"value": 4, "unit": "items", "basis": "replayed"},
+                },
+                {
+                    "evidence_id": "query-bad", "verified": False,
+                    "plan": {"satisfies": ["fact"]},
+                    "claim": {"value": 99, "unit": "items"},
+                },
+            ]}),
+        ))
+        outcome = WorkstreamOutcome(
+            package=dependency, branch=branch, status="query_completed",
+        )
+
+        bundle = _dependency_evidence_bundle(dependent, {"facts": outcome})
+
+        self.assertEqual(len(bundle), 1)
+        self.assertEqual(bundle[0]["evidence_id"], "query-good")
+        self.assertEqual(bundle[0]["claim"]["value"], 4)
+
     def test_numeric_threshold_constraints_compile_to_typed_operators(self):
         self.assertEqual(
             _numeric_filter_request("gross floor area strictly below 50 m²"),
@@ -72,6 +157,11 @@ class RuntimeOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             ("greater_or_equal", "2.7"),
         )
         self.assertIsNone(_numeric_filter_request("area should be reported"))
+
+    def test_compound_gross_floor_area_is_not_misread_as_a_level(self):
+        self.assertEqual(_constraint_field("gross_floor_area"), "area")
+        self.assertEqual(_constraint_field("gross floor area"), "area")
+        self.assertEqual(_constraint_field("ground floor"), "level")
 
     def test_home_count_preserves_governed_aggregate_identity(self):
         contract = BimTaskContract(
@@ -311,6 +401,114 @@ class RuntimeOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan.semantic_intent.value_origin, "comparison")
         self.assertEqual(plan.satisfies, package.required_outputs)
 
+    def test_verified_empty_requirements_population_satisfies_availability_output(self):
+        output = "applicable requirements"
+        package = EvidenceWorkPackage(
+            package_id="requirements",
+            objective="Find applicable requirements",
+            required_outputs=[output],
+            output_specs=[OutputSpec(
+                key="requirements", kind="list", metric="required height limit",
+            )],
+            route_hint="requirements",
+        )
+        branch = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+        )
+        branch.add_evidence(Evidence(
+            evidence_id="requirements-zero", kind="query",
+            work_package_id=package.package_id,
+            summary="No scoped requirements",
+            payload=json.dumps({
+                "plan": {
+                    "entity": "permit_knowledge", "role": "answer_producing",
+                    "satisfies": [output],
+                },
+                "claim": {
+                    "value": 0,
+                    "coverage": {"candidate_count": 0, "exhaustive": True},
+                },
+            }),
+        ))
+        semantic_checks = [
+            {"name": name, "passed": True, "explanation": "verified"}
+            for name in (
+                "replay_stability", "authorized_scope", "population_coverage",
+                "population_complete", "projection_answers_question",
+                "requested_outputs_present",
+            )
+        ] + [{
+            "name": "measurement_basis_matches", "passed": False,
+            "explanation": "No requirement row exists from which to observe a basis.",
+        }]
+        branch.add_evidence(Evidence(
+            evidence_id="verification-zero", kind="verification",
+            summary="Verified exhaustive zero",
+            payload=json.dumps({"checks": [{
+                "evidence_id": "requirements-zero", "verified": False,
+                "plan": {
+                    "entity": "permit_knowledge", "role": "answer_producing",
+                    "satisfies": [output],
+                },
+                "semantic_checks": semantic_checks,
+            }]}),
+        ))
+
+        with patch(
+            "bim_agents.orchestration.ensure_bim_verification",
+            return_value="verification-zero",
+        ):
+            evidence_ids, outputs, failures = _package_verification_snapshot(
+                branch, package,
+            )
+
+        self.assertEqual(evidence_ids, ["requirements-zero"])
+        self.assertEqual(outputs, [output])
+        self.assertEqual(failures, [])
+
+    def test_compliance_dependency_accepts_typed_verified_requirements_absence(self):
+        output = "applicable requirements"
+        requirements = EvidenceWorkPackage(
+            package_id="requirements", objective="Find applicable requirements",
+            required_outputs=[output], route_hint="requirements",
+        )
+        branch = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+        )
+        branch.add_evidence(Evidence(
+            evidence_id="requirements-zero", kind="query", summary="Verified zero",
+            payload=json.dumps({
+                "plan": {"entity": "permit_knowledge", "satisfies": [output]},
+                "claim": {
+                    "value": 0,
+                    "coverage": {"candidate_count": 0, "exhaustive": True},
+                },
+            }),
+        ))
+        comparison = EvidenceWorkPackage(
+            package_id="comparison", objective="Assess compliance",
+            required_outputs=["compliance"],
+            output_specs=[OutputSpec(key="compliance", kind="compliance")],
+            depends_on=["facts", "requirements"],
+        )
+        finished = {
+            "facts": WorkstreamOutcome(
+                EvidenceWorkPackage(
+                    package_id="facts", objective="Resolve facts",
+                    required_outputs=["facts"],
+                ),
+                None, "query_completed",
+            ),
+            "requirements": WorkstreamOutcome(
+                requirements, branch, "partial_completed",
+                evidence_ids=["requirements-zero"], satisfied_outputs=[output],
+            ),
+        }
+
+        self.assertEqual(_failed_dependencies(comparison, finished), [])
+
     def test_package_projection_contains_only_assigned_outputs(self):
         contract = self.contract()
         packages = evidence_work_packages(contract)
@@ -524,6 +722,54 @@ class RuntimeOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan.role, "supporting")
         self.assertFalse(plan.include_in_answer)
         self.assertEqual(plan.satisfies, [])
+
+    def test_governed_grouped_calculation_cannot_claim_unavailable_dimensions(self):
+        floor_output = "endpoint counts by floor"
+        multidimensional_output = "endpoint counts by floor and endpoint type"
+        contract = BimTaskContract(
+            goal="Group endpoints", operation="multi_group_count",
+            entity_concept="electrical endpoints",
+            required_outputs=[floor_output, multidimensional_output],
+            output_specs=[
+                OutputSpec(
+                    key=floor_output, kind="grouped_summary",
+                    grouping_dimensions=["floor"],
+                ),
+                OutputSpec(
+                    key=multidimensional_output, kind="grouped_summary",
+                    grouping_dimensions=["floor", "endpoint type"],
+                ),
+            ],
+            success_criteria=["Preserve every requested grouping dimension."],
+        )
+        knowledge = {"endpoint_counts": {
+            "calculation": "endpoint_counts",
+            "recipe": "composite_grouped_count",
+            "output_kinds": ["grouped_summary"],
+            "components": [{
+                "key": "lights", "label": "IfcFlowTerminal",
+                "identity_property": "GlobalID", "group_property": "Level",
+            }],
+        }}
+        bim = SimpleNamespace(ontology=SimpleNamespace(bim_query_knowledge=knowledge))
+        branch = BimRunContext(
+            bim=bim, scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(), question=contract.goal,
+            task_contract=contract,
+        )
+        package = EvidenceWorkPackage(
+            package_id="endpoints", objective=contract.goal,
+            required_outputs=list(contract.required_outputs),
+            output_specs=[item.model_copy(deep=True) for item in contract.output_specs],
+        )
+        handoff = EvidenceHandoff(
+            package_id="endpoints", status="ready_for_query", route="geometry",
+            calculation="endpoint_counts",
+        )
+
+        plan = _deterministic_geometry_plan(branch, handoff, package)
+
+        self.assertEqual(plan.satisfies, [floor_output])
 
     def test_governed_mapping_can_override_incorrect_contract_route_hint(self):
         knowledge = {"trays": {
@@ -1125,6 +1371,39 @@ class RuntimeOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan.calculation, "broad_switch_inventory")
         self.assertEqual(plan.satisfies, ["switch inventory"])
 
+    def test_governed_calculation_preserves_compatible_partial_output(self):
+        knowledge = {"coverage": {
+            "calculation": "panel_assignment_coverage",
+            "output_kinds": ["count", "coverage"],
+        }}
+        outputs = ["missing assignment count", "missing component identifiers"]
+        specs = [
+            OutputSpec(key="missing_count", kind="count"),
+            OutputSpec(key="missing_identifiers", kind="list"),
+        ]
+        contract = BimTaskContract(
+            goal="Find components missing panel assignments", operation="list",
+            entity_concept="electrical components", required_outputs=outputs,
+            output_specs=specs, success_criteria=["Return supported evidence."],
+        )
+        branch = BimRunContext(
+            bim=SimpleNamespace(ontology=SimpleNamespace(bim_query_knowledge=knowledge)),
+            scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(), task_contract=contract,
+        )
+        package = EvidenceWorkPackage(
+            package_id="coverage", objective=contract.goal,
+            required_outputs=outputs, output_specs=specs,
+        )
+        handoff = EvidenceHandoff(
+            package_id="coverage", status="ready_for_query", route="geometry",
+            calculation="panel_assignment_coverage",
+        )
+
+        plan = _deterministic_geometry_plan(branch, handoff, package)
+
+        self.assertEqual(plan.satisfies, ["missing assignment count"])
+
     def test_governed_floor_area_route_precedes_schema_scout(self):
         knowledge = {
             "area_plan": {
@@ -1152,6 +1431,42 @@ class RuntimeOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         activate.assert_called_once()
         self.assertEqual(activate.call_args.args[1], "area_plan")
         self.assertEqual(handoff.route, "live_mapping")
+
+    def test_floor_plate_mapping_cannot_win_an_individual_home_threshold(self):
+        knowledge = {
+            "area_plan": {
+                "entity_concept": "residential floor plates",
+                "aliases": ["gross floor area", "floor area"],
+                "exact_family_values": ["residential_zone"],
+                "counting_unit": "residential BVO floor-plate record",
+            },
+            "apartments": {
+                "entity_concept": "apartment spaces",
+                "aliases": ["homes", "home"],
+                "exact_family_values": ["apartment"],
+                "counting_unit": "physical apartment-space record",
+            },
+        }
+        root, branch, contract, package = self._routing_context(
+            knowledge,
+            "Are there homes smaller than 50m2 gross floor area?",
+            entity_concept="homes",
+        )
+        contract.semantic_intent.entity_grain = "residential_unit_instance"
+        registered = self._governed_mapping(entity="apartment_spaces")
+
+        with patch(
+            "bim_agents.orchestration.activate_project_knowledge_mapping",
+            return_value=registered.model_dump_json(),
+        ) as activate:
+            handoff = trusted_governed_mapping_handoff(
+                root, branch, contract, package,
+            )
+
+        activate.assert_called_once_with(
+            ANY, "apartments",
+        )
+        self.assertEqual(handoff.entity, "apartment_spaces")
 
     def test_governed_socket_multilingual_alias_routes_without_scout(self):
         knowledge = {
@@ -1367,8 +1682,20 @@ class RuntimeOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             ))
             return SimpleNamespace(final_output={"status": "query_completed"})
 
+        def verified_snapshot(branch, _package):
+            ids = [item for item in ("query-count", "query-types") if item in branch.evidence]
+            outputs = [
+                item for item, evidence_id in (
+                    ("switch count", "query-count"), ("switch types", "query-types"),
+                ) if evidence_id in branch.evidence
+            ]
+            return ids, outputs, []
+
         with patch("bim_agents.orchestration.BimContext", return_value=FakeBimContext()), patch(
             "bim_agents.orchestration.Runner.run", side_effect=fake_run,
+        ), patch(
+            "bim_agents.orchestration._package_verification_snapshot",
+            side_effect=verified_snapshot,
         ):
             outcomes = await run_evidence_workstreams(
                 settings=settings, root=root, registry=build_agent_registry(),
@@ -1438,8 +1765,20 @@ class RuntimeOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                 evidence_ids=["query-count", "query-types"],
             ))
 
+        def inventory_verification(branch, _package):
+            ids = [item for item in ("query-count", "query-types") if item in branch.evidence]
+            outputs = [
+                item for item, evidence_id in (
+                    ("switch count", "query-count"), ("switch types", "query-types"),
+                ) if evidence_id in branch.evidence
+            ]
+            return ids, outputs, []
+
         with patch("bim_agents.orchestration.BimContext", return_value=FakeBimContext()), patch(
             "bim_agents.orchestration.Runner.run", side_effect=fake_run,
+        ), patch(
+            "bim_agents.orchestration._package_verification_snapshot",
+            side_effect=inventory_verification,
         ):
             outcomes = await run_evidence_workstreams(
                 settings=settings, root=root, registry=build_agent_registry(),
@@ -1454,6 +1793,81 @@ class RuntimeOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcomes[0].specialist_attempts, 2)
         self.assertEqual(outcomes[0].typed_output_failures, 1)
         self.assertEqual(set(root.evidence), {"query-count", "query-types"})
+
+    async def test_semantic_verification_feedback_drives_bounded_query_revision(self):
+        package = EvidenceWorkPackage(
+            package_id="measure", objective="Measure governed elements",
+            required_outputs=["measurement"],
+        )
+        root = BimRunContext(
+            bim=object(),
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=load_graph_contract(), question=package.objective,
+            task_contract=BimTaskContract(
+                goal=package.objective, operation="sum", entity_concept="elements",
+                required_outputs=list(package.required_outputs), work_packages=[package],
+                success_criteria=["Return a replay-verified measurement."],
+            ),
+        )
+        settings = Settings("bolt://test", "u", "p", "neo4j", "c", "p")
+        specialist_calls = 0
+        scout_calls = 0
+
+        async def fake_run(agent, input_text, *, context, **kwargs):
+            nonlocal specialist_calls, scout_calls
+            if agent.name == "BIM Schema Mapping Specialist":
+                scout_calls += 1
+                return SimpleNamespace(final_output=EvidenceHandoff(
+                    package_id="measure", status="ready_for_query", route="contract",
+                    entity="elements", operation="sum", evidence_summary="Mapped.",
+                ))
+            specialist_calls += 1
+            evidence_id = f"query-{specialist_calls}"
+            if specialist_calls == 2:
+                self.assertIn("Evidence-verification correction", input_text)
+                self.assertIn("measurement_basis_matches", input_text)
+            context.add_evidence(Evidence(
+                evidence_id=evidence_id, kind="query", summary="measurement",
+                payload=json.dumps({"plan": {
+                    "role": "answer_producing", "include_in_answer": True,
+                    "satisfies": ["measurement"], "answer_key": "measurement",
+                }}),
+            ))
+            return SimpleNamespace(final_output=EvidenceWorkstreamResult(
+                status="query_completed", package_id="measure",
+                evidence_ids=[evidence_id],
+            ))
+
+        snapshots = [
+            ([], [], [{
+                "evidence_id": "query-1", "outputs": ["measurement"],
+                "failed_checks": [{
+                    "name": "measurement_basis_matches",
+                    "explanation": "The metric basis was not established.",
+                }],
+            }]),
+            (["query-2"], ["measurement"], []),
+            (["query-2"], ["measurement"], []),
+        ]
+        with patch("bim_agents.orchestration.BimContext", return_value=FakeBimContext()), patch(
+            "bim_agents.orchestration.Runner.run", side_effect=fake_run,
+        ), patch(
+            "bim_agents.orchestration._package_verification_snapshot",
+            side_effect=snapshots,
+        ):
+            outcomes = await run_evidence_workstreams(
+                settings=settings, root=root, registry=build_agent_registry(),
+                events=PipelineEvents(),
+                merge=lambda authoritative, branch: _merge_isolated_workstream(
+                    authoritative, branch, workstream_id=branch.workstream_id,
+                ),
+            )
+
+        self.assertEqual(specialist_calls, 2)
+        self.assertEqual(scout_calls, 2)
+        self.assertEqual(outcomes[0].status, "query_completed")
+        self.assertEqual(outcomes[0].verification_rejections, 1)
+        self.assertEqual(outcomes[0].satisfied_outputs, ["measurement"])
 
     async def test_exhausted_typed_repair_retains_partial_evidence_without_unblocking_package(self):
         package = EvidenceWorkPackage(
@@ -1493,6 +1907,9 @@ class RuntimeOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("bim_agents.orchestration.BimContext", return_value=FakeBimContext()), patch(
             "bim_agents.orchestration.Runner.run", side_effect=fake_run,
+        ), patch(
+            "bim_agents.orchestration._package_verification_snapshot",
+            return_value=(["query-count"], ["switch count"], []),
         ):
             outcomes = await run_evidence_workstreams(
                 settings=settings, root=root, registry=build_agent_registry(),

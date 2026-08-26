@@ -123,10 +123,14 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(report.verification_status, "verified")
         self.assertIn("11 m, 14 m, 38 m", report.answer)
         self.assertIn("highest defined storey reference elevation is 41 m", report.answer)
+        self.assertEqual(report.claims[0].coverage.candidate_count, 3)
+        self.assertEqual(report.claims[0].coverage.missing_count, 0)
+        self.assertTrue(report.claims[0].coverage.exhaustive)
 
     def test_section_height_recipe_accepts_measurement_group_and_basis_outputs(self):
         self._validate_typed_geometry_outputs("section_heights", [
             OutputSpec(key="section heights", kind="grouped_summary"),
+            OutputSpec(key="height coverage", kind="coverage"),
             OutputSpec(key="height basis", kind="fact"),
         ])
 
@@ -226,6 +230,8 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(report.claims[0].value, 8)
         self.assertEqual(report.claims[0].coverage.missing_count, 8)
         self.assertIn("12 have an explicit asset-tag assignment", report.answer)
+        self.assertIn("Populated assignment rate: 60%", report.answer)
+        self.assertNotIn("missing it (60%", report.answer)
         self.assertIn("does not establish", report.limitations[0])
 
     def test_optional_group_relationship_may_be_absent_from_current_ingest(self):

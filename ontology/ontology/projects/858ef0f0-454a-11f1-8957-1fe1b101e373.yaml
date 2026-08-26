@@ -28,7 +28,11 @@ bim_query_knowledge:
 
   massing_sections:
     calculation: section_heights
-    output_kinds: [measurement, list, grouped_summary, fact]
+    output_kinds: [measurement, list, grouped_summary, coverage, fact]
+    semantic_intent:
+      entity_grain: building massing sections
+      measurement_basis: height above project datum
+      value_origin: actual
     route_terms: ["section heights", "various section heights", "height of the building", "building height"]
     slab_label: IfcSlab
     predefined_type_property: PredefinedType

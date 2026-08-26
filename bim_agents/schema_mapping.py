@@ -41,6 +41,31 @@ class SchemaRelationshipBinding(BaseModel):
     semantic_name: str
     steps: list[SchemaRelationshipStep] = Field(min_length=1, max_length=4)
     purpose: str
+    evidence_kind: Literal[
+        "unspecified", "physical_topology", "logical_assignment", "containment",
+        "hosting", "system_membership",
+    ] = "unspecified"
+    target_identity_property: str = Field(
+        default="",
+        description=(
+            "Stable identity on the final path node. Required for physical-topology "
+            "coverage so a bare edge cannot be mistaken for a resolved connection."
+        ),
+    )
+    target_cardinality: Literal["any", "at_most_one", "exactly_one"] = "any"
+
+    @model_validator(mode="after")
+    def validate_topology_contract(self) -> "SchemaRelationshipBinding":
+        if self.evidence_kind == "physical_topology" and not self.target_identity_property:
+            raise ValueError(
+                "Physical-topology bindings require a stable target_identity_property."
+            )
+        if self.target_identity_property and (
+            "`" in self.target_identity_property
+            or any(ord(char) < 32 for char in self.target_identity_property)
+        ):
+            raise ValueError("Relationship target identity properties must be safe identifiers.")
+        return self
 
 
 class SchemaMatchEvidence(BaseModel):

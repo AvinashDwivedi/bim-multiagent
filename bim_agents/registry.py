@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from agents import Agent, ModelSettings, RunHooks
+from .claude_runtime import Agent, ModelSettings, RunHooks
 
 from . import prompts
 from .agent_tools import (
@@ -60,11 +60,11 @@ class BimAgentRegistry:
 def _settings(effort: str) -> ModelSettings:
     # Every worker owns one isolated mutable context. Runtime scheduling provides
     # parallelism; parallel calls inside one worker would race its artifact ledger.
-    return ModelSettings(reasoning={"effort": effort}, parallel_tool_calls=False)
+    return ModelSettings(effort=effort, parallel_tool_calls=False)
 
 
 def build_agent_registry(
-    model: str = "gpt-5.6-sol",
+    model: str = "claude-sonnet-4-6",
     *,
     worker_model: str | None = None,
     hooks: RunHooks | None = None,

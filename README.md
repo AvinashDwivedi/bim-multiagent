@@ -54,6 +54,12 @@ The Query Worker can execute trusted declarative plans and named geometry calcul
 or mutate mappings. The typed `EvidenceHandoff` is their only conversational bridge; registered mappings
 remain available in the package's isolated artifact ledger.
 
+Each package now closes its own bounded evidence loop before commit: explore, execute, replay, check semantic
+adequacy, and revise. A rejected query remains auditable, while its failed check names and explanations are fed
+back to the isolated specialist. Partial governed routes are checkpoints rather than terminal answers: the
+Schema Scout reopens targeted exploration for missing outputs. Dependent packages receive a compact immutable
+bundle containing only replay-verified claims from their declared dependencies.
+
 Answer-producing queries must name a stable `answer_key`, declare the exact package outputs they satisfy,
 and include every task constraint as a real query filter. The runtime rejects a ground-floor claim backed by
 an unfiltered project-wide query. Diagnostic `is_missing` filters remain non-rendered supporting evidence;
@@ -173,7 +179,7 @@ Discovery uses distinct live family/signature populations rather than arbitrary 
 complete observed property surface remains available to deterministic search, while the agent-facing node
 inventory is compact. A bounded hierarchy profiler exposes exact category → family → type branches and
 their record counts, allowing unrelated families inside broad Revit categories to be rejected before an
-answer query is built. Multilingual ontology expansion plus hybrid lexical/embedding ranking maps
+answer query is built. Multilingual ontology expansion plus hybrid lexical/local-vector ranking maps
 user-language concepts to model-language Revit/IFC vocabulary without asserting that a candidate is
 correct; exact value binding, live mapping registration, and replay remain mandatory.
 
@@ -183,12 +189,30 @@ correct; exact value binding, live mapping registration, and replay remain manda
 python -m pip install -r requirements.txt
 ```
 
-Configure the Neo4j connection, OpenAI API key, client, and project using the environment variables
-consumed by `Settings.from_env()`.
+Configure Claude Code, the Neo4j connection, client, and project in `.env`:
 
-The Schema Scout defaults to 18 turns and the fresh Query Worker to 6. Override them with
-`BIM_SCOUT_MAX_TURNS` and `BIM_QUERY_WORKER_MAX_TURNS`. The split prevents a long discovery transcript from
-consuming query-planning context and ensures a successful mapping gets a fresh chance to produce evidence.
+```dotenv
+ANTHROPIC_API_KEY=your-anthropic-api-key
+NEO4J_URI=neo4j+s://your-instance
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=your-password
+NEO4J_DATABASE=neo4j
+BIM_CLIENT_ID=your-client-uuid
+BIM_PROJECT_ID=your-project-uuid
+BIM_AGENT_MODEL=claude-sonnet-4-6
+BIM_AGENT_WORKER_MODEL=claude-sonnet-4-6
+```
+
+The Python Claude Agent SDK includes the Claude Code runtime. Every specialist runs with only its
+explicit in-process BIM tools; filesystem, shell, web, skills, and ambient MCP configuration are disabled.
+Semantic candidate ranking is local and deterministic, so no second model-provider key is required.
+
+The Task Architect defaults to two turns, the Schema Scout to 18, and the fresh Query Worker to 6. Override
+them with `BIM_ARCHITECT_MAX_TURNS`, `BIM_SCOUT_MAX_TURNS`, and `BIM_QUERY_WORKER_MAX_TURNS`. Invalid architect
+contracts and architect turn limits receive a bounded fresh retry. Query evidence rejected by replay or semantic
+verification receives one bounded correction by default; configure this with
+`BIM_VERIFICATION_REPAIR_ATTEMPTS`. The split prevents a long discovery transcript from consuming
+query-planning context and ensures a successful mapping gets a fresh chance to produce evidence.
 
 Task complexity may raise the available work budget for complex investigations, but it never reduces the
 configured model-call or tool-call limits. A simple question can still require unknown-schema discovery,

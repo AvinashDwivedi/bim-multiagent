@@ -4,13 +4,12 @@
 bim_query_knowledge:
   electrical_panel_assignment_coverage:
     calculation: electrical_panel_assignment_coverage
-    support_only: true
-    output_kinds: [count, grouped_summary]
+    support_only: false
+    output_kinds: [count, grouped_summary, coverage, relationship_coverage]
     semantic_intent:
       entity_grain: physical electrical component instance
-      value_origin: planned
+      value_origin: actual
       absence_semantics: property_missing
-      population_boundary: [project-governed electrical component categories]
     route_terms:
       - "electrical connectivity"
       - "feeding electrical panel"
@@ -45,9 +44,10 @@ bim_query_knowledge:
     assignment_unit: feeding-panel assignment
     semantics: >-
       Measures explicit logical Panel-property coverage over the governed electrical
-      component population, excluding system openings and covers. This is supporting
-      authoring-data evidence only: it never establishes physical port continuity or
-      proves that a component is electrically connected to the named panel.
+      component population, excluding system openings and covers. For questions about
+      planned feeding-panel assignment, this is direct authoring-data evidence. It never
+      establishes physical port continuity or proves that a component is physically
+      connected to the named panel.
 
   electrical_endpoints_by_level:
     calculation: electrical_endpoints_by_level
@@ -248,6 +248,10 @@ bim_query_knowledge:
       The governed family boundary covers the eight observed family/type combinations whose
       descriptions identify a six-module socket box. Elevation from Level is the modeled
       instance reference-point offset in centimetres; it is not a clear-height measurement.
+    query_profile:
+      apply_when_operations: [count, count_distinct, list, distinct]
+      operation: distinct
+      grouping_fields: [elevation_from_level]
 
   nonmetallic_conduit_segments:
     entity_concept: nonmetallic electrical conduit segments

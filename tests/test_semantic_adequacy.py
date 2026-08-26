@@ -9,7 +9,8 @@ from bim_agents.schema_mapping import (
     RegisteredSchemaMapping, SchemaFieldMapping, SchemaMappingProposal,
 )
 from bim_agents.tools import (
-    BimFilter, BimQueryPlan, GeometryQueryPlan, _semantic_adequacy_checks,
+    BimFilter, BimQueryPlan, GeometryQueryPlan, PipelineContext,
+    _semantic_adequacy_checks, _validate_answer_metadata,
 )
 
 
@@ -58,6 +59,26 @@ def _context(intent: SemanticIntent):
 
 
 class SemanticAdequacyTests(unittest.TestCase):
+    def test_distinct_numeric_values_satisfy_a_set_valued_measurement(self):
+        context = _context(SemanticIntent(
+            entity_grain="socket box instance",
+            measurement_basis="height above floor",
+            requested_projection=["value", "groups"],
+        ))
+        context.task_contract.operation = "distinct"
+        context.task_contract.output_specs = [OutputSpec(
+            key="answer", kind="measurement", metric="gross floor area",
+        )]
+        mapping = _mapping()
+        context.schema_mappings[mapping.mapping_id] = mapping
+        plan = BimQueryPlan(
+            entity="model_records", mapping_id="mapping-test",
+            operation="distinct", group_by="area_bvo",
+            answer_key="answer", satisfies=["answer"],
+        )
+
+        _validate_answer_metadata(PipelineContext(context), plan)
+
     def test_replayed_related_aggregate_cannot_answer_individual_measurement(self):
         context = _context(SemanticIntent(
             entity_grain="individual home",
@@ -231,7 +252,135 @@ class SemanticAdequacyTests(unittest.TestCase):
         by_name = {item["name"]: item["passed"] for item in checks}
         self.assertTrue(by_name["entity_grain_matches"])
         self.assertTrue(by_name["measurement_basis_matches"])
+
+    def test_group_summary_structurally_proves_count_area_and_classification_basis(self):
+        context = _context(SemanticIntent(
+            measurement_basis="count_and_summed_canonical_area_by_function_type",
+            requested_projection=["groups"],
+        ))
+        mapping = _mapping(counting_unit="physical functional-space record")
+        plan = BimQueryPlan(
+            entity="model_records", mapping_id=mapping.mapping_id,
+            operation="group_summary", group_by="type", metric="area_bvo",
+            answer_key="answer", satisfies=["answer"],
+        )
+
+        checks = _semantic_adequacy_checks(
+            context, plan,
+            {"value": 4, "unit": "records", "details": ["office: count and area"]},
+            registered=mapping, matched_count=4,
+        )
+
+        by_name = {item["name"]: item["passed"] for item in checks}
+        self.assertTrue(by_name["measurement_basis_matches"])
         self.assertTrue(by_name["projection_answers_question"])
+
+    def test_area_sum_without_group_counts_does_not_prove_compound_group_basis(self):
+        context = _context(SemanticIntent(
+            measurement_basis="count_and_summed_canonical_area_by_function_type",
+        ))
+        mapping = _mapping(counting_unit="physical functional-space record")
+        plan = BimQueryPlan(
+            entity="model_records", mapping_id=mapping.mapping_id,
+            operation="sum", metric="area_bvo",
+            answer_key="answer", satisfies=["answer"],
+        )
+
+        checks = _semantic_adequacy_checks(
+            context, plan, {"value": 100, "unit": "m²"},
+            registered=mapping, matched_count=4,
+        )
+
+        by_name = {item["name"]: item["passed"] for item in checks}
+        self.assertFalse(by_name["measurement_basis_matches"])
+
+    def test_generic_area_property_does_not_prove_gross_area_basis(self):
+        context = _context(SemanticIntent(
+            entity_grain="individual home",
+            measurement_basis="gross floor area",
+        ))
+        mapping = _mapping()
+        mapping.proposal.fields = [
+            field.model_copy(update={
+                "semantic_name": "area_m2",
+                "property": "canonical_area_m2",
+                "aliases": ["area"],
+            }) if field.semantic_name == "area_bvo" else field
+            for field in mapping.proposal.fields
+        ]
+        plan = BimQueryPlan(
+            entity="model_records", mapping_id=mapping.mapping_id,
+            operation="sum", metric="area_m2",
+            answer_key="answer", satisfies=["answer"],
+        )
+        checks = _semantic_adequacy_checks(
+            context, plan,
+            {"value": 42, "unit": "m²", "basis": "canonical square metres"},
+            registered=mapping, matched_count=1,
+        )
+
+        by_name = {item["name"]: item["passed"] for item in checks}
+        self.assertFalse(by_name["measurement_basis_matches"])
+        self.assertTrue(by_name["projection_answers_question"])
+
+    def test_typed_boundary_accepts_compiler_proven_schema_dimension_remap(self):
+        context = _context(SemanticIntent(
+            entity_grain="electrical conduit segment instance",
+            measurement_basis="count",
+            population_boundary=[SemanticBoundary(
+                semantic_field="material",
+                exact_values=["non-metallic electrical conduit"],
+            )],
+            value_origin="actual",
+            requested_projection=["value"],
+        ))
+        mapping = _mapping(counting_unit="electrical conduit segment instance")
+        plan = BimQueryPlan(
+            entity="model_records", mapping_id=mapping.mapping_id,
+            operation="count", filters=[BimFilter(
+                field="family_and_type", operator="equals",
+                value="Conduit without Fittings: Electrical Nonmetallic Conduit (HDPE)",
+            )],
+            constraint_bindings=[ConstraintBinding(
+                concept="material", requested_value="non-metallic electrical conduit",
+                semantic_field="family_and_type",
+                exact_values=[
+                    "Conduit without Fittings: Electrical Nonmetallic Conduit (HDPE)"
+                ],
+                mapping_id=mapping.mapping_id,
+            )],
+            answer_key="answer", satisfies=["answer"],
+        )
+
+        checks = _semantic_adequacy_checks(
+            context, plan, {"value": 25}, registered=mapping, matched_count=25,
+        )
+
+        by_name = {item["name"]: item["passed"] for item in checks}
+        self.assertTrue(by_name["population_complete"])
+
+    def test_typed_boundary_rejects_unproven_cross_dimension_filter(self):
+        context = _context(SemanticIntent(
+            population_boundary=[SemanticBoundary(
+                semantic_field="material", exact_values=["non-metallic conduit"],
+            )],
+        ))
+        mapping = _mapping(counting_unit="electrical conduit segment instance")
+        plan = BimQueryPlan(
+            entity="model_records", mapping_id=mapping.mapping_id,
+            operation="count", filters=[BimFilter(
+                field="family_and_type", operator="equals",
+                value="Electrical Nonmetallic Conduit (HDPE)",
+            )],
+            answer_key="answer", satisfies=["answer"],
+        )
+
+        checks = _semantic_adequacy_checks(
+            context, plan, {"value": 25}, registered=mapping, matched_count=25,
+        )
+
+        by_name = {item["name"]: item["passed"] for item in checks}
+        self.assertFalse(by_name["population_complete"])
 
 
 if __name__ == "__main__":

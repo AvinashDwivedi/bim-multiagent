@@ -6,7 +6,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Callable
 
-from agents import RunHooks
+from .claude_runtime import RunHooks
 
 from .models import BimRunContext
 
@@ -59,7 +59,7 @@ class PipelineEvents:
         }
         details = " | ".join(
             f"{key}={event[key]}" for key in (
-                "workstream_id", "agent", "tool", "status", "category",
+                "workstream_id", "agent", "tool", "status", "category", "error_type",
             )
             if event.get(key) is not None
         )
