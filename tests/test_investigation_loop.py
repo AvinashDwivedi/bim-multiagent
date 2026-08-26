@@ -3,7 +3,7 @@ import unittest
 
 from bim_agents.graph_contract import load_graph_contract
 from bim_agents.models import (
-    BimRunContext, BimTaskContract, InvestigationAction,
+    BimRunContext, BimTaskContract, Evidence, InvestigationAction,
     InvestigationHypothesis, InvestigationObservation, ProjectScope,
 )
 from bim_agents.tools import (
@@ -87,6 +87,91 @@ class InvestigationLoopTests(unittest.TestCase):
         self.assertFalse(gates["ready_to_respond"])
         self.assertIn("required output: height", gates["missing"])
         self.assertGreaterEqual(context.max_tool_calls, 55)
+
+    def test_phase_machine_covers_action_observation_recovery_and_blocked_paths(self):
+        context = self.context()
+        define_bim_task(PipelineContext(context), BimTaskContract(
+            goal="Count physical conduits", operation="count",
+            entity_concept="conduits", required_outputs=["conduit count"],
+            success_criteria=["Verified count"],
+        ))
+        self.assertEqual(context.notebook.phase, "explore")
+
+        register_investigation_hypothesis(PipelineContext(context), InvestigationHypothesis(
+            hypothesis_id="identity", statement="One record is one conduit",
+            expected_observation="Stable unique identity", status="testing",
+        ))
+        self.assertEqual(context.notebook.phase, "analyze")
+
+        select_investigation_action(PipelineContext(context), InvestigationAction(
+            action_id="inspect", phase="act", objective="Inspect identity",
+            unresolved_question="What is the identity?", proposed_action="Profile IDs",
+            expected_information_gain="Identify a stable key",
+        ))
+        self.assertEqual(context.notebook.phase, "act")
+        record_investigation_observation(PipelineContext(context), InvestigationObservation(
+            action_id="inspect", phase="observe", result_summary="Identity observed",
+        ))
+        self.assertEqual(context.notebook.phase, "analyze")
+        self.assertIn("observe", context.notebook.phase_history)
+
+        select_investigation_action(PipelineContext(context), InvestigationAction(
+            action_id="verify", phase="verify", objective="Verify identity",
+            unresolved_question="Is the identity stable?", proposed_action="Replay query",
+            expected_information_gain="Confirm replay stability",
+        ))
+        self.assertEqual(context.notebook.phase, "verify")
+        # A failed verification may return to analysis for a correction.
+        gates = json.loads(inspect_completion_gates(PipelineContext(context)))
+        self.assertFalse(gates["ready_to_respond"])
+        self.assertEqual(context.notebook.phase, "analyze")
+
+        select_investigation_action(PipelineContext(context), InvestigationAction(
+            action_id="stop", phase="blocked", objective="Stop safely",
+            unresolved_question="Can the result be verified?", proposed_action="Report limitation",
+            expected_information_gain="None",
+        ))
+        self.assertEqual(context.notebook.phase, "blocked")
+        with self.assertRaisesRegex(ValueError, "Invalid investigation phase transition"):
+            select_investigation_action(PipelineContext(context), InvestigationAction(
+                action_id="illegal", phase="respond", objective="Respond",
+                unresolved_question="", proposed_action="Answer", expected_information_gain="None",
+            ))
+
+    def test_verified_completion_routes_through_verify_to_respond(self):
+        context = self.context()
+        define_bim_task(PipelineContext(context), BimTaskContract(
+            goal="Count physical conduits", operation="count",
+            entity_concept="conduits", required_outputs=["conduit count"],
+            success_criteria=["Verified count"],
+        ))
+        context.add_evidence(Evidence(
+            evidence_id="query-1", kind="query", summary="count",
+            payload=json.dumps({
+                "plan": {"role": "answer_producing", "answer_key": "count",
+                         "satisfies": ["conduit count"]},
+                "claim": {"value": 2, "unit": "conduits"},
+            }),
+        ))
+        context.add_evidence(Evidence(
+            evidence_id="verification-1", kind="verification", summary="verified",
+            payload=json.dumps({
+                "checks": [{
+                    "verified": True,
+                    "plan": {"role": "answer_producing", "satisfies": ["conduit count"]},
+                    "semantic_checks": [
+                        {"name": "identity_integrity", "passed": True},
+                        {"name": "classification_purity", "passed": True},
+                        {"name": "replay_stability", "passed": True},
+                    ],
+                }],
+            }),
+        ))
+
+        gates = json.loads(inspect_completion_gates(PipelineContext(context)))
+        self.assertTrue(gates["ready_to_respond"])
+        self.assertEqual(context.notebook.phase, "respond")
+        self.assertEqual(context.notebook.phase_history[-3:], ["analyze", "verify", "respond"])
 
 
 if __name__ == "__main__":

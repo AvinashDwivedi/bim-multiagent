@@ -2,6 +2,24 @@
 # rules over observed graph fields and quantities, not global IFC assumptions.
 bim_query_knowledge:
   area_plan:
+    entity_concept: residential floor plates
+    aliases: [floor area, floor plate, residential floor area, BVO floor area]
+    retrieval_terms: [floor area size, sixth floor area, 6th floor area]
+    label: IfcSpace
+    source_property: source
+    identity_property: GlobalID
+    category_property: Bepalingsmethode
+    category_value: BVO
+    classification_property: canonical_type
+    classification_semantic_name: type
+    exact_family_values: [residential_zone]
+    fields:
+      - {semantic_name: level, property: canonical_level, ontology_kind: level}
+      - {semantic_name: area_m2, property: canonical_area_m2, data_type: number, source_unit: "m²", unit: "m²", conversion_factor: 1.0, conversion_basis: canonical square metres}
+    counting_unit: residential BVO floor-plate record
+    counting_unit_semantics: >-
+      A distinct GlobalID represents one residential-zone BVO floor-plate record;
+      overlapping area-plan functions are excluded by the exact canonical type and BVO basis.
     floor_plate_basis: BVO
     floor_plate_type: residential_zone
     semantics: >-
@@ -10,6 +28,7 @@ bim_query_knowledge:
 
   massing_sections:
     calculation: section_heights
+    output_kinds: [measurement, list, grouped_summary, fact]
     route_terms: ["section heights", "various section heights", "height of the building", "building height"]
     slab_label: IfcSlab
     predefined_type_property: PredefinedType
@@ -23,6 +42,7 @@ bim_query_knowledge:
 
   tower_facade:
     calculation: facade_opening_percentage
+    output_kinds: [measurement, coverage, fact]
     route_terms: ["opening percentage of the tower facade", "tower facade opening percentage"]
     wall_label: IfcWall
     wall_name_property: name
@@ -43,6 +63,7 @@ bim_query_knowledge:
 
   tower_floor_area:
     calculation: tower_max_floor_area
+    output_kinds: [measurement, list, fact]
     route_terms: ["tower's maximum floor area", "tower maximum floor area", "maximum tower floor area"]
     space_label: IfcSpace
     type_property: canonical_type
@@ -56,6 +77,88 @@ bim_query_knowledge:
     semantics: >-
       Repeated upper-storey BVO residential-zone records are the tower floor plates.
       Other overlapping area-plan records and podium functions are outside this measure.
+
+  physical_unit_scope_comparison:
+    calculation: physical_unit_scope_comparison
+    output_kinds: [count, grouped_summary]
+    route_terms:
+      - "units are in the building and how many on the ground floor"
+      - "total units and ground floor units"
+      - "physical apartments in the building"
+    recipe: scope_comparison
+    entity:
+      label: IfcSpace
+      identity_property: EenheidNummer
+      source_property: source
+      filters:
+        - {property: canonical_type, values: [apartment]}
+    scopes:
+      - {key: all_units}
+      - key: ground_floor
+        filters:
+          - {property: canonical_level, values: ["00 begane grond"]}
+    baseline_scope: all_units
+    counting_unit: physical apartments
+    semantics: >-
+      Count distinct populated EenheidNummer values rather than space records. Both levels
+      of a duplex share the same dwelling identity, while the ground-floor scope applies an
+      exact canonical-level boundary before the same distinct-identity count.
+
+  apartment_spaces:
+    entity_concept: apartment spaces
+    aliases: [apartments, apartment, homes, dwelling spaces]
+    retrieval_terms: [apartments on the ground floor, apartments on the 7th floor, ground floor apartments]
+    label: IfcSpace
+    source_property: source
+    identity_property: GlobalID
+    classification_property: canonical_type
+    classification_semantic_name: type
+    exact_family_values: [apartment]
+    fields:
+      - {semantic_name: level, property: canonical_level, ontology_kind: level}
+      - {semantic_name: dwelling_unit_number, property: EenheidNummer, ontology_kind: aggregate_identity, optional: true}
+      - {semantic_name: area_m2, property: canonical_area_m2, data_type: number, source_unit: "m²", unit: "m²", conversion_factor: 1.0, conversion_basis: canonical square metres, optional: true}
+      - {semantic_name: area_basis, property: Bepalingsmethode, optional: true}
+    counting_unit: physical apartment-space record
+    counting_unit_semantics: >-
+      A distinct GlobalID represents one modeled IfcSpace apartment record. Queries for
+      physical dwelling units across the building must instead use the governed distinct
+      EenheidNummer scope-comparison calculation so duplex parts are deduplicated.
+
+  functional_spaces:
+    entity_concept: functional spaces
+    aliases: [space functions, function types, functions on the ground floor, ground floor functions]
+    retrieval_terms: [types of functions on the ground floor, ground floor function areas]
+    label: IfcSpace
+    source_property: source
+    identity_property: GlobalID
+    classification_property: canonical_type
+    classification_semantic_name: function_type
+    exact_family_values:
+      - parking
+      - technical_room
+      - apartment
+      - circulation
+      - retail
+      - amenity
+      - bicycle_storage
+      - storage
+      - horeca
+      - residential_zone
+    fields:
+      - {semantic_name: level, property: canonical_level, ontology_kind: level}
+      - {semantic_name: area_m2, property: canonical_area_m2, data_type: number, source_unit: "m²", unit: "m²", conversion_factor: 1.0, conversion_basis: canonical square metres}
+      - {semantic_name: area_basis, property: Bepalingsmethode, optional: true}
+    counting_unit: physical functional-space record
+    counting_unit_semantics: >-
+      Count distinct populated GlobalID values within the exact canonical function-type
+      boundary. A grouped summary must report both record count and summed canonical area;
+      the exact level filter remains a separate package-owned constraint.
+    query_profile:
+      apply_when_operations: [count, count_distinct, list, group_count, group_summary, distinct, coverage]
+      operation: group_summary
+      metric: area_m2
+      grouping_fields: [function_type]
 
   residential_records:
     segment_code: MSH

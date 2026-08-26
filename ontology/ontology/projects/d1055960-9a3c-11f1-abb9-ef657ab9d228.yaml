@@ -2,6 +2,178 @@
 # These are classification/identity rules only; all counts and measurements
 # must still be queried and replayed from the authorized live graph.
 bim_query_knowledge:
+  electrical_panel_assignment_coverage:
+    calculation: electrical_panel_assignment_coverage
+    support_only: true
+    output_kinds: [count, grouped_summary]
+    semantic_intent:
+      entity_grain: physical electrical component instance
+      value_origin: planned
+      absence_semantics: property_missing
+      population_boundary: [project-governed electrical component categories]
+    route_terms:
+      - "electrical connectivity"
+      - "feeding electrical panel"
+      - "connection or continuity to its feeding electrical panel"
+      - "panel assignment coverage"
+      - "רכיבי חשמל המתוכננים ללא חיבור"
+      - "המשכיות אל לוח החשמל המזין"
+    recipe: property_coverage
+    entity:
+      label: BIMElement
+      identity_property: GlobalID
+      source_property: source
+      filters:
+        - property: Category
+          values:
+            - Electrical Fixtures
+            - Lighting Fixtures
+            - Fire Alarm Devices
+            - Lighting Devices
+            - Electrical Equipment
+            - Specialty Equipment
+            - Communication Devices
+        - property: Family
+          operator: not_in
+          values:
+            - "Elec- Face Based - פתח למערכות עגול"
+            - "Elec- Face Based - פתח למערכות מרובע"
+            - Cover-Thomas_&_Betts-665
+    property: Panel
+    missing_values: ["", "<unnamed>", "<not associated>"]
+    counting_unit: planned electrical component instances
+    assignment_unit: feeding-panel assignment
+    semantics: >-
+      Measures explicit logical Panel-property coverage over the governed electrical
+      component population, excluding system openings and covers. This is supporting
+      authoring-data evidence only: it never establishes physical port continuity or
+      proves that a component is electrically connected to the named panel.
+
+  electrical_endpoints_by_level:
+    calculation: electrical_endpoints_by_level
+    output_kinds: [count, grouped_summary]
+    semantic_intent: {value_origin: planned}
+    route_terms:
+      - "electrical endpoints exist on each floor"
+      - "electrical endpoints by floor"
+      - "endpoints by floor"
+      - "outlets switches and lighting fixtures by floor"
+      - "נקודות קצה"
+      - "נקודות קצה מתוכננות בקומה"
+      - "נקודות קצה"
+      - "נקודות קצה לפי קומה"
+      - "נקודות קצה חשמליות בכל קומה"
+    recipe: composite_grouped_count
+    components:
+      - key: power_endpoints
+        label: IfcBuildingElementProxy
+        identity_property: GlobalID
+        source_property: source
+        group_property: Level
+        cross_source_identity_join: true
+        group_relationship: &endpoint_storey
+          relationship_type: SPATIALLY_CONTAINS
+          target_label: IfcBuildingStorey
+          target_property: canonical_level
+          direction: either
+          prefer_relationship: true
+        filters:
+          - {property: Category, values: [Electrical Fixtures]}
+          - property: Family
+            operator: not_in
+            values:
+              - "Elec- Face Based - פתח למערכות עגול"
+              - "Elec- Face Based - פתח למערכות מרובע"
+              - "M_הזנה "
+              - Cover-Thomas_&_Betts-665
+      - key: lighting_switch_endpoints
+        label: IfcBuildingElementProxy
+        identity_property: GlobalID
+        source_property: source
+        group_property: Level
+        cross_source_identity_join: true
+        group_relationship: *endpoint_storey
+        filters:
+          - {property: Category, values: [Lighting Devices]}
+          - property: Family
+            values: [ED_SwitchButton, M_Lighting Switches_Y23, "מפסק דו קוטבי", LD_Lighting Switch Water Proof]
+      - key: lighting_fixture_endpoints
+        label: IfcFlowTerminal
+        identity_property: GlobalID
+        source_property: source
+        group_property: Level
+        cross_source_identity_join: true
+        group_relationship: *endpoint_storey
+        filters:
+          - {property: Category, values: [Lighting Fixtures]}
+      - key: emergency_exit_luminaires
+        label: IfcBuildingElementProxy
+        identity_property: GlobalID
+        source_property: source
+        group_property: Level
+        cross_source_identity_join: true
+        group_relationship: *endpoint_storey
+        filters:
+          - {property: Category, values: [Lighting Devices]}
+          - {property: Family, values: [Emergency Exit Sign (One-Side)_JEG_I]}
+    identity_namespace: global
+    counting_unit: physical electrical endpoints
+    group_unit: modelled floor
+    missing_group_label: unassigned floor
+    semantics: >-
+      The endpoint population is the union of eligible electrical fixtures, exact lighting
+      switch families, lighting fixtures, and the exact emergency-exit luminaire family.
+      System openings, feed markers, and covers are
+      explicitly excluded; every live answer is grouped and deduplicated by GlobalID.
+      Records without a populated model Level remain visible in an unassigned-floor bucket
+      rather than being dropped or assigned to a floor by assumption.
+
+  broad_switch_inventory:
+    calculation: broad_switch_inventory
+    output_kinds: [list, count, grouped_summary]
+    route_terms:
+      - "what switches are in the project"
+      - "all switches in the project"
+      - "broad switch inventory"
+      - "switch types across the project"
+      - "switch types in the project"
+      - "סוגי מפסקים בפרויקט"
+      - "סוגי מפסקים בפרוייקט"
+    recipe: composite_grouped_count
+    components:
+      - key: lighting_switches
+        label: IfcBuildingElementProxy
+        identity_property: GlobalID
+        source_property: source
+        group_property: Type
+        filters:
+          - {property: Category, values: [Lighting Devices]}
+          - property: Family
+            values: [ED_SwitchButton, M_Lighting Switches_Y23, "מפסק דו קוטבי", LD_Lighting Switch Water Proof]
+      - key: electrical_switchboards
+        label: IfcBuildingElementProxy
+        identity_property: GlobalID
+        source_property: source
+        group_property: Type
+        filters:
+          - {property: Category, values: [Electrical Equipment]}
+          - {property: Family, values: [Switchboard-Siemens]}
+      - key: door_intercom_switches
+        label: IfcBuildingElementProxy
+        identity_property: GlobalID
+        source_property: source
+        group_property: Type
+        filters:
+          - {property: Category, values: [Electrical Fixtures]}
+          - {property: Family, values: [Y_switch_Open door]}
+    identity_namespace: global
+    counting_unit: physical switch-related instances
+    group_unit: governed switch type
+    semantics: >-
+      Broad switch scope includes the exact lighting-switch branches, modeled electrical
+      switchboards, and the separately classified door/intercom switch. It does not classify
+      unrelated devices merely because their free text contains the word switch.
+
   lighting_switches:
     entity_concept: lighting switches
     aliases: [switch, switches, lighting switch, "מפסק", "מפסקים"]
@@ -31,7 +203,7 @@ bim_query_knowledge:
 
   cable_tray_segments:
     entity_concept: cable tray segments
-    aliases: [cable tray, cable trays, tray, trays, "מגש כבלים", "מגשי כבלים"]
+    aliases: [cable tray, cable trays, tray, trays, "מגש כבלים", "מגשי כבלים", "מגשי הכבלים"]
     label: IfcFlowSegment
     source_property: source
     identity_property: GlobalID
@@ -39,13 +211,14 @@ bim_query_knowledge:
     category_value: Cable Trays
     classification_property: Type
     classification_semantic_name: type
+    classification_aliases: [tray type, type, "סוג", "סוג מגש כבלים"]
     exact_family_values: [Wire Mesh Cable Tray, Channel Cable Tray]
     fields:
-      - {semantic_name: width, property: Width, data_type: number, source_unit: cm, unit: mm, conversion_factor: 10, conversion_basis: "centimetres to millimetres"}
-      - {semantic_name: height, property: Height, data_type: number, source_unit: cm, unit: mm, conversion_factor: 10, conversion_basis: "centimetres to millimetres"}
-      - {semantic_name: length, property: Length, data_type: number, source_unit: cm, unit: m, conversion_factor: 0.01, conversion_basis: "centimetres to metres"}
-      - {semantic_name: material, property: "Materials and Finishes_Material", optional: true}
-      - {semantic_name: level, property: canonical_level, ontology_kind: level}
+      - {semantic_name: width, property: Width, aliases: [tray width, width, "רוחב"], data_type: number, source_unit: cm, unit: mm, conversion_factor: 10, conversion_basis: "centimetres to millimetres"}
+      - {semantic_name: height, property: Height, aliases: [tray height, height, "גובה"], data_type: number, source_unit: cm, unit: mm, conversion_factor: 10, conversion_basis: "centimetres to millimetres"}
+      - {semantic_name: length, property: Length, aliases: [total length, segment length, "אורך", "האורך הכולל"], data_type: number, source_unit: cm, unit: m, conversion_factor: 0.01, conversion_basis: "centimetres to metres"}
+      - {semantic_name: material, property: "Materials and Finishes_Material", aliases: [tray material, material, "חומר"], optional: true}
+      - {semantic_name: level, property: canonical_level, aliases: [floor, level, "קומה"], ontology_kind: level}
     counting_unit: physical cable-tray segment instance
     counting_unit_semantics: >-
       Count distinct GlobalID values on the exact Cable Trays category. IfcFlowFitting
@@ -60,14 +233,16 @@ bim_query_knowledge:
     category_property: Category
     category_value: Electrical Fixtures
     classification_property: Family
+    classification_aliases: [socket type, outlet type, "סוג שקע", "סוג הקופסה"]
     exact_family_values: [D-20, D14AV, "D17-קופסת שקעים", EF_D11, EF_D17, EF_D18A]
     type_property: Type
     fields:
-      - {semantic_name: level, property: canonical_level, ontology_kind: level}
-      - {semantic_name: elevation_from_level, property: "Elevation from Level", data_type: number, source_unit: cm, unit: cm, conversion_factor: 1, conversion_basis: "source already uses canonical centimetres"}
+      - {semantic_name: instance_id, property: GlobalID, aliases: [GlobalID, physical instance, matching instance, "מופע", "מזהה מופע"]}
+      - {semantic_name: level, property: canonical_level, aliases: [floor, level, "קומה"], ontology_kind: level}
+      - {semantic_name: elevation_from_level, property: "Elevation from Level", aliases: [distance from floor, height above floor, "מרחק מהרצפה", "גובה מהרצפה", "מרחק אנכי מהרצפה"], data_type: number, source_unit: cm, unit: cm, conversion_factor: 1, conversion_basis: "source already uses canonical centimetres"}
       - {semantic_name: planned_default_elevation, property: "Constraints_Default Elevation"}
       - {semantic_name: description, property: "Identity Data_Description"}
-      - {semantic_name: mark, property: Mark}
+      - {semantic_name: mark, property: Mark, aliases: [instance, socket instance, mark, "מופע", "סימון"]}
     counting_unit: physical socket-box instance
     counting_unit_semantics: >-
       The governed family boundary covers the eight observed family/type combinations whose
@@ -84,11 +259,12 @@ bim_query_knowledge:
     category_value: Conduits
     classification_property: Type
     classification_semantic_name: type
+    classification_aliases: [conduit type, type, nonmetallic classification, "סוג", "סוג צינור"]
     exact_family_values: [Electrical Nonmetallic Conduit (HDPE)]
     fields:
-      - {semantic_name: diameter, property: "Outside Diameter", data_type: number, source_unit: cm, unit: mm, conversion_factor: 10, conversion_basis: "centimetres to millimetres"}
-      - {semantic_name: length, property: Length, data_type: number, source_unit: cm, unit: m, conversion_factor: 0.01, conversion_basis: "centimetres to metres"}
-      - {semantic_name: level, property: canonical_level, ontology_kind: level}
+      - {semantic_name: diameter, property: "Outside Diameter", aliases: [diameter, "קוטר"], data_type: number, source_unit: cm, unit: mm, conversion_factor: 10, conversion_basis: "centimetres to millimetres"}
+      - {semantic_name: length, property: Length, aliases: [length, total length, "אורך"], data_type: number, source_unit: cm, unit: m, conversion_factor: 0.01, conversion_basis: "centimetres to metres"}
+      - {semantic_name: level, property: canonical_level, aliases: [floor, level, "קומה"], ontology_kind: level}
     counting_unit: physical modeled conduit segment instance
     counting_unit_semantics: >-
       Count distinct GlobalID values on the exact Conduits category and HDPE type. Conduit

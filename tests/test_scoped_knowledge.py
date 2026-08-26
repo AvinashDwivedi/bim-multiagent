@@ -14,6 +14,14 @@ class ScopedKnowledgeTests(unittest.TestCase):
             ontology.bim_query_knowledge["area_plan"]["floor_plate_basis"], "BVO"
         )
         self.assertEqual(
+            ontology.bim_query_knowledge["area_plan"]["exact_family_values"],
+            ["residential_zone"],
+        )
+        self.assertEqual(
+            ontology.bim_query_knowledge["apartment_spaces"]["identity_property"],
+            "GlobalID",
+        )
+        self.assertEqual(
             ontology.bim_query_knowledge["tower_facade"]["wall_name_value"], "Klimaatgevel"
         )
         self.assertNotIn("facts", ontology.bim_query_knowledge)

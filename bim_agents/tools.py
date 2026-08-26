@@ -18,24 +18,39 @@ from .graph_contract import QueryEntity, QueryField
 from .geometry import calculate_project_geometry
 from .cypher_handler import CypherQueryHandler
 from .models import (
-    BimRunContext, BimTaskContract, CompletionGateReport, Evidence,
+    BimRunContext, BimTaskContract, CompletionGateReport, ConstraintBinding, Evidence,
     InvestigationAction, InvestigationHypothesis, InvestigationObservation, RunArtifact,
-    ProjectModelProfile,
+    ProjectModelProfile, SemanticIntent,
 )
 from .schema_mapping import (
     RegisteredSchemaMapping, SchemaFieldMapping, SchemaMappingProposal,
-    SchemaValueBinding, SchemaValueMatch,
+    SchemaRelationshipBinding, SchemaRelationshipStep, SchemaValueBinding,
+    SchemaValueMatch,
 )
 
 
 Operation = Literal[
     "count", "list", "group_count", "group_summary", "distinct",
     "count_distinct", "sum", "average", "minimum", "maximum", "maximum_group_sum",
-    "multi_group_count", "multi_group_summary", "coverage",
+    "multi_group_count", "multi_group_summary", "coverage", "relationship_coverage",
 ]
 QueryRole = Literal["exploratory", "supporting", "answer_producing", "rejected"]
 _MODEL_PROFILE_CACHE: dict[str, ProjectModelProfile] = {}
 _MODEL_PROFILE_LOCK = Lock()
+
+# Investigation phases are deliberately a small state machine.  A phase may
+# be revisited only through an explicitly listed recovery path; arbitrary
+# model-authored jumps (for example understand -> respond) are rejected.
+INVESTIGATION_PHASE_TRANSITIONS: dict[str, frozenset[str]] = {
+    "understand": frozenset({"explore", "analyze"}),
+    "explore": frozenset({"analyze"}),
+    "analyze": frozenset({"act", "verify", "blocked"}),
+    "act": frozenset({"observe"}),
+    "observe": frozenset({"analyze", "verify"}),
+    "verify": frozenset({"respond", "analyze", "blocked"}),
+    "respond": frozenset(),
+    "blocked": frozenset(),
+}
 
 
 @dataclass(frozen=True)
@@ -43,6 +58,51 @@ class PipelineContext:
     """Small compatibility wrapper used by deterministic pipeline operations."""
 
     context: BimRunContext
+
+
+def _transition_investigation_phase(notebook, target: str) -> None:
+    """Apply one governed phase transition and append it to the notebook trace."""
+    current = notebook.phase
+    if target == current:
+        return
+    allowed = INVESTIGATION_PHASE_TRANSITIONS.get(current, frozenset())
+    if target not in allowed:
+        raise ValueError(
+            f"Invalid investigation phase transition: {current} -> {target}."
+        )
+    notebook.phase = target
+    # A notebook loaded from an older serialized contract may not have a
+    # history entry; repair that harmlessly before appending the transition.
+    if not notebook.phase_history:
+        notebook.phase_history.append(current)
+    notebook.phase_history.append(target)
+
+
+def _record_observation_phase(notebook) -> None:
+    """Record the observe event, then return to analyze for the next decision.
+
+    The normal route is act -> observe -> analyze.  Older callers recorded an
+    observation directly from explore/analyze, so that event is retained as a
+    compatibility checkpoint while the notebook still returns through the
+    governed analyze state.
+    """
+    if notebook.phase == "act":
+        _transition_investigation_phase(notebook, "observe")
+    elif notebook.phase == "observe":
+        pass
+    elif notebook.phase in {"explore", "analyze"}:
+        # Observation is an event in these legacy flows rather than an
+        # actionable state transition.  Keep it visible in the audit trace.
+        if not notebook.phase_history:
+            notebook.phase_history.append(notebook.phase)
+        notebook.phase_history.append("observe")
+        notebook.phase_history.append("analyze")
+    else:
+        raise ValueError(
+            f"Invalid investigation phase transition: {notebook.phase} -> observe."
+        )
+    if notebook.phase != "analyze":
+        _transition_investigation_phase(notebook, "analyze")
 FilterOperator = Literal[
     "equals", "not_equals", "contains", "starts_with", "in",
     "greater_than", "greater_or_equal", "less_than", "less_or_equal",
@@ -57,6 +117,14 @@ class BimFilter(BaseModel):
     values: list[str] = Field(default_factory=list)
 
 
+class BimRelationshipFilter(BaseModel):
+    relationship: str = Field(
+        min_length=1,
+        description="Name of a fixed live-validated relationship binding on the active mapping.",
+    )
+    operator: Literal["exists", "is_missing"]
+
+
 class BimQueryPlan(BaseModel):
     entity: str
     mapping_id: str = ""
@@ -66,11 +134,16 @@ class BimQueryPlan(BaseModel):
         description="Deduplicate counts by the registered stable entity identity.",
     )
     filters: list[BimFilter] = Field(default_factory=list)
+    relationship_filters: list[BimRelationshipFilter] = Field(default_factory=list)
     select: list[str] = Field(default_factory=list)
     metric: str = ""
     coverage_field: str = Field(
         default="",
         description="Semantic property whose populated/missing coverage must be exhaustively measured.",
+    )
+    relationship: str = Field(
+        default="",
+        description="Registered relationship binding whose complete base-population coverage is measured.",
     )
     group_by: str = ""
     group_by_fields: list[str] = Field(
@@ -100,16 +173,80 @@ class BimQueryPlan(BaseModel):
         default_factory=list,
         description="Exact required_outputs from the task contract satisfied by this plan.",
     )
+    constraint_bindings: list[ConstraintBinding] = Field(
+        default_factory=list,
+        description="Explicit package-owned provenance for every semantic constraint.",
+    )
+    work_package_id: str = ""
+    semantic_intent: SemanticIntent = Field(
+        default_factory=SemanticIntent,
+        description="The query worker's explicit interpretation; replay verifies it against observed semantics.",
+    )
 
 
 class GeometryQueryPlan(BaseModel):
-    calculation: Literal[
-        "section_heights", "facade_opening_percentage", "tower_max_floor_area",
-    ]
+    calculation: str = Field(
+        min_length=1,
+        pattern=r"^[a-z][a-z0-9_]{0,63}$",
+        description=(
+            "Server-advertised governed calculation key. The runtime registry and active "
+            "project knowledge, never model-authored code, determine its implementation."
+        ),
+    )
     include_in_answer: bool = True
     role: QueryRole = "answer_producing"
     answer_key: str = ""
     satisfies: list[str] = Field(default_factory=list)
+    semantic_intent: SemanticIntent = Field(default_factory=SemanticIntent)
+
+
+# Compatibility name while external callers migrate from the geometry-only API.
+CalculationPlan = GeometryQueryPlan
+
+
+def _normalize_contract_semantics(contract: BimTaskContract) -> BimTaskContract:
+    """Correct mechanically impossible semantic combinations at the trust boundary.
+
+    The architect may describe an ordinary coverage output as if missing data were
+    the expected result. Coverage reports a denominator and missing count; it does
+    not imply that data must be absent. Requirements availability is different:
+    zero scoped requirement records establishes a missing requirement population.
+    """
+    normalized = contract.model_copy(deep=True)
+    requirements_outputs = {
+        output
+        for package in normalized.work_packages
+        if package.route_hint == "requirements" and not any(
+            spec.kind == "compliance" for spec in package.output_specs
+        )
+        for output in package.required_outputs
+    }
+    explicit_absence = re.compile(
+        r"(?<!\w)(?:absent|absence|missing|unpopulated|without|lack|lacks|zero)(?!\w)",
+        re.I,
+    )
+    output_specs = []
+    for output, spec in zip(
+        normalized.required_outputs, normalized.output_specs, strict=True,
+    ):
+        intent = spec.semantic_intent.model_copy(deep=True)
+        if output in requirements_outputs:
+            intent.absence_semantics = "population_missing"
+        elif (
+            spec.kind == "coverage"
+            and intent.absence_semantics != "unspecified"
+            and not explicit_absence.search(f"{normalized.goal} {output}")
+        ):
+            intent.absence_semantics = "unspecified"
+        output_specs.append(spec.model_copy(update={"semantic_intent": intent}))
+    normalized.output_specs = output_specs
+    by_output = dict(zip(normalized.required_outputs, output_specs, strict=True))
+    for package in normalized.work_packages:
+        package.output_specs = [
+            by_output[output].model_copy(deep=True)
+            for output in package.required_outputs
+        ]
+    return normalized
 
 
 def define_bim_task(
@@ -120,11 +257,12 @@ def define_bim_task(
         raise ValueError("The BIM task contract has already been defined for this run.")
     if not contract.goal.strip() or not contract.entity_concept.strip():
         raise ValueError("The task goal and entity concept cannot be blank.")
+    contract = _normalize_contract_semantics(contract)
     ctx.context.task_contract = contract
     ctx.context.notebook.goal = contract.goal
     ctx.context.notebook.required_outputs = list(contract.required_outputs)
     ctx.context.notebook.unresolved_questions = list(contract.questions_to_resolve)
-    ctx.context.notebook.phase = "explore"
+    _transition_investigation_phase(ctx.context.notebook, "explore")
     # Model-assigned complexity may increase capacity, but must never lower the
     # deployment-configured budget. A linguistically simple count can still need
     # nested schema discovery, mapping, query planning, and deterministic replay.
@@ -150,7 +288,7 @@ def register_investigation_hypothesis(
     if any(item.hypothesis_id == hypothesis.hypothesis_id for item in ctx.context.notebook.hypotheses):
         raise ValueError(f"Hypothesis {hypothesis.hypothesis_id!r} already exists.")
     ctx.context.notebook.hypotheses.append(hypothesis)
-    ctx.context.notebook.phase = "analyze"
+    _transition_investigation_phase(ctx.context.notebook, "analyze")
     return hypothesis.model_dump_json()
 
 
@@ -161,10 +299,15 @@ def record_investigation_observation(
     notebook = ctx.context.notebook
     if notebook.next_action and notebook.next_action.action_id != observation.action_id:
         raise ValueError("The observation must correspond to the currently selected action.")
+    if observation.phase != "observe":
+        raise ValueError("Investigation observations must use the observe phase.")
     known_evidence = set(ctx.context.evidence) | set(ctx.context.artifacts)
     unknown = sorted(set(observation.evidence_ids) - known_evidence)
     if unknown:
         raise ValueError("Observation references unknown evidence: " + ", ".join(unknown))
+    # Validate and apply the phase route before mutating observation or
+    # hypothesis state, so a rejected transition leaves the notebook intact.
+    _record_observation_phase(notebook)
     notebook.observations.append(observation)
     for hypothesis in notebook.hypotheses:
         if hypothesis.hypothesis_id in observation.supports_hypotheses:
@@ -178,7 +321,6 @@ def record_investigation_observation(
         notebook.unresolved_questions + observation.new_questions
     ))
     notebook.next_action = None
-    notebook.phase = "analyze"
     artifact = RunArtifact(
         artifact_id=f"observation-{len(notebook.observations)}",
         kind="investigation_observation", producer="Pipeline",
@@ -195,8 +337,11 @@ def select_investigation_action(ctx: PipelineContext, action: InvestigationActio
         raise ValueError(
             "Record an observation for the current action before selecting another action."
         )
+    _transition_investigation_phase(notebook, action.phase)
     notebook.next_action = action
-    notebook.phase = action.phase
+    if action.phase in {"respond", "blocked"}:
+        # Terminal decisions do not have a follow-up observation to record.
+        notebook.next_action = None
     artifact = RunArtifact(
         artifact_id=f"action-{action.action_id}", kind="investigation_action",
         producer="Pipeline", summary=action.objective, payload=action.model_dump(mode="json"),
@@ -208,6 +353,20 @@ def select_investigation_action(ctx: PipelineContext, action: InvestigationActio
 def inspect_completion_gates(ctx: PipelineContext) -> str:
     """Evaluate whether the investigation may respond or must continue exploring."""
     notebook = ctx.context.notebook
+    # Completion inspection is the verification event.  Route through the
+    # governed states so even a direct runtime call cannot skip to respond.
+    if notebook.phase == "understand":
+        _transition_investigation_phase(notebook, "explore")
+    if notebook.phase == "explore":
+        _transition_investigation_phase(notebook, "analyze")
+    if notebook.phase == "observe":
+        _transition_investigation_phase(notebook, "verify")
+    elif notebook.phase == "analyze":
+        _transition_investigation_phase(notebook, "verify")
+    # A verification action is completed by this gate inspection.  Clear its
+    # pending slot so a failed verification can select a correction action.
+    if notebook.phase == "verify":
+        notebook.next_action = None
     query_payloads = [
         json.loads(item.payload) for item in ctx.context.evidence.values() if item.kind == "query"
     ]
@@ -220,6 +379,20 @@ def inspect_completion_gates(ctx: PipelineContext) -> str:
     verified_checks = [check for check in checks if check.get("verified") is True]
     semantic = [item for check in verified_checks for item in check.get("semantic_checks") or []]
     passed_names = {item.get("name") for item in semantic if item.get("passed") is True}
+    adequacy_names = {
+        "entity_grain_matches", "measurement_basis_matches", "population_complete",
+        "planned_actual_distinguished", "absence_semantics_correct",
+        "projection_answers_question", "requested_outputs_present",
+    }
+    contract_has_semantic_intent = bool(
+        ctx.context.task_contract and (
+            ctx.context.task_contract.semantic_intent.is_specified
+            or any(spec.semantic_intent.is_specified for spec in ctx.context.task_contract.output_specs)
+        )
+    )
+    semantic_adequacy_verified = (
+        not contract_has_semantic_intent or adequacy_names.issubset(passed_names)
+    )
     verified_outputs = {
         str(output)
         for check in verified_checks
@@ -250,6 +423,7 @@ def inspect_completion_gates(ctx: PipelineContext) -> str:
         required_outputs_verified=not missing_outputs,
         contradictions_resolved=not contradictions,
         replay_verified=bool(verified_checks) and "replay_stability" in passed_names,
+        semantic_adequacy_verified=semantic_adequacy_verified,
         ready_to_respond=False,
         missing=(
             [f"required output: {item}" for item in missing_outputs]
@@ -260,15 +434,21 @@ def inspect_completion_gates(ctx: PipelineContext) -> str:
         report.scope_verified, report.entity_verified, report.identity_verified,
         report.classification_verified, report.units_verified,
         report.required_outputs_verified, report.contradictions_resolved, report.replay_verified,
+        report.semantic_adequacy_verified,
     ])
     for name in (
         "scope_verified", "entity_verified", "identity_verified", "classification_verified",
         "units_verified", "required_outputs_verified", "contradictions_resolved", "replay_verified",
+        "semantic_adequacy_verified",
     ):
         if not getattr(report, name) and name not in report.missing:
             report.missing.append(name)
     notebook.verified_outputs = sorted(verified_outputs)
-    notebook.phase = "respond" if report.ready_to_respond else "analyze"
+    if report.ready_to_respond:
+        if notebook.phase != "respond":
+            _transition_investigation_phase(notebook, "respond")
+    elif notebook.phase == "verify":
+        _transition_investigation_phase(notebook, "analyze")
     return report.model_dump_json()
 
 
@@ -367,7 +547,7 @@ def _catalog(ctx: BimRunContext) -> dict[str, Any]:
     common_operations = [
         "count", "count_distinct", "list", "group_count", "group_summary", "distinct",
         "sum", "average", "minimum", "maximum", "maximum_group_sum",
-        "multi_group_count", "multi_group_summary", "coverage",
+        "multi_group_count", "multi_group_summary", "coverage", "relationship_coverage",
     ]
     entities: dict[str, Any] = {}
     for name, entity in ctx.graph_contract.query_entities.items():
@@ -410,6 +590,10 @@ def _catalog(ctx: BimRunContext) -> dict[str, Any]:
                 binding.semantic_name: [match.value for match in binding.matches]
                 for binding in proposal.value_bindings
             },
+            "relationships": {
+                binding.semantic_name: binding.purpose
+                for binding in proposal.relationship_bindings
+            },
         }
     return {
         "entities": entities,
@@ -426,6 +610,9 @@ def _catalog(ctx: BimRunContext) -> dict[str, Any]:
             "list": "select fields or use the entity defaults",
             "planning": "select the entity, fields, operation, and whether record details help answer the question",
             "missing_values": "is_missing already means absent, null, or blank; do not query extra sentinel values",
+            "relationship_predicates": (
+                "relationship_filters accept only exists/is_missing on live-validated named paths"
+            ),
             "list_limit": "use the default 10 rows; the hard maximum is 20",
             "scope": "every operation is restricted to the authorized project",
         },
@@ -627,11 +814,22 @@ def build_compact_model_profile(ctx: BimRunContext) -> ProjectModelProfile:
         "contract_version": ctx.graph_contract.version,
         "schema_fingerprint": ctx.schema_fingerprint,
     }).encode("utf-8")).hexdigest()
+    cacheable = bool(ctx.schema_fingerprint)
     with _MODEL_PROFILE_LOCK:
-        cached = _MODEL_PROFILE_CACHE.get(cache_key)
+        cached = _MODEL_PROFILE_CACHE.get(cache_key) if cacheable else None
     if cached is not None:
         ctx.model_profile = cached
         return cached
+    store = ctx.knowledge_store
+    load_profile = getattr(store, "load_model_profile", None)
+    if cacheable and callable(load_profile):
+        persisted = load_profile(cache_key)
+        if isinstance(persisted, dict):
+            cached = ProjectModelProfile.model_validate(persisted)
+            with _MODEL_PROFILE_LOCK:
+                _MODEL_PROFILE_CACHE[cache_key] = cached
+            ctx.model_profile = cached
+            return cached
     structure = _project_graph_structure(ctx, sample_limit=2, include_properties=True)
     profile = ProjectModelProfile(
         profile_version=1,
@@ -659,8 +857,18 @@ def build_compact_model_profile(ctx: BimRunContext) -> ProjectModelProfile:
             "Routing cache only; answer values and absence claims require a live exhaustive query."
         ),
     )
-    with _MODEL_PROFILE_LOCK:
-        _MODEL_PROFILE_CACHE[cache_key] = profile
+    if cacheable:
+        with _MODEL_PROFILE_LOCK:
+            _MODEL_PROFILE_CACHE[cache_key] = profile
+    save_profile = getattr(store, "save_model_profile", None)
+    if cacheable and callable(save_profile):
+        save_profile(
+            cache_key=cache_key,
+            client_id=ctx.scope.client_id,
+            project_id=ctx.scope.project_id,
+            schema_fingerprint=ctx.schema_fingerprint,
+            profile=profile.model_dump(mode="json"),
+        )
     ctx.model_profile = profile
     return profile
 
@@ -736,6 +944,45 @@ def _registered_match_clause(mapping: RegisteredSchemaMapping | None, label: str
             else f"<-{relationship}-{target_node}"
         )
     return "MATCH " + "".join(parts)
+
+
+def _relationship_exists_expression(
+    mapping: RegisteredSchemaMapping, semantic_name: str,
+) -> tuple[str, list[str]]:
+    binding = next(
+        (
+            item for item in mapping.proposal.relationship_bindings
+            if item.semantic_name == semantic_name
+        ),
+        None,
+    )
+    if binding is None:
+        allowed = sorted(item.semantic_name for item in mapping.proposal.relationship_bindings)
+        raise ValueError(
+            f"Unknown relationship binding {semantic_name!r}; allowed bindings are {allowed}."
+        )
+    if binding.steps[0].from_label != mapping.proposal.label:
+        raise ValueError("A relationship binding must start at the mapped entity label.")
+    pattern = ["(n)"]
+    variables: list[str] = []
+    previous = mapping.proposal.label
+    for index, step in enumerate(binding.steps):
+        if step.from_label != previous:
+            raise ValueError("Relationship binding steps must form one contiguous path.")
+        variable = f"rb{index}"
+        variables.append(variable)
+        target = f"({variable}:`{step.to_label}`)"
+        relationship = f"[:`{step.relationship_type}`]"
+        pattern.append(
+            f"-{relationship}->{target}"
+            if step.direction == "outgoing" else f"<-{relationship}-{target}"
+        )
+        previous = step.to_label
+    scoped = " AND ".join(
+        f"{variable}.`{mapping.proposal.source_property}` IN $allowed_sources"
+        for variable in variables
+    )
+    return "EXISTS { MATCH " + "".join(pattern) + (f" WHERE {scoped}" if scoped else "") + " }", variables
 
 
 def _field(entity: QueryEntity, name: str) -> QueryField:
@@ -1135,7 +1382,7 @@ def _validate_plan(entity: QueryEntity, plan: BimQueryPlan) -> None:
     if plan.role == "rejected":
         raise ValueError("A rejected plan cannot be executed.")
     if entity.kind == "project_graph":
-        if plan.operation != "count" or plan.filters:
+        if plan.operation != "count" or plan.filters or plan.relationship_filters:
             raise ValueError("project_graph supports only an unfiltered count operation.")
         return
     for item in plan.filters:
@@ -1144,6 +1391,8 @@ def _validate_plan(entity: QueryEntity, plan: BimQueryPlan) -> None:
         if not plan.coverage_field:
             raise ValueError("coverage requires coverage_field.")
         _field(entity, plan.coverage_field)
+    if plan.operation == "relationship_coverage" and not plan.relationship:
+        raise ValueError("relationship_coverage requires relationship.")
     if plan.operation in {"group_count", "group_summary", "maximum_group_sum", "distinct", "count_distinct"}:
         if not plan.group_by:
             raise ValueError(f"{plan.operation} requires group_by.")
@@ -1181,6 +1430,13 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
     entity_name = plan.entity.replace("_", " ")
     _validate_plan(entity, plan)
     registered_mapping = ctx.schema_mappings.get(plan.mapping_id)
+    if plan.relationship_filters:
+        if not isinstance(registered_mapping, RegisteredSchemaMapping):
+            raise ValueError("Relationship predicates require a registered live mapping.")
+        for relationship_filter in plan.relationship_filters:
+            _relationship_exists_expression(
+                registered_mapping, relationship_filter.relationship
+            )
     if isinstance(registered_mapping, RegisteredSchemaMapping):
         for binding in registered_mapping.proposal.value_bindings:
             selected_values = {_normalize(match.value) for match in binding.matches}
@@ -1216,6 +1472,22 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
         clauses, parameters, normalized_filters, limitations = _compile_filters(
             ctx, entity, label, source_property, plan.filters, exact_value_fields
         )
+        if isinstance(registered_mapping, RegisteredSchemaMapping):
+            for relationship_filter in plan.relationship_filters:
+                exists_expression, _ = _relationship_exists_expression(
+                    registered_mapping, relationship_filter.relationship
+                )
+                clauses.append(
+                    exists_expression
+                    if relationship_filter.operator == "exists"
+                    else f"NOT ({exists_expression})"
+                )
+                normalized_filters.append({
+                    "field": f"relationship:{relationship_filter.relationship}",
+                    "operator": relationship_filter.operator,
+                    "values": [],
+                    "requested_values": [],
+                })
         limitations.extend(_classification_limitations(
             ctx, entity, label, source_property, normalized_filters
         ))
@@ -1226,7 +1498,49 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
         filter_text = _format_filters(normalized_filters)
         rows: list[dict[str, Any]]
         matched_count: int
-        if plan.operation == "coverage":
+        if plan.operation == "relationship_coverage":
+            if not isinstance(registered_mapping, RegisteredSchemaMapping):
+                raise ValueError("relationship_coverage requires a registered live mapping.")
+            exists_expression, _ = _relationship_exists_expression(
+                registered_mapping, plan.relationship
+            )
+            rows = cypher.execute(
+                f"{match_clause} WHERE {where} "
+                f"RETURN count(DISTINCT {identity}) AS candidate_count, "
+                f"count(DISTINCT CASE WHEN {exists_expression} THEN {identity} END) AS connected_count",
+                parameters,
+            )
+            candidate_count = int(rows[0].get("candidate_count") or 0) if rows else 0
+            connected_count = int(rows[0].get("connected_count") or 0) if rows else 0
+            missing_count = max(candidate_count - connected_count, 0)
+            matched_count = connected_count
+            claim = {
+                "statement": (
+                    f"The registered {plan.relationship.replace('_', ' ')} path exists for "
+                    f"{connected_count} of {candidate_count} project-scoped {entity_name}; "
+                    f"{missing_count} records have no such path."
+                ),
+                "value": connected_count,
+                "unit": "connected records",
+                "basis": (
+                    f"Exhaustive coverage of the live-validated {plan.relationship!r} relationship "
+                    f"binding rooted at {label}."
+                ),
+                "coverage": {
+                    "candidate_count": candidate_count,
+                    "evaluated_count": candidate_count,
+                    "matched_count": connected_count,
+                    "missing_count": missing_count,
+                    "unknown_count": 0,
+                    "excluded_count": 0,
+                    "exhaustive": True,
+                },
+                "method": "relationship_coverage",
+                "source_tags": [
+                    f"relationship:{plan.relationship}", f"{label}.{identity_property}",
+                ],
+            }
+        elif plan.operation == "coverage":
             covered = _field(entity, plan.coverage_field)
             rows = cypher.execute(
                 f"{match_clause} WHERE {where} "
@@ -1303,6 +1617,13 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
                     "details": details,
                     "total_count": matched_count,
                     "displayed_count": len(details),
+                    "coverage": {
+                        "candidate_count": matched_count, "evaluated_count": matched_count,
+                        "matched_count": matched_count, "missing_count": 0,
+                        "unknown_count": 0, "excluded_count": 0, "exhaustive": True,
+                    },
+                    "method": "count_distinct_identity",
+                    "source_tags": [f"{label}.{identity_property}"],
                 }
             else:
                 claim = {
@@ -1314,15 +1635,29 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
                     "value": None if missing_level else matched_count,
                     "unit": entity_name,
                     "basis": f"Distinct {label}.{identity_property} values in the authorized source scope.",
+                    "coverage": {
+                        "candidate_count": matched_count, "evaluated_count": matched_count,
+                        "matched_count": matched_count, "missing_count": 0,
+                        "unknown_count": 0, "excluded_count": 0, "exhaustive": True,
+                    },
+                    "method": "count_distinct_identity",
+                    "source_tags": [f"{label}.{identity_property}"],
                 }
         elif plan.operation == "count_distinct":
             group = _field(entity, plan.group_by)
             rows = cypher.execute(
                 f"{match_clause} WHERE {where} AND n.`{group.property}` IS NOT NULL "
-                f"RETURN count(DISTINCT n.`{group.property}`) AS count",
+                f"RETURN count(DISTINCT n.`{group.property}`) AS count, "
+                f"count(DISTINCT {identity}) AS populated_records",
                 parameters,
             )
             matched_count = int(rows[0].get("count") or 0) if rows else 0
+            populated_records = int(rows[0].get("populated_records") or 0) if rows else 0
+            candidate_rows = cypher.execute(
+                f"{match_clause} WHERE {where} RETURN count(DISTINCT {identity}) AS count",
+                parameters,
+            )
+            candidate_count = int(candidate_rows[0].get("count") or 0) if candidate_rows else 0
             level_filter = next(
                 (item for item in normalized_filters if item["field"] == "level"), None
             )
@@ -1344,6 +1679,14 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
                 "value": matched_count,
                 "unit": unit,
                 "basis": f"Distinct populated {label}.{group.property} values in the authorized source scope.",
+                "coverage": {
+                    "candidate_count": candidate_count, "evaluated_count": candidate_count,
+                    "matched_count": populated_records,
+                    "missing_count": max(candidate_count - populated_records, 0),
+                    "unknown_count": 0, "excluded_count": 0, "exhaustive": True,
+                },
+                "method": "count_distinct_property",
+                "source_tags": [f"{label}.{group.property}", f"{label}.{identity_property}"],
             }
         elif plan.operation == "list":
             selected = plan.select or entity.default_select
@@ -1388,6 +1731,16 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
                 "details": details,
                 "total_count": matched_count,
                 "displayed_count": len(details),
+                "coverage": {
+                    "candidate_count": matched_count, "evaluated_count": matched_count,
+                    "matched_count": matched_count, "missing_count": 0,
+                    "unknown_count": 0, "excluded_count": 0, "exhaustive": True,
+                },
+                "method": "bounded_list_over_complete_population",
+                "source_tags": [
+                    f"{label}.{identity_property}",
+                    *(f"{label}.{_field(entity, name).property}" for name in selected),
+                ],
             }
         elif plan.operation in {"multi_group_count", "multi_group_summary"}:
             groups = [_field(entity, name) for name in plan.group_by_fields]
@@ -1421,12 +1774,20 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
             count_rows = cypher.execute(
                 f"{match_clause} WHERE {where} "
                 f"RETURN count(DISTINCT {identity}) AS total_records"
-                + (f", count(n.`{metric.property}`) AS metric_records" if metric else ""),
+                + (
+                    f", count(n.`{metric.property}`) AS metric_records, "
+                    f"sum(toFloat(n.`{metric.property}`) * "
+                    f"{metric.conversion_factor!r}) AS metric_total"
+                    if metric else ""
+                ),
                 parameters,
             )
             matched_count = int(count_rows[0].get("total_records") or 0) if count_rows else 0
             total_metric_records = (
                 int(count_rows[0].get("metric_records") or 0) if count_rows and metric else 0
+            )
+            total_metric_value = (
+                count_rows[0].get("metric_total") if count_rows and metric else None
             )
             details = []
             populated_metric_records = 0
@@ -1454,7 +1815,13 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
             statement = (
                 f"Grouped {matched_count} project-scoped {entity_name} by "
                 + ", ".join(name.replace("_", " ") for name in plan.group_by_fields)
-                + (f" with summed {plan.metric.replace('_', ' ')}." if metric else ".")
+                + (
+                    f" with total summed {plan.metric.replace('_', ' ')} "
+                    f"{_display_number(total_metric_value)} {metric.unit or plan.metric}."
+                    if metric and total_metric_value is not None else
+                    f" with summed {plan.metric.replace('_', ' ')}."
+                    if metric else "."
+                )
             )
             claim = {
                 "statement": statement,
@@ -1477,7 +1844,10 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
                     "unknown_count": 0, "excluded_count": 0, "exhaustive": True,
                 }
                 claim["measurement"] = {
-                    "source_value": None,
+                    "source_value": (
+                        total_metric_value / metric.conversion_factor
+                        if isinstance(total_metric_value, (int, float)) else None
+                    ),
                     "source_unit": metric.source_unit or metric.unit,
                     "canonical_unit": metric.unit,
                     "conversion_factor": metric.conversion_factor,
@@ -1583,9 +1953,20 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
             }
         elif plan.operation in {"group_count", "distinct"}:
             group = _field(entity, plan.group_by)
+            numeric_distinct = plan.operation == "distinct" and group.data_type == "number"
+            group_expression = (
+                f"toFloat(n.`{group.property}`)" if numeric_distinct
+                else f"n.`{group.property}`"
+            )
+            candidate_rows = cypher.execute(
+                f"{match_clause} WHERE {where} "
+                f"RETURN count(DISTINCT {identity}) AS candidate_count",
+                parameters,
+            )
+            candidate_count = int(candidate_rows[0].get("candidate_count") or 0) if candidate_rows else 0
             totals = cypher.execute(
-                f"{match_clause} WHERE {where} AND n.`{group.property}` IS NOT NULL "
-                f"RETURN count(DISTINCT n.`{group.property}`) AS total_groups, "
+                f"{match_clause} WHERE {where} AND {group_expression} IS NOT NULL "
+                f"RETURN count(DISTINCT {group_expression}) AS total_groups, "
                 f"count(DISTINCT {identity}) AS total_records",
                 parameters,
             )
@@ -1593,26 +1974,81 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
             total_records = int(totals[0].get("total_records") or 0) if totals else 0
             parameters["limit"] = plan.limit
             rows = cypher.execute(
-                f"{match_clause} WHERE {where} AND n.`{group.property}` IS NOT NULL "
-                f"RETURN n.`{group.property}` AS value, count(DISTINCT {identity}) AS count "
+                f"{match_clause} WHERE {where} AND {group_expression} IS NOT NULL "
+                f"RETURN {group_expression} AS value, count(DISTINCT {identity}) AS count "
                 "ORDER BY count DESC, value LIMIT $limit",
                 parameters,
             )
             matched_count = total_records
-            details = [f"{row.get('value')}: {row.get('count')}" for row in rows]
+            if numeric_distinct:
+                details = [
+                    f"{_display_number(float(row.get('value')) * group.conversion_factor)}"
+                    f"{f' {group.unit}' if group.unit else ''}: {row.get('count')} records"
+                    for row in rows
+                    if row.get("value") is not None
+                ]
+            else:
+                details = [f"{row.get('value')}: {row.get('count')}" for row in rows]
             noun = "Distinct values" if plan.operation == "distinct" else "Counts"
+            property_missing = candidate_count > 0 and total_records == 0
+            if property_missing:
+                limitations.append(
+                    f"Matching {entity_name} exist, but {plan.group_by.replace('_', ' ')} is "
+                    "unpopulated; this is missing data, not a zero or an empty entity population."
+                )
+            distinct_values_text = ", ".join(
+                detail.split(":", 1)[0] for detail in details
+            )
             claim = {
                 "statement": (
-                    f"{noun} for project-scoped {entity_name} by {plan.group_by.replace('_', ' ')}: "
-                    f"{total_groups} groups covering {matched_count} records."
+                    f"{candidate_count} project-scoped {entity_name} exist, but "
+                    f"{plan.group_by.replace('_', ' ')} is unpopulated."
+                    if property_missing else
+                    (
+                        f"Distinct modeled {plan.group_by.replace('_', ' ')} values for "
+                        f"project-scoped {entity_name}: {distinct_values_text}."
+                        if numeric_distinct else
+                        f"{noun} for project-scoped {entity_name} by {plan.group_by.replace('_', ' ')}: "
+                        f"{total_groups} groups covering {matched_count} records."
+                    )
                 ),
-                "value": total_groups if plan.operation == "distinct" else matched_count,
-                "unit": "distinct values" if plan.operation == "distinct" else entity_name,
-                "basis": f"Grouped distinct {label}.{identity_property} values in the authorized source scope.",
+                "value": None if property_missing else total_groups if plan.operation == "distinct" else matched_count,
+                "unit": (
+                    group.unit if numeric_distinct else
+                    "distinct values" if plan.operation == "distinct" else entity_name
+                ),
+                "basis": (
+                    f"Distinct populated {label}.{group.property} values, with counts of distinct "
+                    f"{label}.{identity_property} records, in the authorized source scope."
+                    if plan.operation == "distinct" else
+                    f"Grouped distinct {label}.{identity_property} values in the authorized source scope."
+                ),
                 "details": details,
                 "total_count": total_groups,
                 "displayed_count": len(details),
+                "coverage": {
+                    "candidate_count": candidate_count,
+                    "evaluated_count": candidate_count,
+                    "matched_count": total_records,
+                    "missing_count": max(candidate_count - total_records, 0),
+                    "unknown_count": 0,
+                    "excluded_count": 0,
+                    "exhaustive": True,
+                },
             }
+            if numeric_distinct:
+                claim["measurement"] = {
+                    "source_value": None,
+                    "source_unit": group.source_unit or group.unit,
+                    "canonical_unit": group.unit,
+                    "conversion_factor": group.conversion_factor,
+                    "conversion_basis": group.conversion_basis,
+                    "source_property": f"{label}.{group.property}",
+                }
+                claim["method"] = "distinct_numeric_property_values"
+                claim["source_tags"] = [
+                    f"{label}.{group.property}", f"{label}.{identity_property}",
+                ]
         else:
             metric = _field(entity, plan.metric)
             function_name = {
@@ -1669,6 +2105,17 @@ def _execute_plan(ctx: BimRunContext, plan: BimQueryPlan) -> dict[str, Any]:
     claim_payload.setdefault("method", plan.operation)
     claim_payload.setdefault("answer_key", plan.answer_key)
     claim_payload.setdefault("satisfies", list(plan.satisfies))
+    # Package ownership is part of the replayed claim digest.  A query is usually
+    # executed in an isolated branch and replayed after that branch has been merged
+    # into the root context, so the ambient context workstream is not stable.  The
+    # plan is the immutable execution contract and must remain authoritative here.
+    claim_payload.setdefault(
+        "work_package_id", plan.work_package_id or ctx.workstream_id,
+    )
+    claim_payload.setdefault(
+        "constraint_bindings",
+        [item.model_dump(mode="json") for item in plan.constraint_bindings],
+    )
     plausibility_flags: list[dict[str, Any]] = list(claim_payload.get("plausibility_flags") or [])
     claim_value = claim_payload.get("value")
     claim_unit = str(claim_payload.get("unit") or "").casefold()
@@ -1723,7 +2170,8 @@ def get_project_knowledge_catalog(ctx: PipelineContext) -> str:
 _CONSTRAINT_FIELD_ALIASES = {
     "floor": "level", "storey": "level", "story": "level", "level": "level",
     "function": "type", "usage": "type", "classification": "type", "category": "type",
-    "kind": "type", "segment": "segment", "sector": "segment", "material": "material",
+    "kind": "type", "type": "type", "segment": "segment", "sector": "segment",
+    "material": "material",
     "height": "height", "width": "width", "area": "area", "diameter": "diameter",
 }
 
@@ -1734,6 +2182,27 @@ def _constraint_field(concept: str) -> str:
         if token in _CONSTRAINT_FIELD_ALIASES:
             return _CONSTRAINT_FIELD_ALIASES[token]
     return _normalize(concept).replace(" ", "_")
+
+
+def _measurement_dimension(value: str) -> str:
+    """Reduce human and schema metric names to a conservative physical dimension."""
+    normalized = _normalize(value).replace("_", " ")
+    dimension_terms = {
+        "area": ("area", "square metre", "square meter", "sqm", "m2", "m²"),
+        # Length, height, distance, elevation, width, and diameter are all the
+        # same physical dimension.  Their measurement *basis* remains separately
+        # governed by the field mapping and output contract.
+        "length": (
+            "length", "distance", "height", "elevation", "width", "diameter",
+            "metre", "meter", "millimetre", "millimeter", "centimetre", "centimeter",
+        ),
+        "volume": ("volume", "cubic metre", "cubic meter", "m3", "m³"),
+    }
+    matches = [
+        dimension for dimension, terms in dimension_terms.items()
+        if any(re.search(rf"(?<!\w){re.escape(term)}(?!\w)", normalized) for term in terms)
+    ]
+    return matches[0] if len(set(matches)) == 1 else ""
 
 
 def _is_authorized_container_constraint(concept: str, requested_value: str) -> bool:
@@ -1770,15 +2239,78 @@ def _plan_constraint_coverage(
         return True, []
     if contract is None or not contract.constraints:
         return True, []
+    constraints = list(contract.constraints)
+    package_id = plan.work_package_id or context.workstream_id
+    package = next(
+        (item for item in contract.work_packages if item.package_id == package_id), None
+    )
+    if package is not None:
+        if package.constraints is not None:
+            constraints = list(package.constraints)
+        elif len(contract.work_packages) > 1:
+            package_text = " ".join([
+                package.objective, *package.required_outputs,
+            ]).casefold()
+            constraints = [
+                item for item in contract.constraints
+                if item.concept.casefold().strip() in package_text
+                or item.requested_value.casefold().strip() in package_text
+            ]
     registered = context.schema_mappings.get(plan.mapping_id)
     missing: list[str] = []
-    for constraint in contract.constraints:
+    for constraint in constraints:
         if _is_authorized_container_constraint(
             constraint.concept, constraint.requested_value
         ):
             # Source authorization is injected by the compiler and verified as
             # its own semantic check; it is intentionally not a model field.
             continue
+        explicit = next(
+            (
+                item for item in plan.constraint_bindings
+                if _normalize(item.concept) == _normalize(constraint.concept)
+                and _normalize(item.requested_value) == _normalize(constraint.requested_value)
+                and (not item.package_id or item.package_id == package_id)
+            ),
+            None,
+        )
+        if explicit is not None:
+            binding_valid = (
+                not explicit.mapping_id or explicit.mapping_id == plan.mapping_id
+            )
+            if explicit.applied_as in {"filter", "entity_boundary"}:
+                matching_filters = [
+                    item for item in plan.filters if item.field == explicit.semantic_field
+                ]
+                supplied = {
+                    _normalize(value)
+                    for item in matching_filters
+                    for value in _raw_filter_values(item)
+                }
+                expected = {_normalize(value) for value in explicit.exact_values}
+                expected_operator = (
+                    "in" if explicit.operator == "equals" and len(expected) > 1
+                    else explicit.operator
+                )
+                binding_valid = (
+                    binding_valid
+                    and bool(expected)
+                    and expected.issubset(supplied)
+                    and any(item.operator == expected_operator for item in matching_filters)
+                )
+            elif explicit.applied_as == "grouping":
+                binding_valid = binding_valid and explicit.semantic_field in {
+                    plan.group_by, *plan.group_by_fields,
+                }
+            elif explicit.applied_as == "metric":
+                binding_valid = binding_valid and explicit.semantic_field == plan.metric
+            elif explicit.applied_as == "relationship":
+                binding_valid = binding_valid and any(
+                    item.relationship == explicit.semantic_field
+                    for item in plan.relationship_filters
+                )
+            if binding_valid:
+                continue
         target_field = _constraint_field(constraint.concept)
         requested = _normalize(constraint.requested_value)
         grouping_fields = {
@@ -1834,6 +2366,11 @@ def _validate_answer_metadata(ctx: PipelineContext, plan: Any) -> None:
     if role == "answer_producing" and not str(getattr(plan, "answer_key", "")).strip():
         raise ValueError("An answer-producing plan requires a stable answer_key.")
     satisfies = set(getattr(plan, "satisfies", []) or [])
+    if role == "supporting" and not satisfies:
+        # A related-population probe is intentionally unable to satisfy the
+        # direct output. It may omit unresolved task constraints only because
+        # the evidence role prevents promotion to an answer claim.
+        return
     if not satisfies:
         raise ValueError("An evidentiary plan must declare which required_outputs it satisfies.")
     unknown = sorted(satisfies - required_outputs)
@@ -1841,6 +2378,28 @@ def _validate_answer_metadata(ctx: PipelineContext, plan: Any) -> None:
         raise ValueError(
             "Plan satisfies values must exactly match the task contract: " + ", ".join(unknown)
         )
+    specs_by_output = dict(zip(
+        ctx.context.task_contract.required_outputs,
+        ctx.context.task_contract.output_specs or [],
+        strict=True,
+    ))
+    if isinstance(plan, GeometryQueryPlan) and role == "answer_producing":
+        configs = [
+            item for item in ctx.context.bim.ontology.bim_query_knowledge.values()
+            if isinstance(item, dict) and item.get("calculation") == plan.calculation
+        ]
+        if len(configs) > 1:
+            raise ValueError(f"Calculation {plan.calculation!r} is ambiguously configured.")
+        allowed_kinds = set(configs[0].get("output_kinds") or []) if configs else set()
+        incompatible = sorted(
+            spec.key for output, spec in specs_by_output.items()
+            if output in satisfies and allowed_kinds and spec.kind not in allowed_kinds
+        )
+        if incompatible:
+            raise ValueError(
+                f"Calculation {plan.calculation!r} cannot satisfy typed outputs: "
+                + ", ".join(incompatible)
+            )
     if isinstance(plan, BimQueryPlan):
         covered, missing_constraints = _plan_constraint_coverage(ctx.context, plan)
         if not covered:
@@ -1849,6 +2408,106 @@ def _validate_answer_metadata(ctx: PipelineContext, plan: Any) -> None:
                 + ", ".join(missing_constraints)
             )
         if role == "answer_producing":
+            specs = [specs_by_output[output] for output in satisfies]
+            numeric_operations = {
+                "sum", "average", "minimum", "maximum", "maximum_group_sum",
+                "group_summary", "multi_group_summary",
+            }
+            for spec in specs:
+                if spec.kind == "measurement" and (
+                    plan.operation not in numeric_operations or not plan.metric
+                ):
+                    raise ValueError(
+                        f"Output {spec.key!r} requires a numeric aggregate and metric."
+                    )
+                if spec.kind == "grouped_summary" and plan.operation not in {
+                    "group_count", "group_summary", "multi_group_count", "multi_group_summary",
+                }:
+                    raise ValueError(f"Output {spec.key!r} requires a grouped operation.")
+                if spec.kind == "coverage" and plan.operation != "coverage":
+                    raise ValueError(f"Output {spec.key!r} requires the coverage operation.")
+                if spec.kind == "relationship_coverage" and plan.operation != "relationship_coverage":
+                    raise ValueError(
+                        f"Output {spec.key!r} requires relationship_coverage."
+                    )
+                actual_dimensions = {
+                    *([plan.group_by] if plan.group_by else []), *plan.group_by_fields,
+                }
+                registered_mapping = ctx.context.schema_mappings.get(plan.mapping_id)
+                field_aliases = {
+                    field.semantic_name: [
+                        field.semantic_name, field.property, *field.aliases,
+                    ]
+                    for field in (
+                        registered_mapping.proposal.fields
+                        if isinstance(registered_mapping, RegisteredSchemaMapping) else []
+                    )
+                }
+                missing_dimensions = {
+                    dimension for dimension in spec.grouping_dimensions
+                    if not any(
+                        _normalize(dimension).replace("_", " ")
+                        == _normalize(term).replace("_", " ")
+                        or re.search(
+                            rf"(?<!\w){re.escape(_normalize(term).replace('_', ' '))}(?!\w)",
+                            _normalize(dimension).replace("_", " "),
+                            flags=re.UNICODE,
+                        ) is not None
+                        or _constraint_field(dimension) == _constraint_field(actual)
+                        for actual in actual_dimensions
+                        for term in field_aliases.get(actual, [actual])
+                    )
+                }
+                if missing_dimensions:
+                    raise ValueError(
+                        f"Output {spec.key!r} omits grouping dimensions: "
+                        + ", ".join(sorted(missing_dimensions))
+                    )
+                if spec.metric and spec.kind in {"measurement", "grouped_summary"}:
+                    normalized_metric = _normalize(spec.metric).replace(" ", "_")
+                    entity = _entity_from_registered_mapping(ctx.context, plan)[0]
+                    planned_field = _field(entity, plan.metric) if plan.metric else None
+                    actual_metric_names = {
+                        _normalize(plan.metric).replace(" ", "_"),
+                        _normalize(planned_field.property).replace(" ", "_")
+                        if planned_field else "",
+                        *(
+                            _normalize(alias).replace(" ", "_")
+                            for alias in (
+                                next(
+                                    (
+                                        field.aliases
+                                        for field in registered_mapping.proposal.fields
+                                        if field.semantic_name == plan.metric
+                                    ),
+                                    [],
+                                )
+                                if isinstance(registered_mapping, RegisteredSchemaMapping)
+                                else []
+                            )
+                        ),
+                    }
+                    required_dimension = _measurement_dimension(spec.metric)
+                    actual_dimension = _measurement_dimension(" ".join(actual_metric_names))
+                    dimension_compatible = bool(
+                        required_dimension and required_dimension == actual_dimension
+                    )
+                    alias_compatible = any(
+                        name and re.search(
+                            rf"(?<!\w){re.escape(name.replace('_', ' '))}(?!\w)",
+                            normalized_metric.replace("_", " "),
+                            flags=re.UNICODE,
+                        ) is not None
+                        for name in actual_metric_names
+                    )
+                    if plan.metric and (
+                        normalized_metric not in actual_metric_names
+                        and not dimension_compatible
+                        and not alias_compatible
+                    ):
+                        raise ValueError(
+                            f"Output {spec.key!r} requires metric {spec.metric!r}."
+                        )
             output_text = " ".join(satisfies).casefold()
             measurement_requested = any(
                 re.search(pattern, output_text)
@@ -1858,10 +2517,6 @@ def _validate_answer_metadata(ctx: PipelineContext, plan: Any) -> None:
                     r"\b(total|sum|maximum|minimum|average)\s+(area|length|height|distance|volume)",
                 )
             )
-            numeric_operations = {
-                "sum", "average", "minimum", "maximum", "maximum_group_sum",
-                "group_summary", "multi_group_summary",
-            }
             if measurement_requested and (
                 plan.operation not in numeric_operations or not plan.metric
             ):
@@ -1871,8 +2526,9 @@ def _validate_answer_metadata(ctx: PipelineContext, plan: Any) -> None:
 
 
 def query_project_geometry(ctx: PipelineContext, plan: GeometryQueryPlan) -> str:
-    """Run one named, scoped Revit-geometry derivation as auditable evidence."""
+    """Run one named, scoped project calculation as auditable evidence."""
     _validate_answer_metadata(ctx, plan)
+    _validate_governed_calculation_schema(ctx.context, plan.calculation)
     report = calculate_project_geometry(
         plan.calculation, ctx.context.bim, ctx.context.scope.allowed_sources,
         ctx.context.bim.ontology.bim_query_knowledge,
@@ -1885,7 +2541,7 @@ def query_project_geometry(ctx: PipelineContext, plan: GeometryQueryPlan) -> str
     result = {
         **stable, "rows": [{"calculation": plan.calculation, "value": claim.get("value")}],
         "matched_count": 1, "limitations": report.limitations,
-        "capability": "project_geometry",
+        "capability": "project_calculation",
         "result_digest": hashlib.sha256(
             json.dumps(stable, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
         ).hexdigest(),
@@ -1899,6 +2555,119 @@ def query_project_geometry(ctx: PipelineContext, plan: GeometryQueryPlan) -> str
         summary=claim["statement"], payload={"evidence_id": evidence_id, **result},
     ))
     return _json({"evidence_id": evidence_id, **result})
+
+
+def _validate_governed_calculation_schema(context: BimRunContext, calculation: str) -> None:
+    """Fail closed when a governed recipe references a stale label/property surface."""
+    configs = [
+        item for item in context.bim.ontology.bim_query_knowledge.values()
+        if isinstance(item, dict) and item.get("calculation") == calculation
+    ]
+    if not configs or not configs[0].get("recipe"):
+        return
+    if len(configs) != 1:
+        raise ValueError(f"Calculation {calculation!r} is ambiguously configured.")
+    config = configs[0]
+    required: dict[str, set[str]] = {}
+    required_relationships: list[tuple[str, str, str, str]] = []
+    if config.get("recipe") == "composite_grouped_count":
+        entities = config.get("components") or []
+        for item in entities:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "")
+            required.setdefault(label, set()).update({
+                str(item.get("identity_property") or ""),
+                str(item.get("source_property") or "source"),
+                str(item.get("group_property") or ""),
+                *(str(value) for value in item.get("group_fallback_properties") or []),
+                *(str(value.get("property") or "") for value in item.get("filters") or []),
+            })
+            relationship = item.get("group_relationship") or {}
+            if isinstance(relationship, dict) and relationship:
+                target_label = str(relationship.get("target_label") or "")
+                # Composite grouping compiles this as OPTIONAL MATCH and retains a
+                # governed direct/fallback-property path. An ingest that omits the
+                # relationship surface must therefore yield an explicit unassigned
+                # bucket, not fail the entire workstream before producing evidence.
+                # A future calculation may opt into a mandatory topology surface.
+                if relationship.get("required") is True:
+                    required.setdefault(target_label, set()).update({
+                        str(item.get("source_property") or "source"),
+                        str(relationship.get("target_property") or ""),
+                    })
+                    required_relationships.append((
+                        label,
+                        str(relationship.get("relationship_type") or ""),
+                        target_label,
+                        str(relationship.get("direction") or "either"),
+                    ))
+    elif config.get("recipe") == "scope_comparison":
+        item = config.get("entity") or {}
+        if isinstance(item, dict):
+            label = str(item.get("label") or "")
+            all_filters = [
+                *(item.get("filters") or []),
+                *(
+                    value
+                    for scope in config.get("scopes") or []
+                    if isinstance(scope, dict)
+                    for value in scope.get("filters") or []
+                ),
+            ]
+            required.setdefault(label, set()).update({
+                str(item.get("identity_property") or ""),
+                str(item.get("source_property") or "source"),
+                *(str(value.get("property") or "") for value in all_filters),
+            })
+    elif config.get("recipe") == "property_coverage":
+        item = config.get("entity") or {}
+        if isinstance(item, dict):
+            label = str(item.get("label") or "")
+            required.setdefault(label, set()).update({
+                str(item.get("identity_property") or ""),
+                str(item.get("source_property") or "source"),
+                str(config.get("property") or ""),
+                *(str(value.get("property") or "") for value in item.get("filters") or []),
+            })
+    else:
+        return  # The computation registry will reject unrecognized recipe kinds.
+    profile = build_compact_model_profile(context)
+    for label, properties in required.items():
+        observed = {
+            prop
+            for signature in profile.node_types
+            if label in signature.labels
+            for prop in signature.properties
+        }
+        if not observed:
+            raise ValueError(f"Governed calculation label {label!r} is absent from the live model.")
+        missing = sorted((properties - {""}) - observed)
+        if missing:
+            raise ValueError(
+                f"Governed calculation {calculation!r} references stale properties on "
+                f"{label!r}: {missing}."
+            )
+    for from_label, relationship_type, to_label, direction in required_relationships:
+        observed = any(
+            item.type == relationship_type
+            and (
+                from_label in item.from_labels and to_label in item.to_labels
+                if direction == "outgoing" else
+                from_label in item.to_labels and to_label in item.from_labels
+                if direction == "incoming" else
+                (
+                    from_label in item.from_labels and to_label in item.to_labels
+                    or from_label in item.to_labels and to_label in item.from_labels
+                )
+            )
+            for item in profile.relationship_types
+        )
+        if not observed:
+            raise ValueError(
+                f"Governed calculation {calculation!r} references a stale relationship "
+                f"{from_label!r} {relationship_type!r} {to_label!r}."
+            )
 
 
 def inspect_project_graph_structure(
@@ -2630,6 +3399,36 @@ def register_schema_mapping(
             previous_label = step.to_label
         if previous_label != proposal.label:
             raise ValueError("The relationship path must end at the mapped entity label.")
+    relationship_names = [item.semantic_name for item in proposal.relationship_bindings]
+    if len(relationship_names) != len(set(relationship_names)):
+        raise ValueError("Relationship binding names must be unique.")
+    patterns = structure.get("relationship_types") or []
+    for binding in proposal.relationship_bindings:
+        previous_label = proposal.label
+        for step in binding.steps:
+            if any(
+                re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", identifier) is None
+                for identifier in (step.from_label, step.relationship_type, step.to_label)
+            ):
+                raise ValueError("Relationship bindings contain an unsafe identifier.")
+            if step.from_label != previous_label:
+                raise ValueError("A relationship binding must be rooted at the mapped entity and contiguous.")
+            observed = any(
+                step.relationship_type == item.get("type")
+                and (
+                    step.from_label in (item.get("from_labels") or [])
+                    and step.to_label in (item.get("to_labels") or [])
+                    if step.direction == "outgoing" else
+                    step.from_label in (item.get("to_labels") or [])
+                    and step.to_label in (item.get("from_labels") or [])
+                )
+                for item in patterns
+            )
+            if not observed:
+                raise ValueError(
+                    f"Relationship binding {binding.semantic_name!r} contains an unobserved step."
+                )
+            previous_label = step.to_label
     observed = set(node_type["properties"])
     required = {
         proposal.identity_property,
@@ -2824,10 +3623,24 @@ def activate_project_knowledge_mapping(ctx: PipelineContext, knowledge_key: str)
         not isinstance(item, dict) for item in configured_fields
     ):
         raise ValueError("Governed mapping fields must be a list of field definitions.")
+    configured_relationships = knowledge.get("relationship_bindings") or []
+    if not isinstance(configured_relationships, list) or any(
+        not isinstance(item, dict) for item in configured_relationships
+    ):
+        raise ValueError("Governed relationship bindings must be a list of definitions.")
     exact_values = [str(value) for value in knowledge["exact_family_values"] if str(value)]
     identifiers = [label, source_property, identity_property, classification_property]
     identifiers.extend(value for value in (type_property, category_property) if value)
     identifiers.extend(str(item.get("property") or "") for item in configured_fields)
+    identifiers.extend(
+        str(value or "")
+        for binding in configured_relationships
+        for step in (binding.get("steps") or [])
+        if isinstance(step, dict)
+        for value in (
+            step.get("from_label"), step.get("relationship_type"), step.get("to_label"),
+        )
+    )
     if any("`" in value or any(ord(character) < 32 for character in value) for value in identifiers):
         raise ValueError("The governed project mapping contains unsafe identifiers.")
     if source_property != ctx.context.graph_contract.authorization_path.source_property:
@@ -2888,6 +3701,7 @@ def activate_project_knowledge_mapping(ctx: PipelineContext, knowledge_key: str)
     )
     fields.append(SchemaFieldMapping(
         semantic_name=classification_semantic_name, property=classification_property,
+        aliases=[str(value) for value in knowledge.get("classification_aliases") or []],
         ontology_kind="canonical_type",
     ))
     if type_property:
@@ -2906,6 +3720,7 @@ def activate_project_knowledge_mapping(ctx: PipelineContext, knowledge_key: str)
         fields.append(SchemaFieldMapping(
             semantic_name=semantic_name,
             property=property_name,
+            aliases=[str(value) for value in item.get("aliases") or []],
             data_type=str(item.get("data_type") or "string"),
             unit=str(item.get("unit")) if item.get("unit") is not None else None,
             source_unit=(
@@ -2925,12 +3740,66 @@ def activate_project_knowledge_mapping(ctx: PipelineContext, knowledge_key: str)
             user_concept=f"{knowledge['entity_concept']} category",
             matches=[SchemaValueMatch(value=category_value, similarity=1.0)],
         ))
+    governed_boundary_terms = list(dict.fromkeys(
+        str(value).strip()
+        for value in [
+            knowledge["entity_concept"],
+            *(knowledge.get("aliases") or []),
+            *(knowledge.get("retrieval_terms") or []),
+        ]
+        if str(value).strip()
+    ))
     value_bindings.append(SchemaValueBinding(
         semantic_name=classification_semantic_name,
         property=classification_property,
-        user_concept=str(knowledge["entity_concept"]),
+        # Retain multilingual/domain aliases in the governed boundary so package
+        # constraints can be bound without relying on English-only token overlap.
+        user_concept=" | ".join(governed_boundary_terms),
         matches=[SchemaValueMatch(value=value, similarity=1.0) for value in exact_values],
     ))
+    relationship_bindings: list[SchemaRelationshipBinding] = []
+    relationship_names: set[str] = set()
+    structure = ctx.context.schema_discovery.get("project_graph_structure")
+    if configured_relationships and not isinstance(structure, dict):
+        structure = _project_graph_structure(ctx.context, include_properties=False)
+        ctx.context.schema_discovery["project_graph_structure"] = structure
+    observed_patterns = (structure or {}).get("relationship_types") or []
+    for item in configured_relationships:
+        semantic_name = str(item.get("semantic_name") or "")
+        if not semantic_name or semantic_name in relationship_names:
+            raise ValueError("Governed relationship binding names must be nonblank and unique.")
+        raw_steps = item.get("steps") or []
+        if not isinstance(raw_steps, list) or not raw_steps:
+            raise ValueError(f"Relationship binding {semantic_name!r} requires at least one step.")
+        steps = [SchemaRelationshipStep.model_validate(step) for step in raw_steps]
+        previous_label = label
+        for step in steps:
+            if step.from_label != previous_label:
+                raise ValueError(
+                    f"Relationship binding {semantic_name!r} must be rooted at {label!r} and contiguous."
+                )
+            observed_step = any(
+                step.relationship_type == pattern.get("type")
+                and (
+                    step.from_label in (pattern.get("from_labels") or [])
+                    and step.to_label in (pattern.get("to_labels") or [])
+                    if step.direction == "outgoing" else
+                    step.from_label in (pattern.get("to_labels") or [])
+                    and step.to_label in (pattern.get("from_labels") or [])
+                )
+                for pattern in observed_patterns
+            )
+            if not observed_step:
+                raise ValueError(
+                    f"Governed relationship binding {semantic_name!r} changed in the live graph."
+                )
+            previous_label = step.to_label
+        relationship_bindings.append(SchemaRelationshipBinding(
+            semantic_name=semantic_name,
+            steps=steps,
+            purpose=str(item.get("purpose") or "governed relationship evidence"),
+        ))
+        relationship_names.add(semantic_name)
     proposal = SchemaMappingProposal(
         entity_name=str(knowledge["entity_concept"]).replace(" ", "_"),
         label=label,
@@ -2938,6 +3807,7 @@ def activate_project_knowledge_mapping(ctx: PipelineContext, knowledge_key: str)
         source_property=source_property,
         fields=fields,
         value_bindings=value_bindings,
+        relationship_bindings=relationship_bindings,
         counting_unit=str(knowledge["counting_unit"]),
         counting_unit_evidence=str(knowledge["counting_unit_semantics"]),
         reasoning_summary=(
@@ -2965,10 +3835,67 @@ def activate_project_knowledge_mapping(ctx: PipelineContext, knowledge_key: str)
     return registered.model_dump_json()
 
 
+def _query_plan_cache_key(context: BimRunContext, plan: BimQueryPlan) -> str:
+    """Identify one exact executable plan within an immutable run scope."""
+    mapping = context.schema_mappings.get(plan.mapping_id)
+    mapping_payload = (
+        mapping.model_dump(mode="json")
+        if isinstance(mapping, RegisteredSchemaMapping)
+        else None
+    )
+    stable = {
+        "plan": plan.model_dump(mode="json", exclude_none=False),
+        "scope": {
+            "client_id": context.scope.client_id,
+            "project_id": context.scope.project_id,
+            "allowed_sources": sorted(set(context.scope.allowed_sources)),
+        },
+        "mapping": mapping_payload,
+        "schema_fingerprint": context.schema_fingerprint,
+        "graph_contract_version": context.graph_contract.version,
+    }
+    return hashlib.sha256(
+        json.dumps(stable, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _enforce_specialist_query_scope(context: BimRunContext, plan: BimQueryPlan) -> None:
+    """Make specialist job boundaries executable policy, not prompt-only guidance."""
+    role = context.active_specialist
+    if role == "runtime":
+        return
+    is_requirements = plan.entity == "permit_knowledge"
+    is_relationship = bool(
+        plan.operation == "relationship_coverage"
+        or plan.relationship
+        or plan.relationship_filters
+    )
+    if role == "requirements" and not is_requirements:
+        raise PermissionError("Requirements Specialist may query only scoped permit knowledge.")
+    if role == "relationship" and (is_requirements or not is_relationship):
+        raise PermissionError(
+            "Relationship Specialist requires an explicit registered relationship operation."
+        )
+    if role == "quantity" and (is_requirements or is_relationship):
+        raise PermissionError(
+            "Quantity Specialist cannot execute requirements or relationship evidence work."
+        )
+    if role == "geometry":
+        raise PermissionError("Geometry Specialist cannot execute an ordinary BIM query plan.")
+
+
 def query_bim(ctx: PipelineContext, plan: BimQueryPlan) -> str:
-    """Execute one validated, project-scoped declarative BIM query plan; raw Cypher is never accepted."""
+    """Execute or reuse one exact validated project-scoped BIM query plan."""
     if ctx.context.task_contract is None:
         raise ValueError("The pipeline must define the BIM task contract before querying.")
+    _enforce_specialist_query_scope(ctx.context, plan)
+    if not plan.work_package_id:
+        plan.work_package_id = ctx.context.workstream_id
+    if not plan.constraint_bindings:
+        plan.constraint_bindings = [
+            ConstraintBinding.model_validate(item)
+            for item in ctx.context.schema_discovery.get("active_constraint_bindings") or []
+        ]
     missing_probe = any(item.operator == "is_missing" for item in plan.filters)
     if missing_probe:
         plan.role = "supporting"
@@ -2977,15 +3904,35 @@ def query_bim(ctx: PipelineContext, plan: BimQueryPlan) -> str:
         plan.role = "exploratory"
         plan.include_in_answer = False
     _validate_answer_metadata(ctx, plan)
+    cache_key = _query_plan_cache_key(ctx.context, plan)
+    # One branch owns one cache. Holding its re-entrant state lock through the
+    # miss prevents simultaneous identical tool calls from executing twice.
+    with ctx.context._lock:
+        cache = ctx.context.schema_discovery.setdefault("_exact_query_result_cache", {})
+        if not isinstance(cache, dict):
+            raise RuntimeError("The per-run query-result cache is corrupted.")
+        cached = cache.get(cache_key)
+        if isinstance(cached, str):
+            return cached
+        response = _query_bim_uncached(ctx, plan)
+        cache[cache_key] = response
+        return response
+
+
+def _query_bim_uncached(ctx: PipelineContext, plan: BimQueryPlan) -> str:
     result = _execute_plan(ctx.context, plan)
     diagnostics: list[str] = []
     coverage = (result.get("claim") or {}).get("coverage") or {}
     if (
-        plan.operation == "coverage"
+        plan.operation in {"coverage", "relationship_coverage", "group_count", "distinct"}
         and int(coverage.get("candidate_count") or 0) > 0
         and int(coverage.get("matched_count") or 0) == 0
     ):
-        diagnostics.append("verified_absence: exhaustive property coverage found no populated values")
+        diagnostics.append(
+            "property_missing: entities exist but exhaustive coverage found no populated values"
+            if plan.operation in {"group_count", "distinct"}
+            else "verified_absence: exhaustive coverage found no matching values or paths"
+        )
     elif result.get("matched_count") == 0:
         diagnostics.append(
             "zero_match: no records matched this exact entity/classification/filter hypothesis"
@@ -3017,6 +3964,8 @@ def query_bim(ctx: PipelineContext, plan: BimQueryPlan) -> str:
         kind="query",
         summary=result["claim"]["statement"],
         payload=_json(result),
+        work_package_id=ctx.context.workstream_id,
+        constraint_bindings=list(plan.constraint_bindings),
     ))
     ctx.context.add_artifact(RunArtifact(
         artifact_id=f"plan-{evidence_id}",
@@ -3038,6 +3987,431 @@ def query_bim(ctx: PipelineContext, plan: BimQueryPlan) -> str:
     return _json({"evidence_id": evidence_id, **result})
 
 
+_ADEQUACY_CHECK_NAMES = {
+    "entity_grain_matches", "measurement_basis_matches", "population_complete",
+    "planned_actual_distinguished", "absence_semantics_correct",
+    "projection_answers_question", "requested_outputs_present",
+}
+
+
+def _semantic_token(value: str) -> str:
+    """Canonical lexical form used only after typed/ontology anchors are selected."""
+    words = re.findall(r"[^\W_]+", _normalize(value).replace("_", " "), flags=re.UNICODE)
+    return " ".join(word[:-1] if len(word) > 3 and word.endswith("s") else word for word in words)
+
+
+_SEMANTIC_ANCHORS: dict[str, tuple[str, ...]] = {
+    "dwelling": ("apartment", "dwelling", "home", "housing unit", "residential unit"),
+    "floor": ("floor", "storey", "story", "floor plate", "floorplate"),
+    "space": ("space", "room"),
+    "function": ("function", "functional", "use category"),
+    "building": ("building", "tower"),
+    "section": ("section", "massing section"),
+    "facade": ("facade", "façade", "wall envelope"),
+    "cable_tray": ("cable tray", "tray segment", "tray"),
+    "conduit": ("conduit", "electrical conduit"),
+    "switch": ("switch", "lighting switch"),
+    "endpoint": ("endpoint", "socket", "outlet", "light fixture"),
+    "type": ("type", "classification", "family"),
+    "material": ("material",),
+    "requirement": ("requirement", "criterion", "permit"),
+}
+
+
+def _semantic_anchor_set(*values: str) -> set[str]:
+    """Extract stable concepts from free-form architect prose.
+
+    Task contracts are model-authored and may describe one concept with a sentence,
+    while mappings use short schema keys.  Verification therefore compares a small
+    controlled concept vocabulary, not exact sentences.  Unrecognised prose never
+    becomes an invented semantic assertion.
+    """
+    text = " ".join(_normalize(value).replace("_", " ") for value in values if value)
+    return {
+        anchor
+        for anchor, terms in _SEMANTIC_ANCHORS.items()
+        if any(re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text) for term in terms)
+    }
+
+
+def _measurement_anchor_set(*values: str) -> set[str]:
+    text = " ".join(_normalize(value).replace("_", " ") for value in values if value)
+    anchors: set[str] = set()
+    terms = {
+        "area": ("area", "bvo", "gfa", "gross floor", "nvo", "vvo", "m2", "m²"),
+        "length": ("length", "distance", "metre", "meter", "centimetre", "centimeter"),
+        "vertical_position": ("elevation", "height above", "distance from floor", "offset"),
+        "clear_height": ("clear height", "space height", "vertical extent"),
+        "count": ("count", "number", "quantity", "how many"),
+        "ratio": ("ratio", "percentage", "percent"),
+        "material": ("material",),
+        "classification": ("type", "classification", "family", "distinct value"),
+    }
+    for anchor, candidates in terms.items():
+        if any(re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text) for term in candidates):
+            anchors.add(anchor)
+    return anchors
+
+
+def _field_semantics_match(expected: str, observed: str) -> bool:
+    if _semantic_token(expected) == _semantic_token(observed):
+        return True
+    return _constraint_field(expected) == _constraint_field(observed)
+
+
+def _boundary_value_matches(
+    context: BimRunContext, field: str, expected: str, observed: str,
+) -> bool:
+    if _semantic_token(expected) == _semantic_token(observed):
+        return True
+    if _constraint_field(field) == "level" and _level_matches(
+        expected, observed, context.graph_contract.level_aliases,
+    ):
+        return True
+    expected_numbers = re.findall(r"-?\d+(?:[.,]\d+)?", _normalize(expected))
+    observed_numbers = re.findall(r"-?\d+(?:[.,]\d+)?", _normalize(observed))
+    if expected_numbers and {
+        value.replace(",", ".") for value in expected_numbers
+    } == {
+        value.replace(",", ".") for value in observed_numbers
+    }:
+        return True
+    expected_anchors = _semantic_anchor_set(expected)
+    observed_anchors = _semantic_anchor_set(observed)
+    return bool(expected_anchors and expected_anchors.issubset(observed_anchors))
+
+
+def _expected_semantic_intents(
+    context: BimRunContext, satisfies: list[str]
+) -> list[SemanticIntent]:
+    contract = context.task_contract
+    if contract is None:
+        return []
+    specs = dict(zip(contract.required_outputs, contract.output_specs, strict=True))
+    intents = [
+        specs[output].semantic_intent
+        for output in satisfies
+        if output in specs and specs[output].semantic_intent.is_specified
+    ]
+    if not intents and contract.semantic_intent.is_specified:
+        intents = [contract.semantic_intent]
+    return intents
+
+
+def _semantic_adequacy_checks(
+    context: BimRunContext,
+    plan: BimQueryPlan | GeometryQueryPlan,
+    claim: dict[str, Any],
+    *,
+    registered: RegisteredSchemaMapping | None = None,
+    matched_count: int = 0,
+) -> list[dict[str, Any]]:
+    """Challenge replayed evidence against the task's typed meaning.
+
+    The observed side comes from compiler-owned fields, mapping metadata, exact
+    filters and structured claim coverage.  A worker's prose is never sufficient.
+    """
+    if plan.role == "supporting" and not plan.satisfies:
+        return [
+            {
+                "name": name,
+                "passed": True,
+                "explanation": (
+                    "This replay-stable related fact is intentionally supporting-only "
+                    "and is not treated as satisfying the direct semantic contract."
+                ),
+            }
+            for name in sorted(_ADEQUACY_CHECK_NAMES)
+        ]
+    expected = _expected_semantic_intents(context, list(plan.satisfies))
+    if not expected:
+        return [
+            {"name": name, "passed": True,
+             "explanation": "No typed semantic constraint was supplied by this legacy contract."}
+            for name in sorted(_ADEQUACY_CHECK_NAMES)
+        ]
+
+    if isinstance(plan, BimQueryPlan):
+        observed_grain = (
+            registered.proposal.counting_unit
+            if isinstance(registered, RegisteredSchemaMapping)
+            else plan.entity
+        )
+        observed_grain_terms = [observed_grain, plan.entity]
+        if plan.group_by:
+            observed_grain_terms.append(plan.group_by)
+        observed_grain_terms.extend(plan.group_by_fields)
+        observed_grain_terms.extend(
+            value
+            for item in plan.filters
+            if item.operator in {"equals", "in"}
+            for value in _raw_filter_values(item)
+        )
+        metric_field = plan.metric or plan.coverage_field or plan.group_by
+        observed_metric_terms = {
+            metric_field, plan.operation,
+            *(item.field for item in plan.filters),
+            *(value for item in plan.filters for value in _raw_filter_values(item)),
+        }
+        if isinstance(registered, RegisteredSchemaMapping) and metric_field:
+            mapped = next(
+                (field for field in registered.proposal.fields if field.semantic_name == metric_field),
+                None,
+            )
+            if mapped:
+                observed_metric_terms.update([mapped.property, *mapped.aliases])
+        observed_boundaries = {
+            (_semantic_token(item.field), _semantic_token(value))
+            for item in plan.filters
+            if item.operator in {"equals", "in"}
+            for value in _raw_filter_values(item)
+        }
+        # Instance-level graph queries are observations of the authored model unless
+        # the selected field explicitly declares a planned/type-defined value.  This
+        # inference is compiler-owned and cannot be overridden by worker prose.
+        observed_origin = plan.semantic_intent.value_origin
+        if observed_origin == "unspecified":
+            origin_text = _normalize(" ".join(str(item) for item in observed_metric_terms))
+            observed_origin = (
+                "planned"
+                if any(term in origin_text for term in ("planned", "default", "design", "type defined"))
+                else "actual"
+            )
+        projection = {"value"}
+        if claim.get("unit") is not None:
+            projection.add("unit")
+        if any(claim.get(key) for key in (
+            "details", "basis", "method", "measurement", "source_tags", "coverage",
+        )):
+            projection.add("details")
+        if plan.operation in {
+            "group_count", "group_summary", "multi_group_count", "multi_group_summary",
+            "maximum_group_sum", "distinct", "count_distinct",
+        }:
+            projection.add("groups")
+        if claim.get("coverage") is not None:
+            projection.add("coverage")
+        if observed_origin == "comparison":
+            projection.add("comparison")
+        if plan.entity == "permit_knowledge":
+            projection.add("compliance")
+    else:
+        # Governed geometry recipes do not expose an ordinary schema mapping.  Their
+        # plan must therefore declare the configured semantic identity explicitly.
+        observed_grain = plan.semantic_intent.entity_grain or plan.calculation
+        observed_grain_terms = [observed_grain, plan.calculation, str(claim.get("basis") or "")]
+        observed_metric_terms = {
+            plan.semantic_intent.measurement_basis,
+            plan.calculation,
+            str(claim.get("basis") or ""),
+            str((claim.get("measurement") or {}).get("source_property") or ""),
+        }
+        observed_boundaries = {
+            (_semantic_token(boundary.semantic_field), _semantic_token(value))
+            for boundary in plan.semantic_intent.population_boundary
+            for value in boundary.exact_values
+        }
+        observed_origin = plan.semantic_intent.value_origin
+        if observed_origin == "unspecified":
+            observed_origin = (
+                "comparison"
+                if "comparison" in _normalize(
+                    f"{plan.calculation} {claim.get('method') or ''} {claim.get('basis') or ''}"
+                )
+                else "actual"
+            )
+        projection = {"value"}
+        if claim.get("unit") is not None:
+            projection.add("unit")
+        if any(claim.get(key) for key in (
+            "details", "basis", "method", "measurement", "source_tags", "coverage",
+        )):
+            projection.add("details")
+        if claim.get("details"):
+            projection.add("groups")
+        if claim.get("coverage") is not None:
+            projection.add("coverage")
+        if observed_origin == "comparison":
+            projection.add("comparison")
+
+    expected_grains = [item.entity_grain for item in expected if item.entity_grain]
+    observed_grain_anchors = _semantic_anchor_set(*observed_grain_terms)
+    grain_results = []
+    for item in expected_grains:
+        expected_anchors = _semantic_anchor_set(item)
+        # Exact identifiers remain supported. Free-form prose is challenged only on
+        # concepts the verifier can identify without guessing.
+        grain_results.append(
+            _semantic_token(item) == _semantic_token(observed_grain)
+            or not expected_anchors
+            or bool(expected_anchors & observed_grain_anchors)
+        )
+    grain_ok = all(grain_results)
+    expected_bases = [item.measurement_basis for item in expected if item.measurement_basis]
+    observed_basis_tokens = {_semantic_token(str(item)) for item in observed_metric_terms if item}
+    observed_basis_anchors = _measurement_anchor_set(
+        *(str(item) for item in observed_metric_terms if item)
+    )
+    basis_results = []
+    for item in expected_bases:
+        expected_anchors = _measurement_anchor_set(item)
+        basis_results.append(
+            _semantic_token(item) in observed_basis_tokens
+            or not expected_anchors
+            or expected_anchors.issubset(observed_basis_anchors)
+        )
+    basis_ok = all(basis_results)
+    expected_boundaries = [
+        (boundary.semantic_field, value)
+        for intent in expected
+        for boundary in intent.population_boundary
+        for value in boundary.exact_values
+    ]
+    observed_boundary_values = [
+        (item.field, value)
+        for item in (plan.filters if isinstance(plan, BimQueryPlan) else [])
+        if item.operator in {"equals", "in"}
+        for value in _raw_filter_values(item)
+    ]
+    if isinstance(plan, BimQueryPlan):
+        observed_boundary_values.extend(
+            (binding.semantic_field, value)
+            for binding in plan.constraint_bindings
+            for value in [binding.requested_value, *binding.exact_values]
+            if value
+        )
+    else:
+        observed_boundary_values.extend(
+            (boundary.semantic_field, value)
+            for boundary in plan.semantic_intent.population_boundary
+            for value in boundary.exact_values
+        )
+    boundary_ok = all(
+        any(
+            _field_semantics_match(expected_field, observed_field)
+            and _boundary_value_matches(
+                context, observed_field, expected_value, observed_value,
+            )
+            for observed_field, observed_value in observed_boundary_values
+        )
+        for expected_field, expected_value in expected_boundaries
+    )
+    # Compiler-owned task-constraint coverage and governed classification checks
+    # already prove the executable boundary. Do not let a redundant prose boundary
+    # reject it solely because the architect used user-language rather than stored values.
+    if isinstance(plan, BimQueryPlan):
+        constraints_ok, _ = _plan_constraint_coverage(context, plan)
+        boundary_ok = boundary_ok or constraints_ok and not expected_boundaries
+    elif expected_boundaries and not plan.semantic_intent.population_boundary:
+        # A named geometry recipe is an immutable, project-governed population
+        # compiler. Its configured boundary was checked before execution; the worker
+        # cannot broaden it or supply arbitrary filters.
+        boundary_ok = True
+    expected_origins = {
+        item.value_origin for item in expected if item.value_origin != "unspecified"
+    }
+    origin_ok = not expected_origins or (
+        len(expected_origins) == 1 and observed_origin in expected_origins
+    )
+    requested_projection = {
+        value for item in expected for value in item.requested_projection
+    }
+    projection_ok = requested_projection.issubset(projection)
+    coverage = claim.get("coverage") or {}
+    candidate_count = int(coverage.get("candidate_count") or 0)
+    populated_count = int(coverage.get("matched_count") or 0)
+    missing_count = int(coverage.get("missing_count") or 0)
+    exhaustive = bool(coverage.get("exhaustive"))
+    relevant_specs = []
+    if context.task_contract:
+        specs_by_output = dict(zip(
+            context.task_contract.required_outputs,
+            context.task_contract.output_specs,
+            strict=True,
+        ))
+        relevant_specs = [
+            specs_by_output[output] for output in plan.satisfies if output in specs_by_output
+        ]
+    absence_expectations = {
+        item.absence_semantics for item in expected
+        if item.absence_semantics != "unspecified"
+    }
+    if absence_expectations and not any(
+        spec.kind in {"coverage", "relationship_coverage"} for spec in relevant_specs
+    ):
+        # "Unsupported" is a possible run outcome, not the intended meaning of an
+        # ordinary count/measurement. Absence semantics gate only typed coverage work.
+        absence_expectations = set()
+    absence_ok = True
+    absence_explanation = "No absence interpretation was requested."
+    if len(absence_expectations) > 1:
+        absence_ok = False
+        absence_explanation = "Outputs assigned to one plan require incompatible absence meanings."
+    elif absence_expectations:
+        absence = next(iter(absence_expectations))
+        if absence == "property_missing":
+            absence_ok = (
+                exhaustive and candidate_count > 0 and populated_count == 0
+                and missing_count == candidate_count
+            )
+        elif absence == "population_missing":
+            absence_ok = exhaustive and candidate_count == 0
+        elif absence == "verified_zero":
+            absence_ok = claim.get("value") == 0 and (
+                not coverage or exhaustive
+            )
+        else:  # unsupported
+            absence_ok = claim.get("value") is None and bool(claim.get("caveats"))
+        absence_explanation = (
+            f"Structured evidence establishes {absence}." if absence_ok
+            else f"Structured population evidence does not establish {absence}."
+        )
+
+    related_support = plan.role == "supporting" and not plan.satisfies
+    requested_outputs_ok = related_support or (
+        bool(plan.satisfies) and all(
+            output in (context.task_contract.required_outputs if context.task_contract else [])
+            for output in plan.satisfies
+        )
+    )
+    return [
+        {"name": "entity_grain_matches", "passed": grain_ok,
+         "explanation": (
+             f"Observed counting grain is {observed_grain!r}." if grain_ok
+             else f"Observed counting grain {observed_grain!r} does not match {expected_grains!r}."
+         )},
+        {"name": "measurement_basis_matches", "passed": basis_ok,
+         "explanation": (
+             f"Observed measurement basis is {sorted(observed_metric_terms)!r}." if basis_ok
+             else f"Observed measurement basis {sorted(observed_metric_terms)!r} does not match {expected_bases!r}."
+         )},
+        {"name": "population_complete", "passed": boundary_ok,
+         "explanation": (
+             "Every typed population boundary is an exact query filter." if boundary_ok
+             else "The query omits or broadens a typed population boundary."
+         )},
+        {"name": "planned_actual_distinguished", "passed": origin_ok,
+         "explanation": (
+             f"Value origin is explicitly {observed_origin}." if origin_ok
+             else f"Expected value origin {sorted(expected_origins)!r}, observed {observed_origin!r}."
+         )},
+        {"name": "absence_semantics_correct", "passed": absence_ok,
+         "explanation": absence_explanation},
+        {"name": "projection_answers_question", "passed": projection_ok,
+         "explanation": (
+             f"Returned projection includes {sorted(requested_projection)!r}." if projection_ok
+             else f"Returned projection {sorted(projection)!r} omits {sorted(requested_projection - projection)!r}."
+         )},
+        {"name": "requested_outputs_present", "passed": requested_outputs_ok,
+         "explanation": (
+             "This replay-stable related fact is intentionally supporting-only."
+             if related_support else
+             "The plan is assigned to declared required outputs." if requested_outputs_ok
+             else "The plan is not assigned to a declared required output."
+         )},
+    ]
+
+
 def _verify_query_evidence(
     context: BimRunContext, requested_evidence_ids: list[str]
 ) -> dict[str, Any]:
@@ -3051,8 +4425,9 @@ def _verify_query_evidence(
     for evidence_id in available_evidence_ids:
         evidence = context.evidence[evidence_id]
         original = json.loads(evidence.payload)
-        if original.get("capability") == "project_geometry":
+        if original.get("capability") in {"project_geometry", "project_calculation"}:
             plan = GeometryQueryPlan.model_validate(original["plan"])
+            _validate_governed_calculation_schema(context, plan.calculation)
             report = calculate_project_geometry(
                 plan.calculation, context.bim, context.scope.allowed_sources,
                 context.bim.ontology.bim_query_knowledge,
@@ -3064,21 +4439,45 @@ def _verify_query_evidence(
                 json.dumps(stable, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
             ).hexdigest()
             replay_ok = digest == original.get("result_digest") and bool(claim.get("statement"))
+            calculation_ok = bool(
+                report and report.verification_status == "verified" and claim.get("basis")
+            )
+            counting_unit_ok = bool(claim.get("unit"))
+            plausibility_flags = claim.get("plausibility_flags") or []
+            plausibility_ok = not any(
+                item.get("severity") == "error" for item in plausibility_flags
+            )
             semantic_checks = [
                 {"name": "replay_stability", "passed": replay_ok,
                  "explanation": "The geometry derivation is unchanged." if replay_ok else "The geometry derivation changed."},
                 {"name": "authorized_scope", "passed": bool(context.scope.allowed_sources),
                  "explanation": "The derivation queried only authorized project sources."},
+                {"name": "identity_integrity", "passed": calculation_ok,
+                 "explanation": "The registered calculation uses its code-owned identity/deduplication recipe." if calculation_ok else "The calculation did not return structured provenance."},
+                {"name": "constraint_binding", "passed": calculation_ok,
+                 "explanation": "Project interpretation and exact boundaries came from the active governed calculation configuration."},
+                {"name": "counting_unit", "passed": counting_unit_ok,
+                 "explanation": "The calculation declared its result unit/counting unit." if counting_unit_ok else "The calculation omitted its result unit."},
+                {"name": "boundary_exactness", "passed": calculation_ok,
+                 "explanation": "The allowlisted compiler applied the governed population boundary."},
+                {"name": "source_deduplication", "passed": calculation_ok,
+                 "explanation": "The calculation recipe executes over the complete authorized source set with deterministic identity handling."},
+                {"name": "classification_purity", "passed": calculation_ok,
+                 "explanation": "Classification semantics came from active project configuration rather than model-authored query text."},
+                {"name": "constraint_coverage", "passed": calculation_ok,
+                 "explanation": "The calculation key and typed output were validated against the active project contract."},
+                {"name": "measurement_plausibility", "passed": plausibility_ok,
+                 "explanation": "No invariant-level plausibility error was found." if plausibility_ok else "The calculation violates a numeric invariant."},
             ]
-            for name in ("identity_integrity", "constraint_binding", "counting_unit", "boundary_exactness",
-                         "source_deduplication", "classification_purity", "constraint_coverage"):
-                semantic_checks.append({"name": name, "passed": True,
-                                        "explanation": "Satisfied by the scoped geometry calculation contract."})
+            semantic_checks.extend(_semantic_adequacy_checks(
+                context, plan, claim, matched_count=1,
+            ))
             checks.append({
                 "evidence_id": evidence_id, "verified": all(x["passed"] for x in semantic_checks),
                 "expected_digest": original.get("result_digest"), "actual_digest": digest,
                 "claim": claim, "limitations": report.limitations if report else [],
                 "plan": plan.model_dump(mode="json"), "semantic_checks": semantic_checks,
+                "plausibility_flags": plausibility_flags,
             })
             continue
         rerun = _execute_plan(context, BimQueryPlan.model_validate(original["plan"]))
@@ -3175,7 +4574,8 @@ def _verify_query_evidence(
             coverage = (rerun.get("claim") or {}).get("coverage") or {}
             zero_population = int(
                 coverage.get("candidate_count")
-                if plan.operation == "coverage" else rerun.get("matched_count") or 0
+                if plan.operation in {"coverage", "relationship_coverage"}
+                else rerun.get("matched_count") or 0
             ) == 0
             unexpected_zero = (
                 answer_producing
@@ -3188,14 +4588,33 @@ def _verify_query_evidence(
                     "The exact live-mapped classification produced zero records. "
                     "This is an unresolved mapping contradiction, not a verified absence."
                 )
+        related_support = plan.role == "supporting" and not plan.satisfies
         constraints_ok, missing_constraints = _plan_constraint_coverage(context, plan)
+        if related_support:
+            constraints_ok = True
+            missing_constraints = []
         constraint_explanation = (
+            "This related supporting fact is not assigned to a required output."
+            if related_support else
             "Every task constraint is represented by a query filter."
             if constraints_ok else
             "Missing task constraints: " + ", ".join(missing_constraints) + "."
         )
         coverage = (rerun.get("claim") or {}).get("coverage") or {}
         coverage_ok = not coverage or bool(coverage.get("exhaustive"))
+        relationship_names = {
+            item.semantic_name for item in registered.proposal.relationship_bindings
+        } if isinstance(registered, RegisteredSchemaMapping) else set()
+        requested_relationships = {
+            item.relationship for item in plan.relationship_filters
+        }
+        if plan.operation == "relationship_coverage":
+            requested_relationships.add(plan.relationship)
+        relationship_ok = (
+            not requested_relationships
+            or bool(relationship_names)
+            and requested_relationships.issubset(relationship_names)
+        )
         plausibility_flags = (rerun.get("claim") or {}).get("plausibility_flags") or []
         plausibility_ok = not any(item.get("severity") == "error" for item in plausibility_flags)
         semantic_checks = [
@@ -3223,12 +4642,25 @@ def _verify_query_evidence(
                  "The result exposes an exhaustive evaluated population."
                  if coverage else "This operation does not claim property-absence coverage."
              )},
+            {"name": "relationship_binding", "passed": relationship_ok,
+             "explanation": (
+                 "Every relationship predicate expands from a fixed live-validated mapping path."
+                 if requested_relationships and relationship_ok else
+                 "This plan does not use a relationship predicate."
+                 if not requested_relationships else
+                 "The plan references an unregistered relationship path."
+             )},
             {"name": "measurement_plausibility", "passed": plausibility_ok,
              "explanation": (
                  "No impossible numeric invariant was detected."
                  if plausibility_ok else "The computed result violates a numeric invariant."
-             )},
+            )},
         ]
+        semantic_checks.extend(_semantic_adequacy_checks(
+            context, plan, rerun.get("claim") or {},
+            registered=registered if isinstance(registered, RegisteredSchemaMapping) else None,
+            matched_count=int(rerun.get("matched_count") or 0),
+        ))
         checks.append({
             "evidence_id": evidence_id,
             "verified": all(check["passed"] for check in semantic_checks),
@@ -3240,7 +4672,7 @@ def _verify_query_evidence(
             "matched_count": rerun.get("matched_count"),
             "diagnostics": (
                 ["verified_absence"]
-                if plan.operation == "coverage"
+                if plan.operation in {"coverage", "relationship_coverage", "group_count", "distinct"}
                 and int(((rerun.get("claim") or {}).get("coverage") or {}).get("candidate_count") or 0) > 0
                 and int(rerun.get("matched_count") or 0) == 0
                 else ["zero_match"] if int(rerun.get("matched_count") or 0) == 0 else []
@@ -3248,9 +4680,21 @@ def _verify_query_evidence(
             "plausibility_flags": plausibility_flags,
             "semantic_checks": semantic_checks,
         })
+    failed_adequacy_checks = sorted({
+        item["name"]
+        for check in checks
+        for item in check.get("semantic_checks") or []
+        if item.get("name") in _ADEQUACY_CHECK_NAMES and item.get("passed") is not True
+    })
+    semantic_adequacy = {
+        "verified": bool(checks) and not failed_adequacy_checks,
+        "failed_checks": failed_adequacy_checks,
+        "layer": "deterministic_semantic_challenger",
+    }
     return {
         "verified": bool(checks) and all(check.get("verified") is True for check in checks),
         "checks": checks,
+        "semantic_adequacy": semantic_adequacy,
         "requested_evidence_ids": requested_evidence_ids,
         "verified_evidence_ids": available_evidence_ids,
     }

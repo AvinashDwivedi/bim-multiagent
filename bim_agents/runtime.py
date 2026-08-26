@@ -17,7 +17,7 @@ from .knowledge import (
     LearnedKnowledgeStore, activate_promoted_knowledge, compute_live_schema_fingerprint,
     curate_verified_mappings, default_knowledge_path,
 )
-from .models import BimRunContext, PipelineReport, ProjectScope
+from .models import BimRunContext, PipelineReport, ProjectScope, WorkstreamDiagnostic
 from .observability import AgentRunHooks, PipelineEvents
 from .orchestration import run_evidence_workstreams
 from .registry import build_agent_registry
@@ -141,8 +141,11 @@ def _answer_query_ids(context: BimRunContext) -> list[str]:
         payload = json.loads(evidence.payload)
         plan = payload.get("plan") or {}
         if (
-            plan.get("role", "answer_producing") == "answer_producing"
-            and plan.get("include_in_answer", True) is not False
+            plan.get("role", "answer_producing") in {"answer_producing", "supporting"}
+            and (
+                plan.get("role", "answer_producing") == "supporting"
+                or plan.get("include_in_answer", True) is not False
+            )
         ):
             result.append(evidence_id)
     return result
@@ -151,7 +154,18 @@ def _answer_query_ids(context: BimRunContext) -> list[str]:
 def _merge_isolated_workstream(
     root: BimRunContext, branch: BimRunContext, *, workstream_id: str,
 ) -> list[str]:
-    """Validate then atomically commit a completed isolated worker delta."""
+    """Account branch work, then atomically commit its valid evidence delta.
+
+    Usage is authoritative even when a branch has no answer or its data commit is
+    rejected. This prevents failed/repaired workers from silently returning budget
+    to later workstreams.
+    """
+    with root._lock:
+        root.llm_calls += branch.llm_calls
+        root.tool_calls += branch.tool_calls
+        root.agent_starts += branch.agent_starts
+        for name, count in branch.agent_starts_by_name.items():
+            root.agent_starts_by_name[name] = root.agent_starts_by_name.get(name, 0) + count
     answer_ids = _answer_query_ids(branch)
     if not answer_ids:
         return []
@@ -210,11 +224,6 @@ def _merge_isolated_workstream(
             root.evidence.setdefault(evidence_id, branch.evidence[evidence_id])
         for committed_id, artifact in staged_artifacts:
             root.artifacts[committed_id] = artifact.model_copy(update={"artifact_id": committed_id})
-        root.llm_calls += branch.llm_calls
-        root.tool_calls += branch.tool_calls
-        root.agent_starts += branch.agent_starts
-        for name, count in branch.agent_starts_by_name.items():
-            root.agent_starts_by_name[name] = root.agent_starts_by_name.get(name, 0) + count
     return answer_ids
 
 
@@ -334,10 +343,14 @@ async def answer_bim_question(
             max_agent_starts=int(os.getenv("BIM_MAX_AGENT_STARTS", "30")),
             max_starts_per_agent=int(os.getenv("BIM_MAX_STARTS_PER_AGENT", "6")),
         )
-        if os.getenv("BIM_LEARNING_ENABLED", "1") != "0":
+        try:
+            context.schema_fingerprint = compute_live_schema_fingerprint(context)
+        except Exception:
+            context.failure_categories.append("schema_fingerprint_unavailable")
+            events.stage("schema_fingerprint_unavailable")
+        if os.getenv("BIM_LEARNING_ENABLED", "1") != "0" and context.schema_fingerprint:
             try:
                 context.knowledge_store = LearnedKnowledgeStore(default_knowledge_path())
-                context.schema_fingerprint = compute_live_schema_fingerprint(context)
                 activated = activate_promoted_knowledge(context)
                 events.stage("knowledge_loaded", compatible_records=len(activated))
             except Exception:
@@ -408,6 +421,19 @@ async def answer_bim_question(
                             root, branch, workstream_id=branch.workstream_id
                         ),
                     )
+                    context.workstream_diagnostics = [
+                        WorkstreamDiagnostic(
+                            package_id=outcome.package.package_id,
+                            specialist=outcome.specialist,
+                            status=outcome.status,
+                            attempts=outcome.specialist_attempts,
+                            typed_output_failures=outcome.typed_output_failures,
+                            recovery_strategy=outcome.recovery_strategy,
+                            required_outputs=list(outcome.package.required_outputs),
+                            satisfied_outputs=list(outcome.satisfied_outputs),
+                        )
+                        for outcome in outcomes
+                    ]
                     merged_ids = [
                         evidence_id for outcome in outcomes for evidence_id in outcome.evidence_ids
                     ]
@@ -415,7 +441,9 @@ async def answer_bim_question(
                         context.runtime_limitations.extend(
                             item for item in outcome.limitations if item.strip()
                         )
-                        if outcome.status in {"turn_limit", "error", "merge_rejected"}:
+                        if outcome.status in {
+                            "turn_limit", "error", "merge_rejected", "partial_completed",
+                        }:
                             category = "workstream_" + outcome.status
                             if category not in context.failure_categories:
                                 context.failure_categories.append(category)
@@ -426,7 +454,11 @@ async def answer_bim_question(
                         "workstream_schedule_end",
                         run_id=context.run_id,
                         completed=sum(item.status == "query_completed" for item in outcomes),
+                        partial=sum(item.status == "partial_completed" for item in outcomes),
                         evidence=len(merged_ids),
+                        specialist_attempts=sum(item.specialist_attempts for item in outcomes),
+                        typed_output_failures=sum(item.typed_output_failures for item in outcomes),
+                        recovered=sum(bool(item.recovery_strategy) for item in outcomes),
                     )
         except asyncio.CancelledError:
             events.stage("run_cancelled")
@@ -456,23 +488,56 @@ async def answer_bim_question(
             )
             events.stage("model_connection_error")
         except Exception as exc:
-            if not _is_budget_exhaustion(exc):
-                raise
-            context.failure_categories.append("investigation_budget_exhausted")
-            budget_category, budget_detail = _budget_exhaustion_diagnostic(context)
-            if budget_category not in context.failure_categories:
-                context.failure_categories.append(budget_category)
-            context.runtime_limitations.append(
-                "The investigation reached its configured work budget; completed evidence was retained. "
-                + budget_detail
-            )
-            events.stage("investigation_budget_exhausted", category=budget_category)
+            if _is_budget_exhaustion(exc):
+                context.failure_categories.append("investigation_budget_exhausted")
+                budget_category, budget_detail = _budget_exhaustion_diagnostic(context)
+                if budget_category not in context.failure_categories:
+                    context.failure_categories.append(budget_category)
+                context.runtime_limitations.append(
+                    "The investigation reached its configured work budget; completed evidence was retained. "
+                    + budget_detail
+                )
+                events.stage("investigation_budget_exhausted", category=budget_category)
+            else:
+                # The public BIM endpoint must fail closed with a typed report rather
+                # than turn one worker/runtime defect into an HTTP 500 that discards
+                # every durable evidence checkpoint. Detailed exceptions remain in
+                # server logs/events and are never exposed to the client.
+                context.failure_categories.append("pipeline_runtime_error")
+                context.runtime_limitations.append(
+                    "The investigation encountered an internal execution error; completed "
+                    "evidence was retained and independently verified where possible."
+                )
+                events.stage(
+                    "pipeline_runtime_error", category="internal_execution_error",
+                    error_type=type(exc).__name__,
+                )
         if re.search(r"\b(compliance|comply|compliant|requirement|requirements)\b", question, re.I):
-            evidence_id = ensure_compliance_evidence(context)
-            if evidence_id:
-                events.stage("compliance_evidence", evidence_id=evidence_id)
-        ensure_bim_verification(context)
-        gates = json.loads(inspect_completion_gates(PipelineContext(context)))
+            try:
+                evidence_id = ensure_compliance_evidence(context)
+                if evidence_id:
+                    events.stage("compliance_evidence", evidence_id=evidence_id)
+            except Exception as exc:
+                context.failure_categories.append("compliance_evidence_error")
+                context.runtime_limitations.append(
+                    "Applicable requirement evidence could not be finalized; completed model "
+                    "evidence remains available."
+                )
+                events.stage("compliance_evidence_error", error_type=type(exc).__name__)
+        try:
+            ensure_bim_verification(context)
+        except Exception as exc:
+            context.failure_categories.append("verification_runtime_error")
+            context.runtime_limitations.append(
+                "Deterministic replay could not be completed for all retained evidence."
+            )
+            events.stage("verification_runtime_error", error_type=type(exc).__name__)
+        try:
+            gates = json.loads(inspect_completion_gates(PipelineContext(context)))
+        except Exception as exc:
+            gates = {"ready_to_respond": False, "missing": ["completion_gate_runtime_error"]}
+            context.failure_categories.append("completion_gate_runtime_error")
+            events.stage("completion_gate_runtime_error", error_type=type(exc).__name__)
         if not gates.get("ready_to_respond"):
             context.completion_status = "insufficient_evidence"
             missing = gates.get("missing") or []
@@ -489,7 +554,29 @@ async def answer_bim_question(
         except Exception:
             context.failure_categories.append("knowledge_curation_failed")
             events.stage("knowledge_curation_failed")
-        report = pipeline_report_from_evidence(context)
+        try:
+            report = pipeline_report_from_evidence(context)
+        except Exception as exc:
+            events.stage("report_composition_error", error_type=type(exc).__name__)
+            report = PipelineReport(
+                answer=(
+                    "The investigation completed, but its verified evidence could not be "
+                    "assembled into a safe response."
+                ),
+                limitations=[
+                    "The response composer rejected the retained evidence; no unverified "
+                    "answer value is being returned."
+                ],
+                failure_categories=list(dict.fromkeys([
+                    *context.failure_categories, "report_composition_error",
+                ])),
+                investigation_trace=[
+                    f"{artifact.producer}: {artifact.summary}"
+                    for artifact in context.artifacts.values()
+                ],
+                workstream_diagnostics=context.workstream_diagnostics,
+                verification_status="insufficient_evidence",
+            )
         events.stage("pipeline_end", verification_status=report.verification_status)
         return redact_pipeline_report(report, settings)
     finally:

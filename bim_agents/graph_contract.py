@@ -32,7 +32,9 @@ class QueryField(BaseModel):
     source_unit: str | None = None
     conversion_factor: float = Field(default=1.0, gt=0)
     conversion_basis: str = "identity conversion"
-    ontology_kind: Literal["canonical_type", "ifc_class", "level"] | None = None
+    ontology_kind: Literal[
+        "canonical_type", "ifc_class", "level", "aggregate_identity"
+    ] | None = None
 
     @model_validator(mode="after")
     def validate_unit_conversion(self) -> "QueryField":

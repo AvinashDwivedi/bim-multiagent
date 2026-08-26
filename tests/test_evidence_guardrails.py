@@ -5,7 +5,9 @@ from unittest.mock import patch
 from bim_agents.graph_contract import load_graph_contract
 from bim_agents.guardrails import pipeline_report_from_evidence, verification_report_from_evidence
 from bim_agents.models import (
-    BimRunContext, BimTaskContract, Evidence, ProjectScope, RunArtifact,
+    BimRunContext, BimTaskContract, ConstraintBinding, Evidence,
+    EvidenceWorkPackage, OutputSpec, ProjectScope, RunArtifact,
+    WorkstreamDiagnostic,
 )
 from bim_agents.schema_mapping import (
     RegisteredSchemaMapping, SchemaFieldMapping, SchemaMappingProposal,
@@ -18,6 +20,82 @@ from bim_agents.tools import (
 
 
 class EvidenceGuardrailTests(unittest.TestCase):
+    def test_wrong_work_package_cannot_satisfy_another_packages_output(self):
+        context = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+            task_contract=BimTaskContract(
+                goal="Count and classify switches", operation="count",
+                entity_concept="switches", required_outputs=["count", "types"],
+                output_specs=[
+                    OutputSpec(key="count", kind="count"),
+                    OutputSpec(key="types", kind="grouped_summary"),
+                ],
+                work_packages=[
+                    EvidenceWorkPackage(
+                        package_id="counting", objective="Count switches",
+                        required_outputs=["count"],
+                    ),
+                    EvidenceWorkPackage(
+                        package_id="classification", objective="Classify switches",
+                        required_outputs=["types"],
+                    ),
+                ],
+                success_criteria=["Both outputs are verified"],
+            ),
+        )
+        context.add_evidence(Evidence(
+            evidence_id="q-wrong-owner", kind="query", summary="types from count worker",
+            workstream_id="counting", work_package_id="counting",
+        ))
+        context.add_evidence(Evidence(
+            evidence_id="verification-package-owner", kind="verification", summary="review",
+            payload=json.dumps({"checks": [{
+                "evidence_id": "q-wrong-owner", "verified": True,
+                "plan": {"role": "answer_producing", "answer_key": "types", "satisfies": ["types"]},
+                "claim": {"statement": "Two types.", "value": 2, "basis": "test"},
+                "semantic_checks": [],
+            }]}),
+        ))
+
+        report = pipeline_report_from_evidence(context)
+
+        statuses = {item.output: item for item in report.output_statuses}
+        self.assertEqual(report.verification_status, "insufficient_evidence")
+        self.assertEqual(statuses["types"].status, "unsupported")
+        self.assertEqual(statuses["types"].package_id, "classification")
+        self.assertEqual(statuses["types"].spec.kind, "grouped_summary")
+
+    def test_verified_claim_retains_package_constraint_bindings(self):
+        context = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+        )
+        binding = ConstraintBinding(
+            concept="level", requested_value="ground floor", semantic_field="level",
+            exact_values=["Ground Floor"], mapping_id="spaces", package_id="ground_floor",
+        )
+        context.add_evidence(Evidence(
+            evidence_id="q-ground", kind="query", summary="ground floor count",
+            workstream_id="ground_floor", work_package_id="ground_floor",
+            constraint_bindings=[binding],
+        ))
+        context.add_evidence(Evidence(
+            evidence_id="verification-ground", kind="verification", summary="review",
+            payload=json.dumps({"checks": [{
+                "evidence_id": "q-ground", "verified": True,
+                "plan": {"role": "answer_producing", "answer_key": "count", "satisfies": []},
+                "claim": {"statement": "Five spaces.", "value": 5, "basis": "test"},
+                "semantic_checks": [],
+            }]}),
+        ))
+
+        claim = verification_report_from_evidence(context).verified_claims[0]
+
+        self.assertEqual(claim.work_package_id, "ground_floor")
+        self.assertEqual(claim.constraint_bindings[0].semantic_field, "level")
+        self.assertEqual(claim.constraint_bindings[0].exact_values, ["Ground Floor"])
+
     def test_zero_from_exact_live_mapping_fails_classification_purity(self):
         mapping = RegisteredSchemaMapping(
             mapping_id="mapping-switches",
@@ -307,6 +385,233 @@ class EvidenceGuardrailTests(unittest.TestCase):
         self.assertNotIn("21 switches", report.answer)
         self.assertIn("Conflicting", " ".join(report.limitations))
 
+    def test_grouped_summary_dominates_raw_list_for_same_typed_output(self):
+        context = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+            task_contract=BimTaskContract(
+                goal="Summarize functions", operation="group_summary",
+                entity_concept="spaces", required_outputs=["function summary"],
+                output_specs=[OutputSpec(
+                    key="function summary", kind="grouped_summary",
+                    metric="area_m2", grouping_dimensions=["type"],
+                )],
+                success_criteria=["The grouped summary is verified"],
+            ),
+        )
+        raw_plan = BimQueryPlan(
+            entity="spaces", operation="list", select=["type", "area_m2"],
+            answer_key="raw-functions", satisfies=["function summary"],
+        )
+        summary_plan = BimQueryPlan(
+            entity="spaces", operation="group_summary", group_by="type",
+            metric="area_m2", answer_key="grouped-functions",
+            satisfies=["function summary"],
+        )
+        context.add_evidence(Evidence(
+            evidence_id="verification-group-dominance", kind="verification", summary="review",
+            payload=json.dumps({"checks": [
+                {
+                    "evidence_id": "query-raw-functions", "verified": True,
+                    "plan": raw_plan.model_dump(mode="json"),
+                    "claim": {
+                        "statement": "There are 380 raw function records.",
+                        "value": 380, "unit": "records", "basis": "test",
+                    },
+                    "semantic_checks": [],
+                },
+                {
+                    "evidence_id": "query-grouped-functions", "verified": True,
+                    "plan": summary_plan.model_dump(mode="json"),
+                    "claim": {
+                        "statement": "Ten function groups summarize the scoped spaces.",
+                        "value": 10, "unit": "groups", "basis": "test",
+                        "details": ["Office: 100 m2", "Retail: 80 m2"],
+                    },
+                    "semantic_checks": [],
+                },
+            ]}),
+        ))
+
+        report = pipeline_report_from_evidence(context)
+
+        self.assertEqual(report.verification_status, "verified")
+        self.assertEqual(
+            [claim.statement for claim in report.claims],
+            ["Ten function groups summarize the scoped spaces."],
+        )
+        self.assertNotIn("380 raw function records", report.answer)
+        self.assertEqual(report.output_statuses[0].evidence_ids[0], "query-grouped-functions")
+
+    def test_measurement_dominates_raw_count_for_same_typed_output(self):
+        context = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+            task_contract=BimTaskContract(
+                goal="Measure total length", operation="sum", entity_concept="elements",
+                required_outputs=["total length"],
+                output_specs=[OutputSpec(
+                    key="total length", kind="measurement", metric="length",
+                    required_unit="m",
+                )],
+                success_criteria=["The canonical measurement is verified"],
+            ),
+        )
+        count_plan = BimQueryPlan(
+            entity="elements", operation="count", answer_key="length-record-count",
+            satisfies=["total length"],
+        )
+        sum_plan = BimQueryPlan(
+            entity="elements", operation="sum", metric="length",
+            answer_key="canonical-total-length", satisfies=["total length"],
+        )
+        context.add_evidence(Evidence(
+            evidence_id="verification-measurement-dominance", kind="verification", summary="review",
+            payload=json.dumps({"checks": [
+                {
+                    "evidence_id": "query-length-count", "verified": True,
+                    "plan": count_plan.model_dump(mode="json"),
+                    "claim": {
+                        "statement": "There are 106 length records.",
+                        "value": 106, "unit": "records", "basis": "test",
+                    },
+                    "semantic_checks": [],
+                },
+                {
+                    "evidence_id": "query-length-sum", "verified": True,
+                    "plan": sum_plan.model_dump(mode="json"),
+                    "claim": {
+                        "statement": "The total length is 556.98 m.",
+                        "value": 556.98, "unit": "m", "basis": "test",
+                        "measurement": {
+                            "source_value": 556.98, "source_unit": "m",
+                            "canonical_unit": "m", "conversion_factor": 1.0,
+                            "conversion_basis": "identity conversion",
+                            "source_property": "Length",
+                        },
+                    },
+                    "semantic_checks": [],
+                },
+            ]}),
+        ))
+
+        report = pipeline_report_from_evidence(context)
+
+        self.assertEqual(report.verification_status, "verified")
+        self.assertEqual(len(report.claims), 1)
+        self.assertEqual(report.claims[0].value, 556.98)
+        self.assertEqual(report.claims[0].measurement.canonical_unit, "m")
+        self.assertNotIn("106 length records", report.answer)
+
+    def test_dominance_preserves_claim_that_satisfies_a_distinct_output(self):
+        context = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+            task_contract=BimTaskContract(
+                goal="List and summarize functions", operation="group_summary",
+                entity_concept="spaces",
+                required_outputs=["function summary", "function records"],
+                output_specs=[
+                    OutputSpec(
+                        key="function summary", kind="grouped_summary",
+                        grouping_dimensions=["type"],
+                    ),
+                    OutputSpec(key="function records", kind="list"),
+                ],
+                success_criteria=["Both outputs are verified"],
+            ),
+        )
+        raw_plan = BimQueryPlan(
+            entity="spaces", operation="list", select=["type"],
+            answer_key="function-records",
+            satisfies=["function summary", "function records"],
+        )
+        summary_plan = BimQueryPlan(
+            entity="spaces", operation="group_count", group_by="type",
+            answer_key="function-summary", satisfies=["function summary"],
+        )
+        context.add_evidence(Evidence(
+            evidence_id="verification-distinct-output", kind="verification", summary="review",
+            payload=json.dumps({"checks": [
+                {
+                    "evidence_id": "query-function-records", "verified": True,
+                    "plan": raw_plan.model_dump(mode="json"),
+                    "claim": {
+                        "statement": "The function records are listed.",
+                        "value": 380, "unit": "records", "basis": "test",
+                    },
+                    "semantic_checks": [],
+                },
+                {
+                    "evidence_id": "query-function-summary", "verified": True,
+                    "plan": summary_plan.model_dump(mode="json"),
+                    "claim": {
+                        "statement": "The records form ten function groups.",
+                        "value": 10, "unit": "groups", "basis": "test",
+                    },
+                    "semantic_checks": [],
+                },
+            ]}),
+        ))
+
+        report = pipeline_report_from_evidence(context)
+
+        self.assertEqual(report.verification_status, "verified")
+        self.assertEqual(len(report.claims), 2)
+        self.assertEqual(
+            {item.output: item.status for item in report.output_statuses},
+            {"function summary": "verified", "function records": "verified"},
+        )
+        self.assertIn("The function records are listed.", report.answer)
+        self.assertIn("The records form ten function groups.", report.answer)
+
+    def test_dominance_does_not_mask_an_atomic_answer_conflict(self):
+        context = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+            task_contract=BimTaskContract(
+                goal="Summarize functions", operation="group_summary",
+                entity_concept="spaces", required_outputs=["function summary"],
+                output_specs=[OutputSpec(
+                    key="function summary", kind="grouped_summary",
+                    grouping_dimensions=["type"],
+                )],
+                success_criteria=["The summary is verified"],
+            ),
+        )
+        plans = [
+            BimQueryPlan(
+                entity="spaces", operation="list", answer_key="function-summary",
+                satisfies=["function summary"],
+            ),
+            BimQueryPlan(
+                entity="spaces", operation="group_count", group_by="type",
+                answer_key="function-summary", satisfies=["function summary"],
+            ),
+        ]
+        context.add_evidence(Evidence(
+            evidence_id="verification-typed-conflict", kind="verification", summary="review",
+            payload=json.dumps({"checks": [
+                {
+                    "evidence_id": f"query-conflict-{value}", "verified": True,
+                    "plan": plan.model_dump(mode="json"),
+                    "claim": {
+                        "statement": f"The answer is {value} groups.",
+                        "value": value, "unit": "groups", "basis": "test",
+                    },
+                    "semantic_checks": [],
+                }
+                for value, plan in zip((9, 10), plans)
+            ]}),
+        ))
+
+        report = pipeline_report_from_evidence(context)
+
+        self.assertEqual(report.verification_status, "insufficient_evidence")
+        self.assertEqual(report.claims, [])
+        self.assertIn("Conflicting", " ".join(report.limitations))
+        self.assertNotIn("10 groups", report.answer)
+
     def test_missing_required_output_marks_partial_answer_insufficient(self):
         context = BimRunContext(
             bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
@@ -380,6 +685,71 @@ class EvidenceGuardrailTests(unittest.TestCase):
 
         self.assertEqual(report.verification_status, "verified")
         self.assertEqual(report.answer, "There are 8 apartments.")
+        self.assertEqual(len(report.supporting_claims), 1)
+        self.assertEqual(report.supporting_claims[0].statement, "No identities are missing.")
+
+    def test_supporting_only_evidence_replaces_generic_insufficient_answer(self):
+        context = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+            completion_status="insufficient_evidence",
+            task_contract=BimTaskContract(
+                goal="Assess electrical connectivity", operation="coverage",
+                entity_concept="electrical components",
+                required_outputs=["panel assignment coverage", "physical connectivity"],
+                success_criteria=["Report assignment and relationship coverage separately"],
+            ),
+            runtime_limitations=[
+                "Physical port-to-panel continuity was not represented by an executable path."
+            ],
+        )
+        supporting = BimQueryPlan(
+            entity="elements", operation="coverage", coverage_field="panel",
+            role="supporting", include_in_answer=False,
+            satisfies=["panel assignment coverage"],
+        )
+        context.add_evidence(Evidence(
+            evidence_id="verification-supporting-only", kind="verification",
+            summary="supporting coverage verified",
+            payload=json.dumps({"checks": [{
+                "evidence_id": "q-panel-coverage", "verified": True,
+                "plan": supporting.model_dump(mode="json"),
+                "claim": {
+                    "statement": "Panel assignment is populated for 183 of 488 components.",
+                    "value": 183, "unit": "components", "basis": "replay-verified coverage",
+                },
+                "semantic_checks": [],
+            }]}),
+        ))
+
+        report = pipeline_report_from_evidence(context)
+
+        self.assertEqual(report.verification_status, "insufficient_evidence")
+        self.assertTrue(report.answer.startswith("Verified supporting evidence:"))
+        self.assertIn("183 of 488", report.answer)
+        self.assertIn("A complete direct answer remains unresolved", report.answer)
+        self.assertIn("Physical port-to-panel continuity", report.answer)
+        self.assertEqual(report.claims, [])
+        self.assertEqual(len(report.supporting_claims), 1)
+        statuses = {item.output: item.status for item in report.output_statuses}
+        self.assertEqual(statuses["panel assignment coverage"], "verified")
+        self.assertEqual(statuses["physical connectivity"], "unsupported")
+
+    def test_no_support_fallback_explains_gap_instead_of_old_generic_sentence(self):
+        context = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+            runtime_limitations=["No authorized project-program source was available."],
+        )
+
+        report = pipeline_report_from_evidence(context)
+
+        self.assertNotEqual(
+            report.answer,
+            "The BIM question could not be verified from the available scoped evidence.",
+        )
+        self.assertIn("no replay-verified supporting fact", report.answer)
+        self.assertIn("No authorized project-program source", report.answer)
 
     def test_pipeline_report_exposes_ordered_artifact_trace(self):
         context = BimRunContext(
@@ -472,6 +842,107 @@ class EvidenceGuardrailTests(unittest.TestCase):
         plan = query.call_args.args[1]
         self.assertEqual(plan.entity, "permit_knowledge")
         self.assertEqual(plan.operation, "list")
+
+    def test_report_discloses_bounded_details_and_actual_stages(self):
+        context = BimRunContext(
+            bim=object(),
+            scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+            workstream_diagnostics=[WorkstreamDiagnostic(
+                package_id="quantity-1", specialist="quantity",
+                status="partial_completed", attempts=2, typed_output_failures=1,
+                recovery_strategy="evidence_checkpoint",
+                required_outputs=["socket count"],
+                satisfied_outputs=["socket count"],
+            )],
+        )
+        context.add_artifact(RunArtifact(
+            artifact_id="query-1", kind="cypher_query", producer="Cypher Query Handler",
+            summary="Executed a bounded list.",
+        ))
+        context.add_artifact(RunArtifact(
+            artifact_id="verification-1", kind="semantic_review", producer="Verifier",
+            summary="Replayed the bounded list.",
+        ))
+        context.add_evidence(Evidence(
+            evidence_id="verification-bounded-list", kind="verification", summary="verified",
+            payload=json.dumps({"checks": [{
+                "evidence_id": "query-list", "verified": True,
+                "plan": {"role": "answer_producing", "include_in_answer": True},
+                "claim": {
+                    "statement": "Found 61 socket boxes.", "value": 61,
+                    "basis": "test", "details": ["first", "second"],
+                    "total_count": 61, "displayed_count": 2,
+                },
+                "semantic_checks": [],
+            }]}),
+        ))
+
+        report = pipeline_report_from_evidence(context)
+
+        self.assertIn("shows 2 of 61", report.answer)
+        self.assertEqual(report.stages_used, ["Cypher Query Handler", "Verifier"])
+        self.assertEqual(report.workstream_diagnostics[0].specialist, "quantity")
+        self.assertEqual(report.workstream_diagnostics[0].typed_output_failures, 1)
+        self.assertEqual(report.workstream_diagnostics[0].satisfied_outputs, ["socket count"])
+
+    def test_replay_safe_semantic_mismatch_is_retained_as_supporting_fact(self):
+        context = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+        )
+        context.add_evidence(Evidence(
+            evidence_id="verification-related", kind="verification", summary="related",
+            payload=json.dumps({"checks": [{
+                "evidence_id": "query-related", "verified": False,
+                "plan": {"role": "answer_producing", "answer_key": "floor-area"},
+                "claim": {
+                    "statement": "The governed floor-plate area is 586.248 m².",
+                    "value": 586.248, "unit": "m²", "basis": "scoped query",
+                    "method": "sum",
+                },
+                "semantic_checks": [
+                    {"name": "replay_stability", "passed": True, "explanation": "stable"},
+                    {"name": "authorized_scope", "passed": True, "explanation": "scoped"},
+                    {"name": "measurement_plausibility", "passed": True, "explanation": "plausible"},
+                    {"name": "entity_grain_matches", "passed": False,
+                     "explanation": "The exact direct-answer grain remains unresolved."},
+                ],
+            }]}),
+        ))
+
+        report = pipeline_report_from_evidence(context)
+
+        self.assertEqual(report.claims, [])
+        self.assertEqual(len(report.supporting_claims), 1)
+        self.assertIn("586.248 m²", report.answer)
+        self.assertIn("replay-stable related BIM fact", report.answer)
+        self.assertIn("How this was derived", report.answer)
+
+    def test_failed_safety_check_suppresses_related_value(self):
+        context = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=load_graph_contract(),
+        )
+        context.add_evidence(Evidence(
+            evidence_id="verification-unsafe", kind="verification", summary="unsafe",
+            payload=json.dumps({"checks": [{
+                "evidence_id": "query-unsafe", "verified": False,
+                "plan": {"role": "answer_producing", "answer_key": "unsafe"},
+                "claim": {"statement": "Unsafe value 999.", "value": 999, "basis": "test"},
+                "semantic_checks": [
+                    {"name": "replay_stability", "passed": True, "explanation": "stable"},
+                    {"name": "authorized_scope", "passed": True, "explanation": "scoped"},
+                    {"name": "measurement_plausibility", "passed": False,
+                     "explanation": "implausible"},
+                ],
+            }]}),
+        ))
+
+        report = pipeline_report_from_evidence(context)
+
+        self.assertEqual(report.supporting_claims, [])
+        self.assertNotIn("Unsafe value 999", report.answer)
 
 
 if __name__ == "__main__":

@@ -189,6 +189,27 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("challenger-graph-discovery", root.artifacts)
         self.assertEqual(_answer_query_ids(root), ["query-switches"])
 
+    def test_isolated_supporting_population_evidence_is_committed(self):
+        root = self.context()
+        branch = self.context()
+        branch.add_evidence(Evidence(
+            evidence_id="query-related-population",
+            kind="query",
+            summary="100 governed dwelling identities",
+            payload=(
+                '{"plan":{"role":"supporting","include_in_answer":false,'
+                '"satisfies":[]},"claim":{"value":100}}'
+            ),
+        ))
+
+        merged = _merge_isolated_workstream(
+            root, branch, workstream_id="sector-count",
+        )
+
+        self.assertEqual(merged, ["query-related-population"])
+        self.assertIn("query-related-population", root.evidence)
+        self.assertEqual(_answer_query_ids(root), ["query-related-population"])
+
     def test_conflicting_branch_merge_is_atomic(self):
         root = self.context()
         branch = self.context()

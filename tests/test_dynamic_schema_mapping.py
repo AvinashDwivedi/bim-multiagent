@@ -305,6 +305,11 @@ class DynamicSchemaMappingTests(unittest.TestCase):
                     SchemaFieldMapping(
                         semantic_name="level", property="floor_value", ontology_kind="level"
                     ),
+                    SchemaFieldMapping(
+                        semantic_name="dwelling_unit_number",
+                        property="dwelling_number",
+                        ontology_kind="aggregate_identity",
+                    ),
                 ],
                 reasoning_summary="Observed unique IDs and representative apartment/floor values.",
             ),
@@ -340,6 +345,61 @@ class DynamicSchemaMappingTests(unittest.TestCase):
         self.assertIn("n.`space_key`", count_query)
         self.assertEqual(parameters["filter_0"], ["apartment"])
         self.assertEqual(parameters["filter_1"], ["00 begane grond"])
+
+    def test_distinct_numeric_property_returns_converted_measurement_values(self):
+        class NumericBim(_Bim):
+            def query(self, cypher, parameters=None):
+                self.queries.append((cypher, parameters or {}))
+                if "AS candidate_count" in cypher:
+                    return [{"candidate_count": 3}]
+                if "AS total_groups" in cypher:
+                    return [{"total_groups": 2, "total_records": 3}]
+                if "AS value" in cypher and "ORDER BY count DESC" in cypher:
+                    return [{"value": 14.5, "count": 2}, {"value": 4.0, "count": 1}]
+                raise AssertionError(f"Unexpected query: {cypher}")
+
+        mapping = RegisteredSchemaMapping(
+            mapping_id="mapping-elevations",
+            proposal=SchemaMappingProposal(
+                entity_name="socket_boxes",
+                label="ObservedSocket",
+                identity_property="GlobalID",
+                source_property="source",
+                fields=[SchemaFieldMapping(
+                    semantic_name="elevation_from_level",
+                    property="Elevation from Level",
+                    data_type="number",
+                    source_unit="cm",
+                    unit="mm",
+                    conversion_factor=10,
+                    conversion_basis="centimetres to millimetres",
+                )],
+                counting_unit="physical socket box",
+                counting_unit_evidence="GlobalID is unique per socket box.",
+                reasoning_summary="The observed numeric property is the requested elevation.",
+            ),
+            node_count=3,
+            populated_identity_count=3,
+            distinct_identity_count=3,
+        )
+        bim = NumericBim()
+        context = BimRunContext(
+            bim=bim,
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=load_graph_contract(),
+            schema_mappings={mapping.mapping_id: mapping},
+        )
+
+        result = _execute_plan(context, BimQueryPlan(
+            entity="socket_boxes",
+            mapping_id=mapping.mapping_id,
+            operation="distinct",
+            group_by="elevation_from_level",
+        ))
+
+        self.assertEqual(result["claim"]["details"], ["145 mm: 2 records", "40 mm: 1 records"])
+        self.assertEqual(result["claim"]["measurement"]["conversion_factor"], 10)
+        self.assertIn("toFloat(n.`Elevation from Level`)", bim.queries[-1][0])
 
     def test_registered_exact_value_binding_bypasses_canonical_singularization(self):
         class SwitchBim(_Bim):

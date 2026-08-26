@@ -3,16 +3,26 @@ import unittest
 from pydantic import ValidationError
 
 from bim_agents.graph_contract import load_graph_contract
-from bim_agents.models import BimRunContext, BimTaskContract, ProjectScope, TaskConstraint
+from bim_agents.models import (
+    BimRunContext, BimTaskContract, ConstraintBinding, OutputSpec, ProjectScope,
+    TaskConstraint,
+)
 from bim_agents.tools import (
     BimFilter,
     BimQueryPlan,
     PipelineContext,
+    _enforce_specialist_query_scope,
     _format_space_rows,
+    _execute_plan,
     _space_list_headline,
     _validate_answer_metadata,
     _validate_plan,
 )
+
+
+class StableCountBim:
+    def query(self, _cypher, _parameters):
+        return [{"count": 8}]
 
 
 class GeneralQueryPlanTests(unittest.TestCase):
@@ -27,6 +37,54 @@ class GeneralQueryPlanTests(unittest.TestCase):
             filters=[BimFilter(field="ifc_class", operator="equals", value="wall")],
         )
         _validate_plan(self.contract.query_entity(plan.entity), plan)
+
+    def test_specialist_query_jobs_are_enforced_as_policy(self):
+        context = BimRunContext(
+            bim=object(), scope=ProjectScope(client_id="c", project_id="p"),
+            graph_contract=self.contract,
+        )
+        quantity = BimQueryPlan(entity="elements", operation="count")
+        relationship = BimQueryPlan(
+            entity="elements", operation="relationship_coverage", relationship="connected_to",
+        )
+        requirements = BimQueryPlan(entity="permit_knowledge", operation="list")
+
+        context.active_specialist = "quantity"
+        _enforce_specialist_query_scope(context, quantity)
+        with self.assertRaises(PermissionError):
+            _enforce_specialist_query_scope(context, relationship)
+
+        context.active_specialist = "relationship"
+        _enforce_specialist_query_scope(context, relationship)
+        with self.assertRaises(PermissionError):
+            _enforce_specialist_query_scope(context, quantity)
+
+        context.active_specialist = "requirements"
+        _enforce_specialist_query_scope(context, requirements)
+        with self.assertRaises(PermissionError):
+            _enforce_specialist_query_scope(context, quantity)
+
+        context.active_specialist = "geometry"
+        with self.assertRaises(PermissionError):
+            _enforce_specialist_query_scope(context, quantity)
+
+    def test_replay_digest_keeps_plan_package_after_branch_merge(self):
+        context = BimRunContext(
+            bim=StableCountBim(),
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=self.contract,
+            workstream_id="apartment-count",
+        )
+        plan = BimQueryPlan(
+            entity="spaces", operation="count", work_package_id="apartment-count",
+        )
+
+        original = _execute_plan(context, plan)
+        context.workstream_id = "root"
+        replay = _execute_plan(context, plan)
+
+        self.assertEqual(original["result_digest"], replay["result_digest"])
+        self.assertEqual(original["claim"]["work_package_id"], "apartment-count")
 
     def test_accepts_explicit_property_coverage(self):
         plan = BimQueryPlan(
@@ -191,6 +249,73 @@ class GeneralQueryPlanTests(unittest.TestCase):
             "filters": [BimFilter(field="level", operator="equals", value="ground floor")]
         })
         _validate_answer_metadata(PipelineContext(context), filtered)
+
+    def test_merged_root_accepts_plan_owned_exact_constraint_binding(self):
+        context = BimRunContext(
+            bim=object(),
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=self.contract,
+            workstream_id="root",
+            task_contract=BimTaskContract(
+                goal="Count seventh-floor apartments",
+                operation="count",
+                entity_concept="spaces",
+                constraints=[TaskConstraint(concept="floor", requested_value="7th floor")],
+                required_outputs=["apartment count"],
+                success_criteria=["Exact floor boundary"],
+            ),
+        )
+        plan = BimQueryPlan(
+            entity="spaces",
+            operation="count",
+            filters=[BimFilter(field="level", operator="equals", value="07 zevende verdieping")],
+            answer_key="seventh-apartments",
+            satisfies=["apartment count"],
+            work_package_id="seventh-apartments",
+            constraint_bindings=[ConstraintBinding(
+                concept="floor",
+                requested_value="7th floor",
+                semantic_field="level",
+                exact_values=["07 zevende verdieping"],
+                applied_as="filter",
+                package_id="seventh-apartments",
+            )],
+        )
+
+        _validate_answer_metadata(PipelineContext(context), plan)
+
+    def test_floor_area_output_accepts_canonical_area_metric_name(self):
+        context = BimRunContext(
+            bim=object(),
+            scope=ProjectScope(client_id="c", project_id="p", allowed_sources=["model.ifc"]),
+            graph_contract=self.contract,
+            task_contract=BimTaskContract(
+                goal="Measure floor area",
+                operation="maximum",
+                entity_concept="spaces",
+                required_outputs=["sixth-floor area"],
+                output_specs=[OutputSpec(
+                    key="sixth-floor area",
+                    kind="measurement",
+                    metric="floor area",
+                    required_unit="m²",
+                )],
+                success_criteria=["Verified area and unit"],
+            ),
+        )
+        plan = BimQueryPlan(
+            entity="spaces",
+            operation="maximum",
+            metric="area_m2",
+            answer_key="sixth-floor-area",
+            satisfies=["sixth-floor area"],
+        )
+
+        _validate_answer_metadata(PipelineContext(context), plan)
+
+        wrong_dimension = plan.model_copy(update={"metric": "elevation_m"})
+        with self.assertRaisesRegex(ValueError, "requires metric 'floor area'"):
+            _validate_answer_metadata(PipelineContext(context), wrong_dimension)
 
     def test_authorized_scope_is_governance_not_a_query_filter(self):
         context = BimRunContext(

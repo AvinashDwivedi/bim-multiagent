@@ -5,6 +5,7 @@ import re
 from collections import Counter, defaultdict
 from typing import Any
 
+from .computation import execute_governed_computation
 from .models import Claim, PipelineReport
 
 
@@ -24,13 +25,160 @@ def _quantity(payload: Any, set_name: str, field: str) -> float | None:
         return None
 
 
-def _report(statement: str, value: Any, unit: str, basis: str) -> PipelineReport:
-    claim = Claim(statement=statement, value=value, unit=unit, basis=basis)
+def _report(
+    statement: str,
+    value: Any,
+    unit: str,
+    basis: str,
+    *,
+    details: list[str] | None = None,
+    source_tags: list[str] | None = None,
+    method: str = "governed_geometry",
+) -> PipelineReport:
+    measurement = None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        measurement = {
+            "source_value": value,
+            "source_unit": unit,
+            "canonical_unit": unit,
+            "conversion_factor": 1.0,
+            "conversion_basis": "identity conversion from governed project quantities",
+            "source_property": ", ".join(source_tags or []),
+        }
+    claim = Claim(
+        statement=statement,
+        value=value,
+        unit=unit,
+        basis=basis,
+        details=details or [],
+        measurement=measurement,
+        source_tags=source_tags or [],
+        method=method,
+    )
     return PipelineReport(
         answer=statement,
         claims=[claim],
         stages_used=["Revit Geometry Query", "Deterministic Geometry Derivation"],
         investigation_trace=[basis],
+        verification_status="verified",
+    )
+
+
+def _governed_computation_report(
+    calculation: str, bim, allowed_sources: list[str], config: dict[str, Any],
+) -> PipelineReport:
+    result = execute_governed_computation(
+        calculation_key=calculation,
+        governed_config=config,
+        query=bim.query,
+        allowed_sources=allowed_sources,
+    )
+    if result.recipe == "composite_grouped_count":
+        group_unit = str(result.provenance.get("group_unit") or "group")
+        statement = (
+            f"The governed composite population contains {result.total_count} "
+            f"{result.unit}. Counts by {group_unit}:"
+        )
+        details = [
+            f"{row['group']}: {row['count']}"
+            for row in result.rows
+        ]
+        total = int(result.total_count or 0)
+        claim = Claim(
+            statement=statement,
+            value=total,
+            unit=result.unit,
+            basis=result.basis,
+            details=details,
+            total_count=total,
+            displayed_count=min(len(details), total),
+            coverage={
+                "candidate_count": total,
+                "evaluated_count": total,
+                "matched_count": total,
+                "missing_count": 0,
+                "unknown_count": 0,
+                "excluded_count": 0,
+                "exhaustive": True,
+            },
+            source_tags=[str(item) for item in result.provenance.get("component_keys") or []],
+            method=result.recipe,
+            caveats=result.limitations,
+        )
+    elif result.recipe == "scope_comparison":
+        baseline = str(result.provenance.get("baseline_scope") or "baseline")
+        details = [
+            f"{row['scope']}: {row['count']} {result.unit}"
+            for row in result.rows
+        ]
+        statement = (
+            f"The governed scope comparison reports {len(details)} populations "
+            f"relative to {baseline.replace('_', ' ')}."
+        )
+        claim = Claim(
+            statement=statement,
+            value="; ".join(
+                f"{row['scope']}={row['count']}" for row in result.rows
+            ),
+            unit=result.unit,
+            basis=result.basis,
+            details=details,
+            source_tags=[baseline, *[str(item) for item in result.provenance.get("scope_keys") or []]],
+            method=result.recipe,
+            caveats=result.limitations,
+        )
+    elif result.recipe == "property_coverage":
+        candidate_count = int(result.provenance.get("candidate_count") or 0)
+        populated_count = int(result.provenance.get("populated_count") or 0)
+        missing_count = int(result.provenance.get("missing_count") or 0)
+        assignment_unit = str(
+            result.provenance.get("assignment_unit") or "governed property assignment"
+        )
+        fill_rate = result.provenance.get("fill_rate_percent")
+        rate_text = f" ({fill_rate:g}%)" if isinstance(fill_rate, (int, float)) else ""
+        statement = (
+            f"Of {candidate_count} governed {result.unit}, {populated_count} have an explicit "
+            f"{assignment_unit} and {missing_count} are missing it{rate_text}."
+        )
+        claim = Claim(
+            statement=statement,
+            value=missing_count,
+            unit=f"{result.unit} missing {assignment_unit}",
+            basis=result.basis,
+            details=[
+                f"Populated: {populated_count}",
+                f"Missing: {missing_count}",
+                f"Candidate population: {candidate_count}",
+            ],
+            total_count=candidate_count,
+            displayed_count=candidate_count,
+            coverage={
+                "candidate_count": candidate_count,
+                "evaluated_count": candidate_count,
+                "matched_count": populated_count,
+                "missing_count": missing_count,
+                "unknown_count": 0,
+                "excluded_count": 0,
+                "exhaustive": True,
+            },
+            source_tags=[
+                str(result.provenance.get("property") or "governed property")
+            ],
+            method=result.recipe,
+            caveats=result.limitations,
+        )
+    else:  # The registry is closed, but retain a defensive boundary here.
+        raise ValueError(f"Unsupported governed computation result: {result.recipe!r}.")
+    claim.source_tags.append(f"config:{result.config_digest[:12]}")
+    return PipelineReport(
+        answer=statement,
+        claims=[claim],
+        limitations=result.limitations,
+        stages_used=["Governed Calculation Registry", "Deterministic Computation"],
+        investigation_trace=[
+            f"Executed {calculation} with recipe {result.recipe} v{result.recipe_version}; "
+            f"result digest {result.result_digest[:12]}."
+        ],
         verification_status="verified",
     )
 
@@ -90,6 +238,18 @@ def _section_heights(bim, allowed_sources: list[str], knowledge: dict[str, Any])
         "m",
         "Project-scoped roof gross areas joined to containing-storey elevations using scoped knowledge: "
         + str(config.get("semantics") or "primary massing-section interpretation"),
+        details=[
+            *(f"Primary massing-section roof elevation: {height:g} m." for height in heights),
+            *(
+                [f"Highest defined storey reference elevation: {float(highest_storey):g} m."]
+                if highest_storey is not None else []
+            ),
+        ],
+        source_tags=[
+            f"{slab_label}.{config.get('quantity_set')}.{config.get('area_quantity')}",
+            "IfcBuildingStorey.placement_z",
+        ],
+        method="primary_roof_plate_elevations",
     )
 
 
@@ -148,6 +308,14 @@ def _tower_max_floor_area(
         "m²",
         "Project-scoped residential floor plates calculated using scoped knowledge: "
         + str(config.get("semantics") or "tower floor-plate interpretation"),
+        details=[
+            f"Attaining floor/storey: {level}." for level in levels
+        ] + [f"Area measurement basis: {basis}."],
+        source_tags=[
+            f"{label}.{area_property}", f"{label}.{level_property}",
+            f"{label}.{basis_property}",
+        ],
+        method="maximum_repeated_floor_plate",
     )
 
 
@@ -179,15 +347,21 @@ def _facade_opening_percentage(bim, allowed_sources: list[str], knowledge: dict[
     )
     opaque_by_level: dict[str, float] = defaultdict(float)
     opening_by_level: dict[str, float] = defaultdict(float)
+    valid_walls: list[tuple[str, float]] = []
+    valid_openings: list[tuple[str, float]] = []
     for row in wall_rows:
         area = _quantity(row.get("quantities"), str(config.get("wall_quantity_set")), str(config.get("opaque_area_quantity")))
         if area is not None and row.get("level"):
-            opaque_by_level[str(row["level"])] += area
+            level = str(row["level"])
+            opaque_by_level[level] += area
+            valid_walls.append((level, area))
     for row in opening_rows:
         quantity_set = config.get("window_quantity_set") if row.get("ifc_class") == "IfcWindow" else config.get("door_quantity_set")
         area = _quantity(row.get("quantities"), str(quantity_set), str(config.get("opening_area_quantity")))
         if area is not None and row.get("level"):
-            opening_by_level[str(row["level"])] += area
+            level = str(row["level"])
+            opening_by_level[level] += area
+            valid_openings.append((level, area))
     common_levels = set(opaque_by_level) & set(opening_by_level)
     if not common_levels:
         return None
@@ -202,26 +376,84 @@ def _facade_opening_percentage(bim, allowed_sources: list[str], knowledge: dict[
     if repetitions < int(config.get("repeated_floor_min_count")):
         return None
     opaque_area, opening_area = signature
-    percentage = 100.0 * opening_area / (opaque_area + opening_area)
+    denominator_area = opaque_area + opening_area
+    percentage = 100.0 * opening_area / denominator_area
     approximate_percentage = round(percentage / 5.0) * 5
     statement = (
         f"The typical tower façade opening percentage is {percentage:.1f}% "
         f"(approximately {approximate_percentage:g}%). "
         f"It is consistent across {len(tower_levels)} repeated tower floors."
     )
-    return _report(
-        statement,
-        round(percentage, 3),
-        "%",
+    candidate_count = len(wall_rows) + len(opening_rows)
+    valid_count = len(valid_walls) + len(valid_openings)
+    selected_count = sum(
+        1 for level, _area in [*valid_walls, *valid_openings] if level in tower_levels
+    )
+    missing_count = max(candidate_count - valid_count, 0)
+    excluded_count = max(valid_count - selected_count, 0)
+    basis_text = (
         "Project-scoped Revit facade quantities calculated using scoped knowledge: "
-        + str(config.get("semantics") or "typical tower-facade interpretation"),
+        + str(config.get("semantics") or "typical tower-facade interpretation")
+    )
+    claim = Claim(
+        statement=statement,
+        value=round(percentage, 3),
+        unit="%",
+        basis=basis_text,
+        details=[
+            f"Qualifying opening-area numerator: {opening_area:.3f} m².",
+            f"Tower-facade denominator area: {denominator_area:.3f} m².",
+            f"Opaque facade component: {opaque_area:.3f} m².",
+            "Calculation basis: opening area / (opening area + oriented opaque facade area) × 100.",
+            "Repeated tower floors: " + ", ".join(tower_levels) + ".",
+        ],
+        coverage={
+            "candidate_count": candidate_count,
+            "evaluated_count": candidate_count,
+            "matched_count": selected_count,
+            "missing_count": missing_count,
+            "unknown_count": 0,
+            "excluded_count": excluded_count,
+            "exhaustive": True,
+        },
+        measurement={
+            "source_value": round(percentage, 3),
+            "source_unit": "%",
+            "canonical_unit": "%",
+            "conversion_factor": 1.0,
+            "conversion_basis": "ratio converted to percent exactly once",
+            "source_property": (
+                f"{wall_label}.{config.get('wall_quantity_set')}.{config.get('opaque_area_quantity')} + "
+                f"{','.join(opening_labels)}.{config.get('opening_area_quantity')}"
+            ),
+        },
+        source_tags=[
+            f"{wall_label}.{config.get('opaque_area_quantity')}",
+            *(f"{label}.{config.get('opening_area_quantity')}" for label in opening_labels),
+        ],
+        method="typical_facade_opening_ratio",
+    )
+    return PipelineReport(
+        answer=statement,
+        claims=[claim],
+        stages_used=["Revit Geometry Query", "Deterministic Geometry Derivation"],
+        investigation_trace=[basis_text],
+        verification_status="verified",
     )
 
 
 def calculate_project_geometry(
     calculation: str, bim, allowed_sources: list[str], knowledge: dict[str, Any]
 ) -> PipelineReport | None:
-    """Execute one named geometry derivation selected by the agent from scoped knowledge."""
+    """Execute one named allowlisted project calculation from scoped knowledge."""
+    governed = [
+        config for config in knowledge.values()
+        if isinstance(config, dict) and config.get("calculation") == calculation
+    ]
+    if len(governed) > 1:
+        raise ValueError(f"Calculation {calculation!r} is ambiguously configured.")
+    if governed and governed[0].get("recipe"):
+        return _governed_computation_report(calculation, bim, allowed_sources, governed[0])
     if calculation == "section_heights":
         return _section_heights(bim, allowed_sources, knowledge)
     if calculation == "facade_opening_percentage":

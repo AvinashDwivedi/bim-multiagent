@@ -118,6 +118,46 @@ class ProjectMappingActivationTests(unittest.TestCase):
             "Type",
         )
 
+    def test_governed_mapping_live_validates_relationship_capability(self):
+        context = self.context(["Tray A"])
+        context.bim.ontology.bim_query_knowledge["connected_trays"] = {
+            "entity_concept": "connected tray segments",
+            "label": "IfcFlowSegment",
+            "source_property": "source",
+            "identity_property": "GlobalID",
+            "classification_property": "Type",
+            "exact_family_values": ["Tray A"],
+            "relationship_bindings": [{
+                "semantic_name": "has_distribution_port",
+                "purpose": "Physical port attachment.",
+                "steps": [{
+                    "from_label": "IfcFlowSegment",
+                    "relationship_type": "PORT_OF",
+                    "to_label": "IfcDistributionPort",
+                    "direction": "incoming",
+                    "purpose": "Attach segment to port.",
+                }],
+            }],
+            "counting_unit": "physical tray segment",
+            "counting_unit_semantics": "GlobalID is unique per segment.",
+        }
+        observed = {"properties": ["source", "GlobalID", "Type"]}
+        structure = {"relationship_types": [{
+            "type": "PORT_OF",
+            "from_labels": ["IfcDistributionPort"],
+            "to_labels": ["IfcFlowSegment"],
+        }]}
+        with (
+            patch("bim_agents.tools._observed_node_type", return_value=observed),
+            patch("bim_agents.tools._project_graph_structure", return_value=structure),
+        ):
+            activate_project_knowledge_mapping(PipelineContext(context), "connected_trays")
+
+        mapping = next(iter(context.schema_mappings.values()))
+        binding = mapping.proposal.relationship_bindings[0]
+        self.assertEqual(binding.semantic_name, "has_distribution_port")
+        self.assertEqual(binding.steps[0].relationship_type, "PORT_OF")
+
 
 if __name__ == "__main__":
     unittest.main()

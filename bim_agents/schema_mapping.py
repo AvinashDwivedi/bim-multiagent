@@ -8,15 +8,20 @@ from pydantic import BaseModel, Field, model_validator
 class SchemaFieldMapping(BaseModel):
     semantic_name: str
     property: str
+    aliases: list[str] = Field(default_factory=list, max_length=20)
     data_type: Literal["string", "number"] = "string"
     unit: str | None = None
     source_unit: str | None = None
     conversion_factor: float = Field(default=1.0, gt=0)
     conversion_basis: str = "identity conversion"
-    ontology_kind: Literal["canonical_type", "ifc_class", "level"] | None = None
+    ontology_kind: Literal[
+        "canonical_type", "ifc_class", "level", "aggregate_identity"
+    ] | None = None
 
     @model_validator(mode="after")
     def validate_unit_conversion(self) -> "SchemaFieldMapping":
+        if any(not alias.strip() for alias in self.aliases):
+            raise ValueError("Schema field aliases must be non-blank.")
         if self.source_unit and self.unit and self.source_unit != self.unit and self.conversion_factor == 1:
             raise ValueError("Different source and canonical units require an explicit conversion factor.")
         return self
@@ -28,6 +33,14 @@ class SchemaRelationshipStep(BaseModel):
     to_label: str
     direction: Literal["outgoing", "incoming"] = "outgoing"
     purpose: str = Field(description="Why this traversal is relevant to the user's question.")
+
+
+class SchemaRelationshipBinding(BaseModel):
+    """A named, fixed, live-validated relationship path rooted at the mapped entity."""
+
+    semantic_name: str
+    steps: list[SchemaRelationshipStep] = Field(min_length=1, max_length=4)
+    purpose: str
 
 
 class SchemaMatchEvidence(BaseModel):
@@ -59,6 +72,7 @@ class SchemaMappingProposal(BaseModel):
         max_length=4,
         description="Observed path used to reach the mapped entity; the final step must end at label.",
     )
+    relationship_bindings: list[SchemaRelationshipBinding] = Field(default_factory=list)
     fields: list[SchemaFieldMapping] = Field(default_factory=list)
     match_evidence: list[SchemaMatchEvidence] = Field(default_factory=list)
     value_bindings: list[SchemaValueBinding] = Field(default_factory=list)

@@ -12,7 +12,8 @@ A coding-agent-style, read-only system for investigating one authorized BIM proj
 5. A fresh Query Worker receives only the package and compact typed scout handoff, then submits the
    smallest declarative answer query. It has no discovery or mapping tools.
 6. The runtime validates each staged delta, atomically commits non-conflicting evidence, replays scoped
-   Cypher, checks completion, curates reusable mappings, and renders the answer.
+   Cypher, runs deterministic semantic-adequacy checks, checks completion, curates reusable mappings,
+   and renders the answer.
 
 This is a coding-agent-style architecture: models are isolated workers while runtime code owns scheduling,
 authorization, budgets, commits, dependencies, and stopping. Independent packages run concurrently;
@@ -65,10 +66,40 @@ required-output coverage, contradictions, and replay stability. Replay-verified 
 when secondary completion gates remain open; unresolved checks follow as caveats. Task complexity adjusts
 model/tool budgets without storing project-specific numeric answers.
 
+Replay alone is not proof that a query answered the intended question. Each output carries typed semantic
+intent: entity grain, measurement basis, population boundary, planned-versus-actual origin, absence meaning,
+and requested projection. A deterministic semantic challenger compares that contract with the registered
+mapping, executed plan, population coverage, and returned claim. Entity/aggregate swaps, wrong measurement
+bases, incomplete populations, planned values presented as actual, and related-but-wrong projections fail
+verification even when the Cypher result is stable.
+
+Absence is explicit. The system distinguishes a missing population, an existing population with an
+unpopulated property, a replay-verified zero, and unsupported evidence. Distinct/grouped queries measure the
+candidate population separately, so an empty property column cannot be reported as if no BIM entities exist.
+
 At run start, deterministic code builds one compact scoped model profile containing label/property surfaces
 and relationship patterns. Isolated scouts share this immutable routing profile instead of rediscovering the
-same graph in separate conversations. It is explicitly a cache hint: exact bindings, current values, counts,
+same graph in separate conversations. Compatible profiles persist in the operational SQLite store and are
+keyed by project, authorized-source set, graph-contract version, and a schema fingerprint that includes both
+node properties and relationship topology. It is explicitly a cache hint: exact bindings, current values, counts,
 and absence findings are always executed and replayed live.
+
+Named project calculations run through a frozen code-owned recipe registry. Current primitives support
+composite grouped populations, exact inclusion/exclusion boundaries, nullable group buckets, scoped
+relationship fallbacks, stable-identity source joins, and baseline/subscope comparisons. Project YAML may
+select a recipe and its identifiers/semantics, but cannot store answer values or executable expressions.
+
+Registered mappings may expose fixed, live-validated relationship paths. Plans can measure exhaustive
+`relationship_coverage` or apply compiler-owned `exists`/`is_missing` relationship predicates; models cannot
+invent relationship names or variable-length paths. Every intermediate node remains inside authorized scope.
+If ingestion omitted source provenance or a containment/connectivity edge, the system reports the unresolved
+population instead of converting a missing property into a physical-disconnection claim.
+
+Exact query results are cached only within their isolated run/workstream. The cache key covers the fully
+defaulted plan, package constraint bindings, source scope, active mapping, schema fingerprint, and contract
+version. Verification bypasses that cache and independently replays the plan. Equivalent learned mappings use
+a stable executable-semantics digest, so repeated discovery merges aliases/evidence rather than growing
+duplicate knowledge records.
 
 Numeric mappings retain `source_unit`, canonical `unit`, `conversion_factor`, conversion basis, and source
 property. Aggregation and numeric filters convert exactly once at the compiler boundary. Claims expose typed
@@ -98,7 +129,9 @@ available to the autonomous runtime: learned knowledge stays inside its originat
 
 Exact stored value bindings bypass linguistic canonicalization. Promoted mappings are activated only when
 their labels, properties, identities, and exact bound values still exist. Timed-out, cancelled, failed,
-insufficient-evidence, zero-match, or diagnostic-bearing runs cannot promote knowledge.
+insufficient-evidence, zero-match, diagnostic-bearing, semantically inadequate, or supporting-only runs cannot
+promote knowledge. Promotion also requires a ready project-scoped completion, matching provenance,
+package/output ownership, an active mapping, and answer-producing replay evidence.
 
 Governed project mappings are a faster bootstrap for known difficult schemas. A scout can select only a
 server-configured knowledge key; deterministic code then verifies the configured label, authorization and
@@ -106,9 +139,30 @@ identity properties, exact category/family boundary, numeric fields and units, o
 and live value population before registering it. The
 configuration stores semantics, never counts or answer values, and fails closed when the live schema changes.
 
-The active registry contains a Task Architect, BIM Schema Scout, and BIM Query Worker. Replay verification,
-completion gates, guarded knowledge curation, DAG scheduling, and merging are deterministic runtime
-responsibilities rather than model-agent hops.
+The active registry uses coding-agent-style specialists with small contexts:
+
+```text
+User question
+  -> Task Architect (typed package DAG only)
+  -> governed deterministic route, when available (zero worker-model calls)
+  -> otherwise Schema Mapping Specialist (one package, discovery tools only)
+  -> exactly one terminal specialist:
+       Quantity | Relationship | Geometry | Requirements
+  -> deterministic replay, completion gates, ordered merge, and answer assembly
+```
+
+Each terminal specialist receives only its package objective, projected constraints, typed outputs, and compact
+schema handoff. It does not receive the root question, sibling packages, discovery transcript, credentials, or
+sibling evidence. Schema and execution phases also use distinct mutable run contexts. Replay verification,
+guarded knowledge curation, scheduling, and merging remain deterministic runtime responsibilities rather than
+additional model-agent hops.
+
+Typed specialist handoffs have a bounded repair loop. If a model returns malformed completion JSON after it
+already executed a valid answer query, the package-local evidence ledger acts as a durable checkpoint and
+validated evidence is recovered instead of discarded. Partial packages retain only outputs they genuinely
+satisfied and expose the remaining limitations. Reports include `workstream_diagnostics` with specialist,
+status, attempts, typed-output failures, recovery strategy, and required/satisfied outputs, allowing evaluator
+runs to identify weak agents without private model traces.
 
 Parallelism is runtime-managed rather than model-issued. Results merge in architect order with validate-then-
 commit semantics; mapping-only workstreams, conflicting mappings/evidence, invalid ownership, and unexpected
@@ -184,3 +238,20 @@ python -m unittest discover -s tests -v
 Evaluation code, datasets, reports, chat UI, and the evaluation dashboard live in the separate sibling
 `bim-evaluator` repository. Start its server with `python -m server`, then open
 `http://127.0.0.1:8090/evaluation`. The examiner calls this backend only through its public HTTP API.
+
+### Privacy-safe evaluator analysis
+
+Use the built-in analyzer to inspect an evaluator JSON report without emitting
+case content. It returns aggregate outcomes, pipeline statuses, failure
+categories, semantic-check results, implicated stages/specialists, and (when a
+baseline is supplied) anonymous regression deltas. Questions, expected or actual
+answers, answer values, explanations, and scope identifiers are never included
+in the output.
+
+```powershell
+python -m bim_agents.evaluation_analysis latest-report.json
+python -m bim_agents.evaluation_analysis latest-report.json --baseline previous-report.json
+```
+
+The same functionality is available as `analyze_report(report)` and
+`compare_reports(current, baseline)` from `bim_agents.evaluation_analysis`.

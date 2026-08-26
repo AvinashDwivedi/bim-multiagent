@@ -75,6 +75,24 @@ _FORBIDDEN_KEYS = {
     "result", "result_value", "count", "total_count",
 }
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_PROMOTION_SEMANTIC_CHECKS = {
+    "replay_stability",
+    "authorized_scope",
+    "identity_integrity",
+    "constraint_binding",
+    "counting_unit",
+    "boundary_exactness",
+    "source_deduplication",
+    "classification_purity",
+    "constraint_coverage",
+    "entity_grain_matches",
+    "measurement_basis_matches",
+    "population_complete",
+    "planned_actual_distinguished",
+    "absence_semantics_correct",
+    "projection_answers_question",
+    "requested_outputs_present",
+}
 
 
 def _now() -> str:
@@ -116,8 +134,73 @@ def _mapping_payload(mapping: RegisteredSchemaMapping) -> dict[str, Any]:
     return payload
 
 
+def _stable_payload_digest(kind: KnowledgeKind, payload: dict[str, Any]) -> str:
+    """Hash reusable semantics while excluding discovery-time confidence prose.
+
+    Schema mappings can be rediscovered with different similarity scores or user
+    wording even though they compile to the same graph boundary.  Those volatile
+    observations must not create several reusable mappings for one executable
+    interpretation.
+    """
+    stable_payload: dict[str, Any] = payload
+    if kind == "schema_mapping" and isinstance(payload.get("proposal"), dict):
+        proposal = dict(payload["proposal"])
+        proposal.pop("match_evidence", None)
+        proposal.pop("reasoning_summary", None)
+        proposal.pop("counting_unit_evidence", None)
+        fields = proposal.get("fields")
+        if isinstance(fields, list):
+            proposal["fields"] = sorted(
+                fields,
+                key=lambda item: (
+                    str(item.get("semantic_name") or ""),
+                    str(item.get("property") or ""),
+                ) if isinstance(item, dict) else (str(item), ""),
+            )
+        bindings = proposal.get("value_bindings")
+        if isinstance(bindings, list):
+            stable_bindings: list[Any] = []
+            for binding in bindings:
+                if not isinstance(binding, dict):
+                    stable_bindings.append(binding)
+                    continue
+                stable_binding = {
+                    "semantic_name": binding.get("semantic_name"),
+                    "property": binding.get("property"),
+                    "matches": sorted(
+                        str(match.get("value") or "").casefold().strip()
+                        for match in binding.get("matches") or []
+                        if isinstance(match, dict) and str(match.get("value") or "").strip()
+                    ),
+                }
+                stable_bindings.append(stable_binding)
+            proposal["value_bindings"] = sorted(
+                stable_bindings,
+                key=lambda item: (
+                    str(item.get("semantic_name") or ""),
+                    str(item.get("property") or ""),
+                ) if isinstance(item, dict) else (str(item), ""),
+            )
+        relationship_bindings = proposal.get("relationship_bindings")
+        if isinstance(relationship_bindings, list):
+            proposal["relationship_bindings"] = sorted(
+                relationship_bindings,
+                key=lambda item: str(item.get("semantic_name") or "")
+                if isinstance(item, dict) else str(item),
+            )
+        stable_payload = {"proposal": proposal}
+    return hashlib.sha256(
+        json.dumps(stable_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 def compute_live_schema_fingerprint(context: BimRunContext) -> str:
-    """Fingerprint the scoped live label/property surface plus contract version."""
+    """Fingerprint the authorized node and relationship schema surface.
+
+    Learned executable mappings are compatible only when their source set, node
+    properties, and relationship topology are unchanged. Counts and sample values are
+    deliberately excluded so normal model edits do not invalidate structural knowledge.
+    """
     source_property = context.graph_contract.authorization_path.source_property
     rows = context.bim.query(
         f"MATCH (n) WHERE n.`{source_property}` IN $allowed_sources "
@@ -125,14 +208,38 @@ def compute_live_schema_fingerprint(context: BimRunContext) -> str:
         "RETURN label, collect(DISTINCT property) AS properties ORDER BY label",
         {"allowed_sources": context.scope.allowed_sources},
     )
+    relationship_rows = context.bim.query(
+        f"MATCH (a)-[r]->(b) WHERE a.`{source_property}` IN $allowed_sources "
+        f"AND b.`{source_property}` IN $allowed_sources "
+        "RETURN labels(a) AS from_labels, type(r) AS relationship_type, "
+        "labels(b) AS to_labels, collect(DISTINCT keys(r)) AS property_key_groups "
+        "ORDER BY relationship_type, from_labels, to_labels",
+        {"allowed_sources": context.scope.allowed_sources},
+    )
     stable = {
         "contract_version": context.graph_contract.version,
+        "client_id": context.scope.client_id,
+        "project_id": context.scope.project_id,
+        "allowed_sources": sorted(set(context.scope.allowed_sources)),
         "nodes": [
             {
                 "label": str(row.get("label") or ""),
                 "properties": sorted(str(item) for item in row.get("properties") or []),
             }
             for row in rows
+        ],
+        "relationships": [
+            {
+                "from_labels": sorted(str(item) for item in row.get("from_labels") or []),
+                "type": str(row.get("relationship_type") or ""),
+                "to_labels": sorted(str(item) for item in row.get("to_labels") or []),
+                "properties": sorted({
+                    str(item)
+                    for group in row.get("property_key_groups") or []
+                    for item in (group or [])
+                }),
+            }
+            for row in relationship_rows
         ],
     }
     return hashlib.sha256(
@@ -177,7 +284,47 @@ class LearnedKnowledgeStore:
                 );
                 CREATE INDEX IF NOT EXISTS learned_knowledge_scope_status
                 ON learned_knowledge(client_id, project_id, status, schema_fingerprint);
+
+                CREATE TABLE IF NOT EXISTS model_profiles (
+                    cache_key TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    schema_fingerprint TEXT NOT NULL,
+                    profile_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
+            )
+            connection.commit()
+
+    def load_model_profile(self, cache_key: str) -> dict | None:
+        """Load operational routing metadata, never answer evidence."""
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT profile_json FROM model_profiles WHERE cache_key=?",
+                (cache_key,),
+            ).fetchone()
+        return json.loads(row["profile_json"]) if row else None
+
+    def save_model_profile(
+        self, *, cache_key: str, client_id: str, project_id: str,
+        schema_fingerprint: str, profile: dict,
+    ) -> None:
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute(
+                """
+                INSERT INTO model_profiles(
+                    cache_key, client_id, project_id, schema_fingerprint,
+                    profile_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    profile_json=excluded.profile_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    cache_key, client_id, project_id, schema_fingerprint,
+                    json.dumps(profile, ensure_ascii=False, sort_keys=True), _now(),
+                ),
             )
             connection.commit()
 
@@ -198,16 +345,32 @@ class LearnedKnowledgeStore:
         proposal: KnowledgeProposal, payload: dict[str, Any],
     ) -> LearnedKnowledgeRecord:
         _reject_direct_answers(payload)
+        payload_digest = _stable_payload_digest(proposal.kind, payload)
         stable = {
             "client_id": client_id, "project_id": project_id,
             "schema_fingerprint": schema_fingerprint, "kind": proposal.kind,
-            "concept": proposal.concept.casefold(), "payload": payload,
+            "payload_digest": payload_digest,
         }
+        if proposal.kind != "schema_mapping":
+            stable["concept"] = proposal.concept.casefold()
         knowledge_id = "knowledge-" + hashlib.sha256(
             json.dumps(stable, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()[:16]
         timestamp = _now()
         with self._lock, closing(self._connect()) as connection:
+            existing = connection.execute(
+                "SELECT evidence_ids_json, aliases_json FROM learned_knowledge "
+                "WHERE knowledge_id = ?",
+                (knowledge_id,),
+            ).fetchone()
+            evidence_ids = list(dict.fromkeys([
+                *(json.loads(existing["evidence_ids_json"]) if existing else []),
+                *proposal.evidence_ids,
+            ]))
+            aliases = list(dict.fromkeys([
+                *(json.loads(existing["aliases_json"]) if existing else []),
+                *proposal.aliases,
+            ]))
             connection.execute(
                 """
                 INSERT INTO learned_knowledge (
@@ -224,8 +387,8 @@ class LearnedKnowledgeStore:
                 (
                     knowledge_id, client_id, project_id, schema_fingerprint,
                     proposal.kind, proposal.concept, json.dumps(payload, ensure_ascii=False),
-                    json.dumps(list(dict.fromkeys(proposal.evidence_ids)), ensure_ascii=False),
-                    json.dumps(list(dict.fromkeys(proposal.aliases)), ensure_ascii=False),
+                    json.dumps(evidence_ids, ensure_ascii=False),
+                    json.dumps(aliases, ensure_ascii=False),
                     proposal.confidence, timestamp, timestamp,
                 ),
             )
@@ -258,6 +421,19 @@ class LearnedKnowledgeStore:
             connection.commit()
         return self._record(row)
 
+    def scoped_record(
+        self, knowledge_id: str, *, client_id: str, project_id: str,
+        schema_fingerprint: str,
+    ) -> LearnedKnowledgeRecord | None:
+        """Load one record only when every reuse boundary matches the active run."""
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM learned_knowledge WHERE knowledge_id=? AND client_id=? "
+                "AND project_id=? AND schema_fingerprint=?",
+                (knowledge_id, client_id, project_id, schema_fingerprint),
+            ).fetchone()
+        return self._record(row) if row else None
+
     def compatible(
         self, *, client_id: str, project_id: str, schema_fingerprint: str,
         statuses: tuple[KnowledgeStatus, ...] = ("promoted",),
@@ -270,7 +446,33 @@ class LearnedKnowledgeStore:
                 "ORDER BY confidence DESC, updated_at DESC",
                 [client_id, project_id, schema_fingerprint, *statuses],
             ).fetchall()
-        return [self._record(row) for row in rows]
+        records = [self._record(row) for row in rows]
+        lifecycle_priority = {
+            "promoted": 5, "verified": 4, "candidate": 3,
+            "deprecated": 2, "rejected": 1,
+        }
+        selected: dict[tuple[str, ...], LearnedKnowledgeRecord] = {}
+        for record in records:
+            payload_digest = _stable_payload_digest(record.kind, record.payload)
+            key = (
+                (record.kind, payload_digest)
+                if record.kind == "schema_mapping"
+                else (record.kind, payload_digest, record.concept.casefold())
+            )
+            current = selected.get(key)
+            if current is None or (
+                lifecycle_priority[record.status], record.confidence, record.updated_at
+            ) > (
+                lifecycle_priority[current.status], current.confidence, current.updated_at
+            ):
+                selected[key] = record
+        return sorted(
+            selected.values(),
+            key=lambda record: (
+                lifecycle_priority[record.status], record.confidence, record.updated_at
+            ),
+            reverse=True,
+        )
 
     def deprecate_incompatible(
         self, *, client_id: str, project_id: str, schema_fingerprint: str,
@@ -298,6 +500,111 @@ def _latest_verified_checks(context: BimRunContext) -> dict[str, dict[str, Any]]
             if check.get("evidence_id")
         }
     return {}
+
+
+def _mapping_ids_for_record(
+    context: BimRunContext, record: LearnedKnowledgeRecord,
+) -> set[str]:
+    """Resolve all live mapping IDs represented by a deduplicated stored payload."""
+    if record.kind != "schema_mapping":
+        return set()
+    digest = _stable_payload_digest(record.kind, record.payload)
+    return {
+        mapping_id
+        for mapping_id, mapping in context.schema_mappings.items()
+        if isinstance(mapping, RegisteredSchemaMapping)
+        and _stable_payload_digest("schema_mapping", _mapping_payload(mapping)) == digest
+    }
+
+
+def _owned_required_outputs(
+    context: BimRunContext, evidence_id: str, plan: dict[str, Any],
+) -> set[str]:
+    """Return only task outputs this evidence is authorized to satisfy."""
+    if context.task_contract is None:
+        return set()
+    required = set(context.task_contract.required_outputs)
+    satisfies = {str(item) for item in plan.get("satisfies") or [] if str(item).strip()}
+    if not satisfies or not satisfies <= required:
+        return set()
+    evidence = context.evidence.get(evidence_id)
+    if evidence is None:
+        return set()
+    package_id = evidence.work_package_id or (
+        evidence.workstream_id if evidence.workstream_id != "root" else ""
+    )
+    if not package_id or not context.task_contract.work_packages:
+        return satisfies
+    package = next(
+        (
+            item for item in context.task_contract.work_packages
+            if item.package_id == package_id
+        ),
+        None,
+    )
+    if package is None:
+        return set()
+    return satisfies & set(package.required_outputs)
+
+
+def _source_plan_matches_check(
+    context: BimRunContext, evidence_id: str, plan: dict[str, Any],
+) -> bool:
+    """Prevent a verification payload from upgrading unrelated query evidence."""
+    evidence = context.evidence.get(evidence_id)
+    if evidence is None or evidence.kind != "query":
+        return False
+    try:
+        source_plan = (json.loads(evidence.payload).get("plan") or {})
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    compared = (
+        "mapping_id", "role", "include_in_answer", "answer_key", "satisfies",
+    )
+    return all(source_plan.get(key) == plan.get(key) for key in compared)
+
+
+def _check_has_semantic_adequacy(check: dict[str, Any]) -> bool:
+    semantic_checks = check.get("semantic_checks") or []
+    names = {
+        str(item.get("name") or "")
+        for item in semantic_checks
+        if isinstance(item, dict)
+    }
+    return (
+        bool(semantic_checks)
+        and _PROMOTION_SEMANTIC_CHECKS <= names
+        and all(
+            isinstance(item, dict) and item.get("passed") is True
+            for item in semantic_checks
+        )
+    )
+
+
+def _check_is_answer_evidence(
+    context: BimRunContext, evidence_id: str, check: dict[str, Any],
+    *, mapping_ids: set[str] | None = None,
+) -> bool:
+    """Apply the complete semantic and provenance gate to one replay check."""
+    plan = check.get("plan") or {}
+    if (
+        check.get("verified") is not True
+        or plan.get("role") != "answer_producing"
+        or plan.get("include_in_answer") is False
+        or not str(plan.get("answer_key") or "").strip()
+        or not _source_plan_matches_check(context, evidence_id, plan)
+        or not _owned_required_outputs(context, evidence_id, plan)
+        or not _check_has_semantic_adequacy(check)
+        or bool(check.get("diagnostics"))
+    ):
+        return False
+    if mapping_ids is not None and plan.get("mapping_id") not in mapping_ids:
+        return False
+    matched_count = check.get("matched_count")
+    if matched_count is None or int(matched_count or 0) <= 0:
+        return False
+    claim = check.get("claim") or {}
+    return isinstance(claim, dict) and bool(str(claim.get("statement") or "").strip())
 
 
 def save_knowledge_candidate(
@@ -342,10 +649,24 @@ def verify_and_promote_candidate(
     record = context.learned_knowledge.get(knowledge_id)
     if not isinstance(record, LearnedKnowledgeRecord):
         raise ValueError("Knowledge candidate is not part of the active scoped run.")
+    if context.knowledge_store is None or not context.schema_fingerprint:
+        raise ValueError("The learned-knowledge store is not configured for this run.")
+    scoped = context.knowledge_store.scoped_record(
+        knowledge_id,
+        client_id=context.scope.client_id,
+        project_id=context.scope.project_id,
+        schema_fingerprint=context.schema_fingerprint,
+    )
+    if scoped is None:
+        raise ValueError(
+            "Knowledge candidate does not belong to the active project and schema fingerprint."
+        )
+    record = scoped
+    context.learned_knowledge[knowledge_id] = record
     if record.status in {"verified", "promoted", "rejected", "deprecated"}:
         return record
-    if record.schema_fingerprint != context.schema_fingerprint:
-        raise ValueError("Knowledge candidate does not match the live schema fingerprint.")
+    if context.completion_status != "ready_for_verification" or context.failure_categories:
+        return record
     checks = _latest_verified_checks(context)
     relevant = [checks.get(evidence_id) for evidence_id in record.evidence_ids]
     if not relevant or any(check is None for check in relevant):
@@ -358,27 +679,43 @@ def verify_and_promote_candidate(
         )
         context.learned_knowledge[knowledge_id] = rejected
         return rejected
-    if any(
-        (
-            check.get("matched_count") is not None
-            and int(check.get("matched_count") or 0) == 0
+    mapping_ids = _mapping_ids_for_record(context, record)
+    if record.kind == "schema_mapping" and not mapping_ids:
+        return record
+    answer_checks = [
+        check
+        for evidence_id, check in zip(record.evidence_ids, relevant, strict=True)
+        if _check_is_answer_evidence(
+            context,
+            evidence_id,
+            check,
+            mapping_ids=mapping_ids if record.kind == "schema_mapping" else None,
         )
-        or bool(check.get("diagnostics"))
+    ]
+    if any(
+        check.get("verified") is True
+        and (
+            not _check_has_semantic_adequacy(check)
+            or bool(check.get("diagnostics"))
+            or (
+                check.get("matched_count") is not None
+                and int(check.get("matched_count") or 0) == 0
+            )
+        )
         for check in relevant
+        if (check.get("plan") or {}).get("role") == "answer_producing"
     ):
         rejected = context.knowledge_store.transition(
             knowledge_id, client_id=context.scope.client_id, project_id=context.scope.project_id,
             from_statuses=("candidate",), to_status="rejected",
-            note="Zero-match or diagnostic-bearing evidence cannot be promoted as reusable semantics.",
+            note=(
+                "Answer evidence lacked semantic adequacy, had zero matches, or carried "
+                "diagnostics; it cannot establish reusable semantics."
+            ),
         )
         context.learned_knowledge[knowledge_id] = rejected
         return rejected
-    answer_evidence = any(
-        (check.get("plan") or {}).get("role", "answer_producing") == "answer_producing"
-        and (check.get("plan") or {}).get("include_in_answer", True) is not False
-        for check in relevant
-    )
-    if not answer_evidence:
+    if not answer_checks:
         return record
     minimum = float(os.getenv("BIM_KNOWLEDGE_PROMOTION_CONFIDENCE", "0.65"))
     if record.confidence < minimum:
@@ -392,7 +729,10 @@ def verify_and_promote_candidate(
     verified = context.knowledge_store.transition(
         knowledge_id, client_id=context.scope.client_id, project_id=context.scope.project_id,
         from_statuses=("candidate",), to_status="verified",
-        note="All referenced answer evidence passed deterministic replay verification.",
+        note=(
+            "Relevant answer evidence passed replay, semantic adequacy, required-output, "
+            "population, scope, and provenance gates."
+        ),
     )
     if record.kind != "schema_mapping":
         auto_promote = False
@@ -426,6 +766,9 @@ def curate_verified_mappings(context: BimRunContext) -> KnowledgeCurationReport:
         evidence_ids = [
             evidence_id for evidence_id, check in checks.items()
             if (check.get("plan") or {}).get("mapping_id") == mapping_id
+            and _check_is_answer_evidence(
+                context, evidence_id, check, mapping_ids={mapping_id}
+            )
         ]
         if not evidence_ids:
             continue
@@ -436,7 +779,8 @@ def curate_verified_mappings(context: BimRunContext) -> KnowledgeCurationReport:
             mapping_id=mapping_id, evidence_ids=evidence_ids, confidence=confidence,
             rationale="Reusable live schema mapping backed by replayed project evidence.",
         ))
-        learned_ids.append(candidate.knowledge_id)
+        if candidate.knowledge_id not in learned_ids:
+            learned_ids.append(candidate.knowledge_id)
         result = verify_and_promote_candidate(context, candidate.knowledge_id)
         promoted = promoted or result.status == "promoted"
         artifact_id = f"knowledge-{candidate.knowledge_id}"

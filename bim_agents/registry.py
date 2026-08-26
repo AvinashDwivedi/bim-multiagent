@@ -28,8 +28,33 @@ class BimAgentRegistry:
     """Agents are workers; deterministic runtime code is the coordinator."""
 
     task_architect: Agent
-    schema_scout: Agent
-    query_executor: Agent
+    schema_mapping: Agent
+    quantity: Agent
+    relationship: Agent
+    geometry: Agent
+    requirements: Agent
+
+    @property
+    def schema_scout(self) -> Agent:
+        """Compatibility alias for callers using the former two-worker registry."""
+        return self.schema_mapping
+
+    @property
+    def query_executor(self) -> Agent:
+        """Compatibility alias; ordinary queries are quantity-specialist work."""
+        return self.quantity
+
+    def execution_specialist(self, role: str) -> Agent:
+        specialists = {
+            "quantity": self.quantity,
+            "relationship": self.relationship,
+            "geometry": self.geometry,
+            "requirements": self.requirements,
+        }
+        try:
+            return specialists[role]
+        except KeyError as exc:
+            raise ValueError(f"No execution specialist is registered for {role!r}.") from exc
 
 
 def _settings(effort: str) -> ModelSettings:
@@ -61,9 +86,9 @@ def build_agent_registry(
         tools=[],
         output_type=BimTaskContract,
     )
-    schema_scout = Agent(
-        name="BIM Schema Scout",
-        instructions=prompts.SCHEMA_SCOUT,
+    schema_mapping = Agent(
+        name="BIM Schema Mapping Specialist",
+        instructions=prompts.SCHEMA_SPECIALIST,
         model=worker,
         model_settings=_settings("high"),
         tools=[
@@ -80,16 +105,41 @@ def build_agent_registry(
         ],
         output_type=EvidenceHandoff,
     )
-    query_executor = Agent(
-        name="BIM Query Worker",
-        instructions=prompts.QUERY_EXECUTOR,
+    quantity = Agent(
+        name="BIM Quantity Specialist",
+        instructions=prompts.QUANTITY_SPECIALIST,
         model=worker,
-        model_settings=_settings("high"),
+        model_settings=_settings("medium"),
         tools=[
             inspect_query_capabilities,
             submit_query_plan,
-            submit_geometry_query,
         ],
         output_type=EvidenceWorkstreamResult,
     )
-    return BimAgentRegistry(task_architect, schema_scout, query_executor)
+    relationship = Agent(
+        name="BIM Relationship Specialist",
+        instructions=prompts.RELATIONSHIP_SPECIALIST,
+        model=worker,
+        model_settings=_settings("high"),
+        tools=[inspect_query_capabilities, submit_query_plan],
+        output_type=EvidenceWorkstreamResult,
+    )
+    geometry = Agent(
+        name="BIM Geometry Specialist",
+        instructions=prompts.GEOMETRY_SPECIALIST,
+        model=worker,
+        model_settings=_settings("medium"),
+        tools=[submit_geometry_query],
+        output_type=EvidenceWorkstreamResult,
+    )
+    requirements = Agent(
+        name="BIM Requirements Specialist",
+        instructions=prompts.REQUIREMENTS_SPECIALIST,
+        model=worker,
+        model_settings=_settings("medium"),
+        tools=[inspect_query_capabilities, submit_query_plan],
+        output_type=EvidenceWorkstreamResult,
+    )
+    return BimAgentRegistry(
+        task_architect, schema_mapping, quantity, relationship, geometry, requirements,
+    )
