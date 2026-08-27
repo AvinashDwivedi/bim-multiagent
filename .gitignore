@@ -1,11 +1,14 @@
 __pycache__/
 *.pyc
+*.egg-info/
 .pytest_cache/
 pytest-cache-files-*/
 .venv/
 venv/
 .env
 .env.*
+!.env.example
 .vscode/
 .idea/
 storage/
+logs/

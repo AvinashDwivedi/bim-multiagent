@@ -1,18 +1,3 @@
-"""Project-scoped multi-agent Neo4j calculation system for BIM questions."""
+"""Provider-neutral agentic BIM question answering backed by Neo4j."""
 
-from typing import Any
-
-
-async def answer_bim_question(*args: Any, **kwargs: Any):
-    from .runtime import answer_bim_question as _answer
-
-    return await _answer(*args, **kwargs)
-
-
-def build_agent_registry(*args: Any, **kwargs: Any):
-    from .registry import build_agent_registry as _build
-
-    return _build(*args, **kwargs)
-
-
-__all__ = ["answer_bim_question", "build_agent_registry"]
+__version__ = "0.2.0"
