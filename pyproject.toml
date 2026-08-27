@@ -1,28 +1,30 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "bim-multiagent"
+name = "local-bim-agent"
 version = "0.1.0"
-description = "Provider-neutral evidence-first agent system for project-scoped BIM graphs in Neo4j"
+description = "Evidence-first agentic Q&A over BIM tree, properties, and SQLite IFC exports"
 requires-python = ">=3.11"
 dependencies = [
-    "anthropic>=1.0,<2",
-    "fastapi>=0.116,<1",
-    "neo4j>=6,<7",
-    "openai>=2.53,<3",
-    "pydantic>=2.10,<3",
-    "python-dotenv>=1,<2",
-    "uvicorn>=0.35,<1",
+  "fastapi>=0.110",
+  "openai>=2.0",
+  "pydantic>=2.6",
+  "uvicorn>=0.29",
 ]
 
 [project.optional-dependencies]
-test = ["httpx>=0.28,<1", "pytest>=8,<9", "pytest-asyncio>=0.25,<1"]
+test = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+bim-agent = "bim_agent.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["bim_agents*"]
+include = ["bim_agent*", "bim_agents*"]
+
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q -p no:cacheprovider"
+addopts = "-q -p no:cacheprovider --basetemp=test-tmp/run"
+pythonpath = ["."]

@@ -1,3 +1,6 @@
-"""Provider-neutral agentic BIM question answering backed by Neo4j."""
+"""Compatibility facade for the evaluator's established public contract."""
 
-__version__ = "0.2.0"
+from bim_agent import BimAgent
+
+__all__ = ["BimAgent"]
+
