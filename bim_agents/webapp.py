@@ -10,7 +10,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from bim_agent import BimAgent
-from bim_agent.dataset import DatasetError
+from bim_agent.project_tools import ProjectError
 
 from .adapter import evaluator_payload
 
@@ -35,7 +35,7 @@ def _project_directory(project_id: str | None = None) -> Path:
     root = Path(projects_root).resolve()
     candidate = (root / project_id).resolve()
     if candidate.parent != root or not candidate.is_dir():
-        raise DatasetError(f"Project is not available under BIM_PROJECTS_ROOT: {project_id}")
+        raise ProjectError(f"Project is not available under BIM_PROJECTS_ROOT: {project_id}")
     return candidate
 
 
@@ -64,10 +64,10 @@ def health() -> dict:
         agent = _agent()
         return {
             "status": "ok",
-            "physical_instances": agent.profile["physical_instance_count"],
-            "llm_planner_enabled": agent.settings.use_llm,
+            "raw_records": len(agent.tools.records),
+            "model_directed": True,
         }
-    except DatasetError as exc:
+    except (ProjectError, RuntimeError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
@@ -75,7 +75,7 @@ def health() -> dict:
 def chat(request: ChatRequest) -> dict:
     try:
         report = _agent(request.project_id).ask(request.question)
-    except DatasetError as exc:
+    except (ProjectError, RuntimeError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return evaluator_payload(report, client_id=request.client_id, project_id=request.project_id)
 

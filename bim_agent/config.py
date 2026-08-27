@@ -20,38 +20,28 @@ def load_dotenv(path: Path) -> None:
             os.environ[key] = value
 
 
-def _boolean(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() not in {"0", "false", "no", "off"}
-
-
 @dataclass(frozen=True)
 class Settings:
     data_dir: Path
     trace_dir: Path
     model: str
     reasoning_effort: str
-    use_llm: bool
-    max_profile_values: int = 160
+    max_agent_iterations: int = 20
+    max_tool_output_chars: int = 80000
 
     @classmethod
     def from_env(
         cls,
         *,
         data_dir: str | Path | None = None,
-        use_llm: bool | None = None,
     ) -> "Settings":
         load_dotenv(Path.cwd() / ".env")
         selected_data = Path(data_dir or os.getenv("BIM_DATA_DIR", "test-project-data"))
-        selected_llm = _boolean("BIM_USE_LLM", True) if use_llm is None else use_llm
         return cls(
             data_dir=selected_data.resolve(),
             trace_dir=Path(os.getenv("BIM_TRACE_DIR", "logs/traces")).resolve(),
             model=os.getenv("BIM_MODEL", os.getenv("BIM_OPENAI_AGENT_MODEL", "gpt-5.4")),
             reasoning_effort=os.getenv("BIM_REASONING_EFFORT", "medium"),
-            use_llm=selected_llm and bool(os.getenv("OPENAI_API_KEY")),
-            max_profile_values=max(40, int(os.getenv("BIM_MAX_PROFILE_VALUES", "160"))),
+            max_agent_iterations=max(1, int(os.getenv("BIM_MAX_AGENT_ITERATIONS", "20"))),
+            max_tool_output_chars=max(2000, int(os.getenv("BIM_MAX_TOOL_OUTPUT_CHARS", "80000"))),
         )
-

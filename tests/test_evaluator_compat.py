@@ -9,59 +9,65 @@ from fastapi.testclient import TestClient
 from bim_agent import BimAgent
 from bim_agents.adapter import evaluator_payload
 
+from conftest import final_response, tool_response
 
-def test_evaluator_payload_contract(sample_data: Path, tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("BIM_TRACE_DIR", str(tmp_path / "traces"))
-    report = BimAgent(sample_data, use_llm=False).ask("how many pipes?")
+
+def test_evaluator_payload_reports_model_tools_without_fake_verification(
+    sample_data: Path, fake_client_factory
+) -> None:
+    client = fake_client_factory(
+        tool_response(1, "search_records", {"terms": ["Pipe"], "limit": 20}),
+        final_response(2, "There are two pipes."),
+    )
+    report = BimAgent(sample_data, client=client).ask("How many pipes?")
     payload = evaluator_payload(report, client_id="client", project_id="project")
-    assert payload["verification_status"] == "verified"
-    assert payload["answer"]
-    assert payload["stages_used"]
+    assert payload["verification_status"] == "completed"
+    assert "Tool: search_records" in payload["stages_used"]
+    assert payload["semantic_checks"] == []
     assert payload["artifact_ids"]
-    assert payload["semantic_checks"]
 
 
-def test_compatibility_http_chat(sample_data: Path, tmp_path: Path, monkeypatch) -> None:
+def test_compatibility_http_chat(sample_data: Path, monkeypatch, fake_client_factory) -> None:
     monkeypatch.setenv("BIM_DATA_DIR", str(sample_data))
-    monkeypatch.setenv("BIM_TRACE_DIR", str(tmp_path / "traces"))
+    client = fake_client_factory(final_response(1, "There are two pipes."))
+    import openai
+
+    monkeypatch.setattr(openai, "OpenAI", lambda: client)
     import bim_agents.webapp as webapp
 
     webapp._agent.cache_clear()
-    client = TestClient(webapp.app)
-    response = client.post(
-        "/api/chat",
-        json={"question": "how many pipes?", "client_id": "client", "project_id": "project"},
+    response = TestClient(webapp.app).post(
+        "/api/chat", json={"question": "How many pipes?", "project_id": "project"}
     )
     assert response.status_code == 200
-    assert response.json()["verification_status"] == "verified"
+    assert response.json()["verification_status"] == "completed"
 
 
-def test_http_project_id_routes_through_projects_root(sample_data: Path, tmp_path: Path, monkeypatch) -> None:
+def test_http_project_id_routes_through_projects_root(
+    sample_data: Path, monkeypatch, fake_client_factory
+) -> None:
     monkeypatch.setenv("BIM_PROJECTS_ROOT", str(sample_data.parent))
     monkeypatch.setenv("BIM_DATA_DIR", str(sample_data))
-    monkeypatch.setenv("BIM_USE_LLM", "false")
-    monkeypatch.setenv("BIM_TRACE_DIR", str(tmp_path / "traces"))
+    client = fake_client_factory(final_response(1, "There are two pipes."))
+    import openai
+
+    monkeypatch.setattr(openai, "OpenAI", lambda: client)
     import bim_agents.webapp as webapp
 
     webapp._agent.cache_clear()
-    client = TestClient(webapp.app)
-    response = client.post(
-        "/api/chat",
-        json={"question": "how many pipes?", "project_id": sample_data.name},
+    http = TestClient(webapp.app)
+    response = http.post(
+        "/api/chat", json={"question": "How many pipes?", "project_id": sample_data.name}
     )
     assert response.status_code == 200
-    assert "2" in response.json()["answer"]
-
-    missing = client.post(
-        "/api/chat", json={"question": "how many pipes?", "project_id": "missing-project"}
-    )
-    assert missing.status_code == 404
+    assert "two" in response.json()["answer"]
+    assert http.post("/api/chat", json={"question": "x", "project_id": "missing"}).status_code == 404
 
 
-def test_compatibility_cli_does_not_force_llm(monkeypatch, capsys) -> None:
+def test_compatibility_cli_uses_model_agent(monkeypatch, capsys) -> None:
     report = SimpleNamespace()
     payload = {
-        "verification_status": "verified", "answer": "ok", "stages_used": [],
+        "verification_status": "completed", "answer": "ok", "stages_used": [],
         "artifact_ids": [], "semantic_checks": [], "limitations": [],
         "investigation_trace": [], "failure_categories": [],
     }
@@ -72,5 +78,5 @@ def test_compatibility_cli_does_not_force_llm(monkeypatch, capsys) -> None:
         from bim_agents.cli import main
 
         assert main(["question", "--quiet"]) == 0
-        agent.assert_called_once_with(None, use_llm=None)
+        agent.assert_called_once_with(None)
     assert '"answer": "ok"' in capsys.readouterr().out

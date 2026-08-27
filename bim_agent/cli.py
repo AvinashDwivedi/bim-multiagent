@@ -11,7 +11,6 @@ from .runtime import BimAgent, report_json
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(prog="bim-agent", description="Ask evidence-backed questions over three BIM export files.")
     value.add_argument("--data-dir", default=None, help="Directory containing tree JSON, properties JSON, and .ifc")
-    value.add_argument("--no-llm", action="store_true", help="Use the conservative local semantic planner")
     commands = value.add_subparsers(dest="command", required=True)
 
     ask = commands.add_parser("ask", help="Ask a BIM question")
@@ -38,11 +37,11 @@ def main(argv: list[str] | None = None) -> int:
 
         from .api import create_app
 
-        app = create_app(data_dir=args.data_dir, use_llm=not args.no_llm)
+        app = create_app(data_dir=args.data_dir)
         uvicorn.run(app, host=args.host, port=args.port)
         return 0
 
-    agent = BimAgent(data_dir=args.data_dir, use_llm=not args.no_llm)
+    agent = BimAgent(data_dir=args.data_dir)
     if args.command == "inspect":
         result = agent.inspect()
         print(json.dumps(result, ensure_ascii=False, indent=2))

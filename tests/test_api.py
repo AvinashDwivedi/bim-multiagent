@@ -6,11 +6,19 @@ from fastapi.testclient import TestClient
 
 from bim_agent.api import create_app
 
+from conftest import final_response
 
-def test_api_health_and_ask(sample_data: Path, tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("BIM_TRACE_DIR", str(tmp_path / "traces"))
-    client = TestClient(create_app(sample_data, use_llm=False))
-    assert client.get("/api/health").status_code == 200
-    response = client.post("/api/ask", json={"question": "how many pipes?"})
+
+def test_api_health_and_model_answer(sample_data: Path, monkeypatch, fake_client_factory) -> None:
+    client = fake_client_factory(final_response(1, "There are two pipes."))
+    import openai
+
+    monkeypatch.setattr(openai, "OpenAI", lambda: client)
+    http = TestClient(create_app(sample_data))
+    health = http.get("/api/health")
+    assert health.status_code == 200
+    assert health.json()["model_directed"] is True
+    response = http.post("/api/ask", json={"question": "How many pipes?"})
     assert response.status_code == 200
-    assert response.json()["evidence"]["distinct_identity_count"] == 2
+    assert response.json()["answer"] == "There are two pipes."
+    assert response.json()["agent_loop"]["finished"] is True

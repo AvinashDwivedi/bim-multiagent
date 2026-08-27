@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -159,3 +161,48 @@ def sample_data(tmp_path: Path) -> Path:
         )
     return data_dir
 
+
+class FakeResponses:
+    def __init__(self, responses: list[Any]):
+        self._responses = list(responses)
+        self.requests: list[dict[str, Any]] = []
+
+    def create(self, **kwargs: Any) -> Any:
+        self.requests.append(kwargs)
+        if not self._responses:
+            raise AssertionError("The fake model received more turns than expected.")
+        return self._responses.pop(0)
+
+
+class FakeClient:
+    def __init__(self, responses: list[Any]):
+        self.responses = FakeResponses(responses)
+
+
+def function_call(name: str, arguments: dict[str, Any], index: int = 1) -> Any:
+    return SimpleNamespace(
+        type="function_call",
+        name=name,
+        arguments=json.dumps(arguments),
+        call_id=f"call-{index}",
+    )
+
+
+def tool_response(index: int, name: str, arguments: dict[str, Any]) -> Any:
+    return SimpleNamespace(
+        id=f"resp-{index}",
+        output=[function_call(name, arguments, index)],
+        output_text="",
+    )
+
+
+def final_response(index: int, answer: str) -> Any:
+    return SimpleNamespace(id=f"resp-{index}", output=[], output_text=answer)
+
+
+@pytest.fixture()
+def fake_client_factory():
+    def make(*responses: Any) -> FakeClient:
+        return FakeClient(list(responses))
+
+    return make
