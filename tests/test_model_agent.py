@@ -171,7 +171,13 @@ def test_primary_agent_can_invoke_model_backed_evidence_review(
             "reconciliation": "3 unique object IDs = 3 found records",
             "draft_answer": "3",
         }),
-        final_response(2, "Check the Electrical Fixtures category as a plausible broader scope."),
+        final_response(2, json.dumps({
+            "can_finalize": False,
+            "summary": "Check the Electrical Fixtures category as a plausible broader scope.",
+            "required_follow_up": ["Inspect the broader fixture category."],
+            "required_disclosures": [],
+            "unsupported_claims": [],
+        })),
         tool_response(3, "query_bim_workspace", {
             "sql": "SELECT COUNT(*) AS count FROM records WHERE name LIKE ?",
             "parameters": ["Alpha Switch [%"], "row_limit": 20,
@@ -187,7 +193,13 @@ def test_primary_agent_can_invoke_model_backed_evidence_review(
             "reconciliation": "3 unique object IDs = 3 found records",
             "draft_answer": "3 lighting switches",
         }),
-        final_response(6, "The selected scope is sufficient."),
+        final_response(6, json.dumps({
+            "can_finalize": True,
+            "summary": "The selected scope is sufficient.",
+            "required_follow_up": [],
+            "required_disclosures": [],
+            "unsupported_claims": [],
+        })),
         final_response(7, "There are 3 lighting switches. [ref: call_2] [ref: call_3]"),
     )
     report = BimAgent(settings=settings, client=client).ask("How many switches?")
@@ -198,8 +210,14 @@ def test_primary_agent_can_invoke_model_backed_evidence_review(
     assert "critical BIM evidence-review tool" in nested_request["instructions"]
     assert '"hierarchy_nodes":' not in nested_request["input"]
     assert '"source_inventory_complete": true' in nested_request["input"]
-    assert nested_request["max_output_tokens"] == 800
+    assert nested_request["max_output_tokens"] == 1000
     assert nested_request["text"]["format"]["name"] == "bim_evidence_review"
+    incremental_request = client.responses.requests[5]
+    incremental_payload = json.loads(incremental_request["input"])
+    assert incremental_payload["review_mode"] == "delta"
+    assert "project_summary" not in incremental_payload
+    assert sorted(incremental_payload["changed_inputs"]) == ["draft_answer", "exclusions"]
+    assert incremental_request["max_output_tokens"] == 750
     model_observation = next(
         item["output"] for item in client.responses.requests[2]["input"]
         if isinstance(item, dict) and item.get("type") == "function_call_output"

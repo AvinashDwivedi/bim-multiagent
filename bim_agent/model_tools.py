@@ -28,10 +28,14 @@ class ModelAssistedTools:
         self.reasoning_effort = reasoning_effort
         self.project_tools = project_tools
         self._usage_records: list[dict[str, Any]] = []
+        self._last_review_arguments: dict[str, str] | None = None
+        self._last_review_result: dict[str, Any] | None = None
         self.prompt_cache_key = _prompt_cache_key(model, project_tools)
 
     def reset_usage(self) -> None:
         self._usage_records = []
+        self._last_review_arguments = None
+        self._last_review_result = None
 
     def usage_records(self) -> list[dict[str, Any]]:
         return list(self._usage_records)
@@ -130,20 +134,44 @@ class ModelAssistedTools:
         }
 
     def _review(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        payload = {
+        current_arguments = {
             key: str(arguments.get(key, ""))[:10_000]
             for key in (
                 "question", "selected_scope", "exclusions", "evidence", "reconciliation", "draft_answer",
             )
         }
-        profile = self.project_tools.scope_profile(max_nodes=0, sample_limit=0)
-        payload["project_summary"] = {
-            "record_count": profile["record_count"],
-            "tree_node_count": profile["tree_node_count"],
-            "identity_signals": profile["identity_signals"],
-            "source_inventory_complete": True,
-            "hierarchy_nodes_intentionally_omitted": True,
+        incremental = bool(
+            self._last_review_arguments
+            and self._last_review_result
+            and current_arguments["question"] == self._last_review_arguments["question"]
+            and current_arguments["selected_scope"] == self._last_review_arguments["selected_scope"]
+        )
+        changed_inputs = {
+            key: value
+            for key, value in current_arguments.items()
+            if not self._last_review_arguments or value != self._last_review_arguments.get(key)
         }
+        if incremental:
+            payload: dict[str, Any] = {
+                "review_mode": "delta",
+                "prior_review": {
+                    key: value
+                    for key, value in self._last_review_result.items()
+                    if key not in {"response_id", "required_disclosure_text"}
+                },
+                "changed_inputs": changed_inputs,
+            }
+        else:
+            payload = dict(current_arguments)
+            profile = self.project_tools.scope_profile(max_nodes=0, sample_limit=0)
+            payload["review_mode"] = "full"
+            payload["project_summary"] = {
+                "record_count": profile["record_count"],
+                "tree_node_count": profile["tree_node_count"],
+                "identity_signals": profile["identity_signals"],
+                "source_inventory_complete": True,
+                "hierarchy_nodes_intentionally_omitted": True,
+            }
         response = self.client.responses.create(
             model=self.model,
             instructions=(
@@ -168,12 +196,15 @@ class ModelAssistedTools:
                 "necessary checks in required_follow_up, caveats that must survive into the final answer in "
                 "required_disclosures, using only the allowed disclosure codes, and claims that must be removed "
                 "or verified in unsupported_claims. "
+                "When review_mode is delta, review only changed_inputs against prior_review. Carry forward "
+                "unchanged supported decisions, but clear a prior follow-up when the changed evidence resolves it. "
+                "Keep summary under 500 characters and each follow-up or unsupported claim under 180 characters. "
                 "Do not expose private chain-of-thought."
             ),
             input=json.dumps(payload, ensure_ascii=False),
             reasoning={"effort": self.reasoning_effort},
             store=False,
-            max_output_tokens=800,
+            max_output_tokens=750 if incremental else 1000,
             text={
                 "format": {
                     "type": "json_schema",
@@ -183,9 +214,11 @@ class ModelAssistedTools:
                         "type": "object",
                         "properties": {
                             "can_finalize": {"type": "boolean"},
-                            "summary": {"type": "string"},
+                            "summary": {"type": "string", "maxLength": 500},
                             "required_follow_up": {
-                                "type": "array", "items": {"type": "string"}, "maxItems": 8,
+                                "type": "array",
+                                "items": {"type": "string", "maxLength": 180},
+                                "maxItems": 4,
                             },
                             "required_disclosures": {
                                 "type": "array",
@@ -200,7 +233,9 @@ class ModelAssistedTools:
                                 "maxItems": 6,
                             },
                             "unsupported_claims": {
-                                "type": "array", "items": {"type": "string"}, "maxItems": 8,
+                                "type": "array",
+                                "items": {"type": "string", "maxLength": 180},
+                                "maxItems": 4,
                             },
                         },
                         "required": [
@@ -215,30 +250,56 @@ class ModelAssistedTools:
         )
         self._record_usage(response, "evidence_review")
         review_text = _required_model_text(response, "evidence reviewer")
+        review_parse_valid = True
+        review_parse_error = ""
         try:
+            if str(getattr(response, "status", "") or "").casefold() == "incomplete":
+                raise ValueError("the model response status was incomplete")
             parsed = json.loads(review_text)
-        except json.JSONDecodeError:
-            # Compatibility for older gateways and test doubles. New live calls
-            # use the strict schema above.
+            if not isinstance(parsed, dict):
+                raise ValueError("the review response was not a JSON object")
+        except (json.JSONDecodeError, ValueError) as exc:
+            review_parse_valid = False
+            detail = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
+            review_parse_error = f"Invalid or truncated structured review output: {detail}."
             parsed = {
-                "can_finalize": True,
-                "summary": review_text,
-                "required_follow_up": [],
+                "can_finalize": False,
+                "summary": review_parse_error,
+                "required_follow_up": [
+                    "Repeat review_scope_and_evidence because the prior structured review was incomplete."
+                ],
                 "required_disclosures": [],
                 "unsupported_claims": [],
             }
-        return {
+        required_disclosures = [str(item) for item in parsed.get("required_disclosures", [])]
+        if incremental and self._last_review_result:
+            required_disclosures = list(dict.fromkeys([
+                *self._last_review_result.get("required_disclosures", []),
+                *required_disclosures,
+            ]))
+        result = {
             "review": str(parsed.get("summary") or ""),
             "can_finalize": bool(parsed.get("can_finalize")),
             "required_follow_up": [str(item) for item in parsed.get("required_follow_up", [])],
-            "required_disclosures": [str(item) for item in parsed.get("required_disclosures", [])],
+            "required_disclosures": required_disclosures,
             "required_disclosure_text": [
                 _review_disclosure_text(str(item), _contains_hebrew(str(arguments.get("question", ""))))
-                for item in parsed.get("required_disclosures", [])
+                for item in required_disclosures
             ],
             "unsupported_claims": [str(item) for item in parsed.get("unsupported_claims", [])],
             "response_id": str(getattr(response, "id", "") or ""),
+            "review_mode": "delta" if incremental else "full",
+            "reviewed_changes": sorted(changed_inputs),
+            "review_parse_valid": review_parse_valid,
+            "review_parse_error": review_parse_error or None,
         }
+        if review_parse_valid:
+            self._last_review_arguments = current_arguments
+            self._last_review_result = result
+        else:
+            self._last_review_arguments = None
+            self._last_review_result = None
+        return result
 
     def _research_standards(self, arguments: dict[str, Any]) -> dict[str, Any]:
         query = {

@@ -159,9 +159,11 @@ supplied with `BIM_MODEL_PRICING_JSON`; tool-specific fees such as web search ar
 silently reported as zero. Local Docker execution has no OpenAI tool fee.
 `BIM_MAX_ANSWER_COST_USD` is an opt-in guard. It defaults to `0` (disabled) while real question-cost distributions
 are collected; set a positive amount only after choosing a threshold from observed workloads. When enabled, it stops
-further model/tool turns once the running list-price estimate reaches the configured amount. The completed request may
-exceed the threshold slightly because usage is available only after that request returns. Stable prompt-cache keys and
-compact model-facing observations reduce repeated input.
+further investigation once the running list-price estimate reaches the configured amount. It then preserves an
+already-produced answer or permits one bounded, tool-disabled best-effort finalization from accumulated evidence and
+appends the canonical budget notice. That finalization is included in the cost report. The completed request may exceed
+the threshold because usage is available only after a request returns and the terminal synthesis is intentionally
+allowed after the trigger. Stable prompt-cache keys and compact model-facing observations reduce repeated input.
 Retryable upstream failures are returned as HTTP 503 with a structured `retryable` flag. The health response
 reports whether the local Docker runtime and configured image are ready. A local container is created only if the
 model calls `run_local_python`, and it is removed immediately after the call.

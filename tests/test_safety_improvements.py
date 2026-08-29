@@ -6,11 +6,18 @@ from types import SimpleNamespace
 
 from bim_agent import BimAgent
 from bim_agent.agent_loop import (
+    COST_BUDGET_NOTICE,
+    _classify_route,
     _disclosure_present,
     _ensure_review_disclosures,
     _grounding_issues,
     _model_tool_result,
+    _needs_reconciliation,
+    _population_ids,
+    _repair_citation_placement,
+    _requires_population_reconciliation,
     _review_completion_issues,
+    _tool_cache_key,
 )
 from bim_agent.model_tools import _review_disclosure_text
 from bim_agent.config import Settings
@@ -104,7 +111,7 @@ def test_standard_hebrew_scope_disclosure_satisfies_code_gate_without_duplicatio
         },
     }
 
-    updated, satisfied = _ensure_review_disclosures(
+    updated, disclosure_state = _ensure_review_disclosures(
         "אילו סוגים קיימים?",
         answer,
         evidence,
@@ -118,13 +125,257 @@ def test_standard_hebrew_scope_disclosure_satisfies_code_gate_without_duplicatio
         review_stale=False,
         required_follow_up=[],
         required_disclosures=["selected_scope_only"],
-        satisfied_disclosures=satisfied,
+        disclosure_state=disclosure_state,
         unsupported_claims=[],
     )
 
-    assert updated == answer
-    assert satisfied == {"selected_scope_only"}
+    assert updated.count(disclosure) == 1
+    assert disclosure_state["selected_scope_only"]["citation_valid"] is True
+    assert disclosure_state["selected_scope_only"]["references"] == ["call_1", "call_2"]
+    assert disclosure_state["loaded_snapshot"]["citation_valid"] is True
     assert issues == []
+
+
+def test_multiple_model_authored_disclosures_are_replaced_by_separately_cited_canonical_sentences() -> None:
+    snapshot = _review_disclosure_text("loaded_snapshot", False)
+    uniqueness = _review_disclosure_text("record_count_not_physical_uniqueness", False)
+    answer = f"There are 2 pipe records. [ref: call_1]\n\n{snapshot} {uniqueness} [ref: call_2]"
+    evidence = {
+        "project": {
+            "tool": "query_bim_workspace",
+            "output": '{"rows":[{"count":2}]}',
+            "evidence_class": "project",
+        },
+        "review": {
+            "tool": "review_scope_and_evidence",
+            "output": '{"required_disclosures":["loaded_snapshot","record_count_not_physical_uniqueness"]}',
+            "evidence_class": "model_review",
+        },
+    }
+
+    updated, state = _ensure_review_disclosures(
+        "How many pipes?",
+        answer,
+        evidence,
+        evidence_aliases={"call_1": "project", "call_2": "review"},
+        disclosure_codes=["loaded_snapshot", "record_count_not_physical_uniqueness"],
+    )
+
+    assert updated.count(snapshot) == 1
+    assert updated.count(uniqueness) == 1
+    assert f"{snapshot} [ref: call_1] [ref: call_2]" in updated
+    assert f"{uniqueness} [ref: call_1] [ref: call_2]" in updated
+    assert all(item["citation_valid"] for item in state.values())
+
+
+def test_disclosure_combined_with_factual_sentence_keeps_fact_and_rebuilds_disclosure() -> None:
+    snapshot = _review_disclosure_text("loaded_snapshot", False)
+    answer = f"{snapshot} There are 2 pipe records. [ref: call_1]"
+    evidence = {
+        "project": {
+            "tool": "query_bim_workspace",
+            "output": '{"rows":[{"count":2}]}',
+            "evidence_class": "project",
+        },
+    }
+
+    updated, state = _ensure_review_disclosures(
+        "How many pipes?",
+        answer,
+        evidence,
+        evidence_aliases={"call_1": "project"},
+        disclosure_codes=[],
+    )
+
+    assert "There are 2 pipe records. [ref: call_1]" in updated
+    assert updated.count(snapshot) == 1
+    assert f"{snapshot} [ref: call_1]" in updated
+    assert state["loaded_snapshot"]["citation_valid"] is True
+
+
+def test_semantic_uncited_disclosure_is_replaced_with_canonical_citations() -> None:
+    answer = (
+        "There are 2 pipe records. [ref: call_1]\n\n"
+        "This result covers only the selected scope and excludes objects outside it."
+    )
+    evidence = {
+        "project": {
+            "tool": "query_bim_workspace",
+            "output": '{"rows":[{"count":2}]}',
+            "evidence_class": "project",
+        },
+        "review": {
+            "tool": "review_scope_and_evidence",
+            "output": '{"required_disclosures":["selected_scope_only"]}',
+            "evidence_class": "model_review",
+        },
+    }
+
+    updated, state = _ensure_review_disclosures(
+        "How many pipes are in the selected scope?",
+        answer,
+        evidence,
+        evidence_aliases={"call_1": "project", "call_2": "review"},
+        disclosure_codes=["selected_scope_only"],
+    )
+
+    canonical = _review_disclosure_text("selected_scope_only", False)
+    assert "This result covers only" not in updated
+    assert f"{canonical} [ref: call_1] [ref: call_2]" in updated
+    assert state["selected_scope_only"]["citation_valid"] is True
+
+
+def test_safe_citation_placement_repair_reuses_only_supporting_trailing_refs() -> None:
+    evidence = {
+        "project": {
+            "tool": "query_bim_workspace",
+            "output": '{"rows":[{"pipe_count":2,"population":"pipes"}]}',
+            "evidence_class": "project",
+        },
+    }
+    repaired, repairs = _repair_citation_placement(
+        "How many pipes?",
+        "There are 2 pipes. The pipe population count is 2. [ref: call_1]",
+        evidence,
+        evidence_aliases={"call_1": "project"},
+    )
+    not_repaired, rejected_repairs = _repair_citation_placement(
+        "How many pipes?",
+        "There are 9 pipes. The pipe population count is 2. [ref: call_1]",
+        evidence,
+        evidence_aliases={"call_1": "project"},
+    )
+
+    assert "There are 2 pipes. [ref: call_1]" in repaired
+    assert len(repairs) == 1
+    assert "There are 9 pipes. [ref: call_1]" not in not_repaired
+    assert rejected_repairs == []
+
+
+def test_sentence_grounding_does_not_share_references_across_adjacent_claims() -> None:
+    evidence = {
+        "pipes": {
+            "tool": "query_bim_workspace",
+            "output": '{"rows":[{"pipe_count":2}]}',
+            "evidence_class": "project",
+        },
+        "ducts": {
+            "tool": "query_bim_workspace",
+            "output": '{"rows":[{"duct_count":99}]}',
+            "evidence_class": "project",
+        },
+    }
+
+    correct = _grounding_issues(
+        "How many pipes and ducts are in the project?",
+        "There are 2 pipes. [ref: pipes] There are 99 ducts. [ref: ducts]",
+        evidence,
+        require_disclaimer=False,
+    )
+    crossed = _grounding_issues(
+        "How many pipes and ducts are in the project?",
+        "There are 2 pipes. [ref: ducts] There are 99 ducts. [ref: pipes]",
+        evidence,
+        require_disclaimer=False,
+    )
+
+    assert correct == []
+    assert len(crossed) == 2
+    assert all("do not occur" in issue for issue in crossed)
+
+
+def test_plain_markdown_heading_is_scaffolding_but_factual_heading_is_grounded() -> None:
+    evidence = {
+        "project": {
+            "tool": "query_bim_workspace",
+            "output": '{"rows":[{"count":2}]}',
+            "evidence_class": "project",
+        },
+    }
+
+    issues = _grounding_issues(
+        "How many project records?",
+        "## Result\n\nThere are 2 records. [ref: project]",
+        evidence,
+        require_disclaimer=False,
+    )
+    factual_heading_issues = _grounding_issues(
+        "How many project records?",
+        "## Data quality: low",
+        evidence,
+        require_disclaimer=False,
+    )
+
+    assert issues == []
+    assert any("no inline tool reference" in issue for issue in factual_heading_issues)
+
+
+def test_hebrew_per_floor_aggregate_routes_to_sql_and_requires_reconciliation() -> None:
+    question = "מהי צפיפות ההספק התאורטי (W/m²) לכל קומה, ומה איכות נתוני הפוטומטריה?"
+
+    route = _classify_route(question)
+
+    assert route["project_data_operation"] is True
+    assert route["general_compute_path"] == "sql_only"
+    assert route["calculate_exposed"] is False
+    assert route["local_python_exposed"] is False
+    assert _requires_population_reconciliation(question) is True
+
+
+def test_sql_cache_key_ignores_only_a_terminal_semicolon() -> None:
+    without_semicolon = _tool_cache_key("query_bim_workspace", {
+        "sql": "SELECT record_object_id FROM record_ifc_candidates ORDER BY record_object_id",
+        "parameters": [],
+        "row_limit": 200,
+    })
+    with_semicolon = _tool_cache_key("query_bim_workspace", {
+        "sql": " SELECT record_object_id FROM record_ifc_candidates ORDER BY record_object_id; ",
+        "parameters": [],
+        "row_limit": 200,
+    })
+
+    assert without_semicolon == with_semicolon
+
+
+def test_complete_identity_query_reconciles_all_rows_before_model_row_compaction(sample_data: Path) -> None:
+    object_ids = [str(index) for index in range(1, 111)]
+    result = {
+        "columns": ["record_object_id"],
+        "rows": [{"record_object_id": object_id} for object_id in object_ids],
+        "returned_rows": 110,
+        "truncated": False,
+    }
+
+    assert _needs_reconciliation("query_bim_workspace", result) is True
+    assert _population_ids(
+        "query_bim_workspace",
+        {"sql": "SELECT record_object_id FROM selected", "parameters": [], "row_limit": 200},
+        result,
+        RawProjectTools(sample_data),
+    ) == object_ids
+    assert len(_model_tool_result("query_bim_workspace", result)["rows"]) == 30
+
+
+def test_malformed_structured_review_fails_closed(
+    sample_data: Path, fake_client_factory,
+) -> None:
+    client = fake_client_factory(final_response(1, '{"can_finalize":true,"summary":"truncated'))
+    agent = BimAgent(sample_data, client=client)
+
+    result = agent.agent.model_tools.execute("review_scope_and_evidence", {
+        "question": "How many pipes?",
+        "selected_scope": "Pipes",
+        "exclusions": "Definitions",
+        "evidence": "Two records",
+        "reconciliation": "Two unique IDs",
+        "draft_answer": "Two pipes",
+    })
+
+    assert result["can_finalize"] is False
+    assert result["review_parse_valid"] is False
+    assert result["required_follow_up"]
+    assert "Invalid or truncated" in result["review"]
+    assert agent.agent.model_tools._last_review_result is None
 
 
 def test_non_english_project_claim_cannot_rely_only_on_model_review() -> None:
@@ -202,6 +453,54 @@ def test_grounding_gate_withholds_answer_after_failed_retry(
     assert report.status == "limited"
     assert report.agent_loop["termination_reason"] == "grounding_rejected"
     assert report.answer.startswith("The answer was withheld")
+
+
+def test_content_and_formatting_grounding_retries_have_independent_budgets(
+    sample_data: Path, fake_client_factory,
+) -> None:
+    client = fake_client_factory(
+        tool_response(1, "query_bim_workspace", {
+            "sql": "SELECT COUNT(*) AS count FROM records WHERE name LIKE ?",
+            "parameters": ["Pipe [%"], "row_limit": 20,
+        }),
+        final_response(2, "There are 99 pipes. [ref: call-1]"),
+        final_response(3, "There are 2 pipes."),
+        final_response(4, "There are 2 pipes. [ref: call-1]"),
+    )
+
+    report = BimAgent(sample_data, client=client).ask("How many pipes?")
+
+    assert report.status == "completed"
+    assert report.agent_loop["grounding_content_forced"] is True
+    assert report.agent_loop["grounding_format_forced"] is True
+    retries = [
+        item["grounding_issue_category"]
+        for item in report.agent_loop["iterations"]
+        if item.get("action") == "grounding_continue"
+    ]
+    assert retries == ["content", "formatting"]
+
+
+def test_sentence_level_citation_repair_avoids_a_model_retry(
+    sample_data: Path, fake_client_factory,
+) -> None:
+    client = fake_client_factory(
+        tool_response(1, "query_bim_workspace", {
+            "sql": "SELECT COUNT(*) AS count FROM records WHERE name LIKE ?",
+            "parameters": ["Pipe [%"], "row_limit": 20,
+        }),
+        final_response(
+            2,
+            "There are 2 pipes. The selected query returned a count of 2. [ref: call-1]",
+        ),
+    )
+
+    report = BimAgent(sample_data, client=client).ask("How many pipes?")
+
+    assert report.status == "completed"
+    assert "There are 2 pipes. [ref: call-1]" in report.answer
+    assert report.agent_loop["grounding_forced"] is False
+    assert len(report.agent_loop["citation_repairs"]) == 1
 
 
 def test_completeness_gate_forces_project_data_verification(
@@ -440,7 +739,7 @@ def test_answer_report_calculates_total_cost_from_all_response_usage(
 
 
 def test_cost_guard_stops_before_another_tool_execution(
-    sample_data: Path, tmp_path: Path, fake_client_factory,
+    sample_data: Path, tmp_path: Path, fake_client_factory, monkeypatch,
 ) -> None:
     settings = Settings(
         data_dir=sample_data,
@@ -450,19 +749,71 @@ def test_cost_guard_stops_before_another_tool_execution(
         max_agent_iterations=4,
         max_answer_cost_usd=0.001,
     )
-    client = fake_client_factory(_with_usage(
-        tool_response(1, "calculate", {"expression": "2 + 3"}),
-        input_tokens=1000,
-        output_tokens=100,
-    ))
+    client = fake_client_factory(
+        _with_usage(
+            tool_response(1, "calculate", {"expression": "2 + 3"}),
+            input_tokens=1000,
+            output_tokens=100,
+        ),
+        _with_usage(
+            final_response(2, "The available evidence does not yet establish the result."),
+            input_tokens=200,
+            output_tokens=40,
+        ),
+    )
+    agent = BimAgent(settings=settings, client=client)
+    executions: list[str] = []
+    original_execute = agent.tools.execute
 
-    report = BimAgent(settings=settings, client=client).ask("Calculate 2 + 3")
+    def tracked_execute(name: str, arguments: dict) -> dict:
+        executions.append(name)
+        return original_execute(name, arguments)
+
+    monkeypatch.setattr(agent.tools, "execute", tracked_execute)
+    report = agent.ask("Calculate 2 + 3")
 
     assert report.status == "limited"
     assert report.agent_loop["termination_reason"] == "cost_budget_exceeded"
     assert report.cost["budget_usd"] == 0.001
     assert report.cost["budget_exceeded"] is True
-    assert report.agent_loop["iterations"][0]["action"] == "cost_budget_exceeded"
+    assert report.agent_loop["iterations"][0]["action"] == "cost_budget_answer"
+    assert report.agent_loop["iterations"][0]["budget_finalization"]["trigger"] == "before_tool_execution"
+    assert executions == []
+    assert "tools" not in client.responses.requests[1]
+    assert report.answer.endswith(COST_BUDGET_NOTICE)
+    assert report.answer.count(COST_BUDGET_NOTICE) == 1
+    assert [item["purpose"] for item in report.cost["request_breakdown"]] == [
+        "agent_turn", "budget_finalization",
+    ]
+
+
+def test_final_candidate_that_crosses_budget_is_preserved_without_an_extra_request(
+    sample_data: Path, tmp_path: Path, fake_client_factory,
+) -> None:
+    settings = Settings(
+        data_dir=sample_data,
+        trace_dir=tmp_path / "traces",
+        model="gpt-5.4",
+        reasoning_effort="medium",
+        max_agent_iterations=2,
+        max_answer_cost_usd=0.001,
+    )
+    client = fake_client_factory(_with_usage(
+        final_response(1, f"Best available answer.\n\n{COST_BUDGET_NOTICE}"),
+        input_tokens=1000,
+        output_tokens=100,
+    ))
+
+    report = BimAgent(settings=settings, client=client).ask("Explain the available information")
+
+    assert report.status == "limited"
+    assert len(client.responses.requests) == 1
+    assert report.answer.startswith("Best available answer.")
+    assert report.answer.endswith(COST_BUDGET_NOTICE)
+    assert report.answer.count(COST_BUDGET_NOTICE) == 1
+    metadata = report.agent_loop["iterations"][0]["budget_finalization"]
+    assert metadata["trigger"] == "after_answer_generation"
+    assert metadata["finalization_attempted"] is False
 
 
 def test_markdown_table_headers_do_not_trigger_a_grounding_retry(

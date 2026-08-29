@@ -866,6 +866,7 @@ class RawProjectTools:
                 "For STEP IFC, prefer named ifc_objects, ifc_relationships, and record_ifc_candidates; use ifc_entities plus ifc_references only for raw details.",
                 "Use analyze_ifc_geometry when placement, area, volume, physical size, or spatial containment matters.",
                 "Use parameter placeholders (?) for user-originated text and return aggregated or evidence-sized rows.",
+                "In a compound UNION query, SQLite ORDER BY expressions must match output columns; wrap the UNION in an outer SELECT before ordering by a CASE expression.",
             ],
             "ifc_geometry": self.ifc_analysis.capability(),
         }

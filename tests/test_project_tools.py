@@ -55,6 +55,7 @@ def test_model_authored_workspace_joins_and_aggregates_project_data(sample_data:
         "records", "properties", "tree_nodes", "tree_edges",
     }
     assert "_objects_val" in description["attached_ifc_tables"]
+    assert any("compound UNION" in item and "outer SELECT" in item for item in description["guidance"])
 
     result = tools.execute("query_bim_workspace", {
         "sql": """

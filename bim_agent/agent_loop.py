@@ -18,6 +18,11 @@ from .tracing import TraceLog
 _ROUTING_PATH = Path(__file__).with_name("skills") / "bim-routing" / "SKILL.md"
 ROUTING_INSTRUCTIONS = _ROUTING_PATH.read_text(encoding="utf-8")
 
+COST_BUDGET_NOTICE = (
+    "The answer was stopped because the configured per-answer cost budget was reached before the evidence "
+    "could be finalized."
+)
+
 
 AGENT_INSTRUCTIONS = """You are the only BIM analysis agent. There is no fixed planner, executor,
 verifier, answer template, supervisor, or fallback agent. Decide for yourself which tools to call, in which
@@ -70,7 +75,9 @@ normative compliance question, use research_standards when external requirements
 requirements distinct from project facts. Do not ask the user to choose a floor or interpretation when the project
 data lets you report all material alternatives concisely.
 Answer in the user's language. Give the direct result first, then concise evidence and limitations. Do not expose
-private chain-of-thought. Return a normal assistant message only when you judge the answer ready.
+private chain-of-thought. Do not author snapshot, scope, uniqueness, source-mismatch, unit, or type-semantics
+disclosure sentences yourself; the runtime appends required disclosures in canonical cited form. Return a normal
+assistant message only when you judge the substantive answer ready.
 
 The versioned routing and evidence rules below are mandatory:
 """ + ROUTING_INSTRUCTIONS
@@ -171,7 +178,8 @@ class ModelDirectedBimAgent:
         tool_categories: set[str] = set()
         outstanding_cursors: set[str] = set()
         completeness_forced = False
-        grounding_forced = False
+        grounding_content_forced = False
+        grounding_format_forced = False
         cost_budget_exceeded = False
         fetch_more_calls = 0
         unverified_disclaimer_required = False
@@ -181,7 +189,8 @@ class ModelDirectedBimAgent:
         review_required_follow_up: list[str] = []
         review_required_disclosures: list[str] = []
         review_unsupported_claims: list[str] = []
-        review_satisfied_disclosures: set[str] = set()
+        disclosure_state: dict[str, dict[str, Any]] = {}
+        citation_repairs: list[dict[str, Any]] = []
         usage_records: list[dict[str, Any]] = []
         model_tool_usage_index = 0
         self.model_tools.reset_usage()
@@ -235,29 +244,6 @@ class ModelDirectedBimAgent:
                 configured_model=self.model,
                 purpose="agent_turn",
             ))
-            if calls and _cost_limit_reached(
-                usage_records,
-                limit_usd=self.max_answer_cost_usd,
-                pricing_overrides=self.pricing_overrides,
-            ):
-                cost_budget_exceeded = True
-                termination_reason = "cost_budget_exceeded"
-                final_answer = (
-                    "The answer was stopped before another tool call because the configured per-answer cost "
-                    "budget was reached. The available evidence was not sufficient for a grounded answer."
-                )
-                iterations.append({
-                    "iteration": iteration,
-                    "response_id": response_id,
-                    "action": "cost_budget_exceeded",
-                    "python_calls": python_calls,
-                })
-                trace.event(
-                    "cost_budget_exceeded",
-                    iteration=iteration,
-                    max_answer_cost_usd=self.max_answer_cost_usd,
-                )
-                break
             trace.transcript(
                 "assistant",
                 response_id=response_id,
@@ -280,6 +266,40 @@ class ModelDirectedBimAgent:
                 program_outputs=sum(1 for item in output if getattr(item, "type", None) == "program_output"),
                 python_calls=len(python_calls),
             )
+            if _cost_limit_reached(
+                usage_records,
+                limit_usd=self.max_answer_cost_usd,
+                pricing_overrides=self.pricing_overrides,
+            ):
+                cost_budget_exceeded = True
+                termination_reason = "cost_budget_exceeded"
+                final_answer, budget_metadata, disclosure_state, current_repairs = self._budget_answer(
+                    question=question,
+                    input_items=(
+                        [*input_items, *output]
+                        if not calls and not candidate_answer and output
+                        else input_items
+                    ),
+                    candidate_answer=candidate_answer if not calls else "",
+                    evidence=evidence,
+                    evidence_aliases=evidence_aliases,
+                    disclosure_codes=review_required_disclosures,
+                    require_disclaimer=unverified_disclaimer_required,
+                    trace=trace,
+                    usage_records=usage_records,
+                    response_ids=response_ids,
+                    iteration=iteration,
+                    trigger="before_tool_execution" if calls else "after_answer_generation",
+                )
+                citation_repairs.extend(current_repairs)
+                iterations.append({
+                    "iteration": iteration,
+                    "response_id": response_id,
+                    "action": "cost_budget_answer",
+                    "budget_finalization": budget_metadata,
+                    "python_calls": python_calls,
+                })
+                break
 
             if not calls:
                 if candidate_answer:
@@ -294,18 +314,12 @@ class ModelDirectedBimAgent:
                             "python_calls": python_calls,
                         })
                         break
-                    candidate_answer, review_satisfied_disclosures = _ensure_review_disclosures(
+                    candidate_answer, disclosure_state = _ensure_review_disclosures(
                         question,
                         candidate_answer,
                         evidence,
                         evidence_aliases=evidence_aliases,
                         disclosure_codes=review_required_disclosures,
-                    )
-                    candidate_answer = _ensure_snapshot_disclosure(
-                        question,
-                        candidate_answer,
-                        evidence,
-                        evidence_aliases=evidence_aliases,
                     )
                     completion_issues = _completion_issues(
                         question,
@@ -319,7 +333,7 @@ class ModelDirectedBimAgent:
                         review_stale=review_stale,
                         required_follow_up=review_required_follow_up,
                         required_disclosures=review_required_disclosures,
-                        satisfied_disclosures=review_satisfied_disclosures,
+                        disclosure_state=disclosure_state,
                         unsupported_claims=review_unsupported_claims,
                     ))
                     completion_issues = list(dict.fromkeys(completion_issues))
@@ -357,37 +371,71 @@ class ModelDirectedBimAgent:
                         })
                         break
 
+                    trusted_disclosures = {
+                        str(item.get("text", ""))
+                        for item in disclosure_state.values()
+                        if item.get("citation_valid")
+                    }
+                    candidate_answer, current_repairs = _repair_citation_placement(
+                        question,
+                        candidate_answer,
+                        evidence,
+                        evidence_aliases=evidence_aliases,
+                        trusted_claims=trusted_disclosures,
+                    )
+                    if current_repairs:
+                        citation_repairs.extend(current_repairs)
+                        trace.transcript(
+                            "gate",
+                            gate="citation_placement_repair",
+                            accepted=True,
+                            repairs=current_repairs,
+                        )
                     grounding_issues = _grounding_issues(
                         question,
                         candidate_answer,
                         evidence,
                         evidence_aliases=evidence_aliases,
                         require_disclaimer=unverified_disclaimer_required,
+                        trusted_claims=trusted_disclosures,
                     )
                     if grounding_issues:
                         trace.transcript("gate", gate="grounding", accepted=False, issues=grounding_issues)
-                        if not grounding_forced and iteration < self.max_iterations:
-                            grounding_forced = True
+                        issue_category = _grounding_issue_category(grounding_issues)
+                        retry_used = (
+                            grounding_format_forced
+                            if issue_category == "formatting"
+                            else grounding_content_forced
+                        )
+                        if not retry_used and iteration < self.max_iterations:
+                            if issue_category == "formatting":
+                                grounding_format_forced = True
+                                grounding_feedback = (
+                                    "The factual content has supporting evidence, but citation placement is "
+                                    "incomplete: " + " ".join(grounding_issues)
+                                    + " Attach an existing supporting reference to every affected sentence. "
+                                      "Do not repeat an identical tool call solely to correct formatting."
+                                )
+                            else:
+                                grounding_content_forced = True
+                                grounding_feedback = (
+                                    "The proposed answer failed the citation-grounding check: "
+                                    + " ".join(grounding_issues)
+                                    + " Either call a tool to verify each claim or remove it. Return inline "
+                                      "references in the form [ref: call_id]. For multiple observations, "
+                                      "repeat the tag, for example [ref: call_3] [ref: call_7]. Cite only IDs "
+                                      "from direct function-call outputs, their supplied _citation_reference "
+                                      "aliases, or automatic reconciliation observations."
+                                )
                             input_items.extend([
                                 {"role": "assistant", "content": candidate_answer},
-                                {
-                                    "role": "user",
-                                    "content": (
-                                        "The proposed answer failed the citation-grounding check: "
-                                        + " ".join(grounding_issues)
-                                        + " Either call a tool to verify each claim or remove it. Return inline "
-                                          "references in the form [ref: call_id]."
-                                          " For multiple observations, repeat the tag, for example "
-                                          "[ref: call_3] [ref: call_7]. Cite only IDs from direct "
-                                          "function-call outputs, their supplied _citation_reference aliases, "
-                                          "or automatic reconciliation observations."
-                                    ),
-                                },
+                                {"role": "user", "content": grounding_feedback},
                             ])
                             iterations.append({
                                 "iteration": iteration,
                                 "response_id": response_id,
                                 "action": "grounding_continue",
+                                "grounding_issue_category": issue_category,
                                 "issues": grounding_issues,
                                 "python_calls": python_calls,
                             })
@@ -435,6 +483,7 @@ class ModelDirectedBimAgent:
 
             input_items.extend(output)
             call_records = []
+            cost_reached_during_calls = False
             for call in calls:
                 tool_call_ordinal += 1
                 citation_alias = f"call_{tool_call_ordinal}"
@@ -481,6 +530,11 @@ class ModelDirectedBimAgent:
                 if len(current_model_tool_usage) > model_tool_usage_index:
                     usage_records.extend(current_model_tool_usage[model_tool_usage_index:])
                     model_tool_usage_index = len(current_model_tool_usage)
+                    cost_reached_during_calls = _cost_limit_reached(
+                        usage_records,
+                        limit_usd=self.max_answer_cost_usd,
+                        pricing_overrides=self.pricing_overrides,
+                    )
                 call_output: dict[str, Any] = {
                     "type": "function_call_output",
                     "call_id": call_id,
@@ -515,7 +569,7 @@ class ModelDirectedBimAgent:
                         review_required_disclosures = [
                             str(item) for item in result.get("required_disclosures", [])
                         ]
-                        review_satisfied_disclosures = set()
+                        disclosure_state = {}
                         review_unsupported_claims = [
                             str(item) for item in result.get("unsupported_claims", [])
                         ]
@@ -550,6 +604,10 @@ class ModelDirectedBimAgent:
                     output=result if outcome == "ok" else output_text,
                 )
 
+                if cost_reached_during_calls:
+                    break
+
+                automatic_population_ids: list[str] = []
                 if (
                     outcome == "ok"
                     and isinstance(result, dict)
@@ -557,10 +615,14 @@ class ModelDirectedBimAgent:
                     and "reconciliation" not in tool_categories
                     and _needs_reconciliation(name, result)
                 ):
+                    automatic_population_ids = _population_ids(name, arguments, result, self.tools)
+                if automatic_population_ids:
                     auto_id = f"auto_reconcile_{call_id}"
-                    population_ids = _population_ids(name, arguments, result, self.tools)
                     reconciliation_args = {
-                        "populations": [{"label": f"{name}:{call_id}", "object_ids": population_ids}]
+                        "populations": [{
+                            "label": f"{name}:{call_id}",
+                            "object_ids": automatic_population_ids,
+                        }]
                     }
                     reconciliation_key = _tool_cache_key("reconcile_populations", reconciliation_args)
                     reconciliation_cached = reconciliation_key in cache
@@ -571,7 +633,7 @@ class ModelDirectedBimAgent:
                         cache[reconciliation_key] = copy.deepcopy(reconciliation)
                     reconciliation["automatic"] = True
                     reconciliation["trigger_call_id"] = call_id
-                    reconciliation["population_ids_available"] = bool(population_ids)
+                    reconciliation["population_ids_available"] = True
                     reconciliation["mismatch"] = _reconciliation_mismatch(reconciliation)
                     reconciliation_text, reconciliation_truncated = _tool_output(
                         reconciliation, self.max_tool_output_chars
@@ -589,8 +651,7 @@ class ModelDirectedBimAgent:
                         "result": reconciliation,
                         "evidence_class": "project",
                     }
-                    if population_ids:
-                        tool_categories.add("reconciliation")
+                    tool_categories.add("reconciliation")
                     auto_record = {
                         "tool": "reconcile_populations",
                         "call_id": auto_id,
@@ -628,15 +689,23 @@ class ModelDirectedBimAgent:
             ):
                 cost_budget_exceeded = True
                 termination_reason = "cost_budget_exceeded"
-                final_answer = (
-                    "The answer was stopped because the configured per-answer cost budget was reached before "
-                    "the evidence could be finalized."
-                )
-                trace.event(
-                    "cost_budget_exceeded",
+                final_answer, budget_metadata, disclosure_state, current_repairs = self._budget_answer(
+                    question=question,
+                    input_items=input_items,
+                    candidate_answer="",
+                    evidence=evidence,
+                    evidence_aliases=evidence_aliases,
+                    disclosure_codes=review_required_disclosures,
+                    require_disclaimer=unverified_disclaimer_required,
+                    trace=trace,
+                    usage_records=usage_records,
+                    response_ids=response_ids,
                     iteration=iteration,
-                    max_answer_cost_usd=self.max_answer_cost_usd,
+                    trigger="after_tool_execution",
                 )
+                citation_repairs.extend(current_repairs)
+                iterations[-1]["action"] = "cost_budget_answer"
+                iterations[-1]["budget_finalization"] = budget_metadata
                 break
 
         limitations = [
@@ -668,7 +737,7 @@ class ModelDirectedBimAgent:
                 )
             elif termination_reason == "cost_budget_exceeded":
                 limitations.append(
-                    f"The run reached the configured ${self.max_answer_cost_usd:.2f} per-answer cost guard."
+                    f"The run reached the configured ${self.max_answer_cost_usd:g} per-answer cost guard."
                 )
             else:
                 limitations.append(f"The run stopped after {self.max_iterations} model iterations.")
@@ -676,6 +745,20 @@ class ModelDirectedBimAgent:
             usage_records,
             pricing_overrides=self.pricing_overrides,
         )
+        estimated_cost = cost.get("estimated_cost_usd")
+        if (
+            self.max_answer_cost_usd > 0
+            and isinstance(estimated_cost, (int, float))
+            and estimated_cost >= self.max_answer_cost_usd
+            and not cost_budget_exceeded
+        ):
+            cost_budget_exceeded = True
+            termination_reason = "cost_budget_exceeded"
+            status = "limited"
+            final_answer = _append_budget_notice(final_answer)
+            limitations.append(
+                f"The run reached the configured ${self.max_answer_cost_usd:g} per-answer cost guard."
+            )
         cost["budget_usd"] = self.max_answer_cost_usd or None
         cost["budget_exceeded"] = cost_budget_exceeded
         trace.transcript("cost", **cost)
@@ -704,13 +787,19 @@ class ModelDirectedBimAgent:
                 "tools_available": tool_names,
                 "route": route,
                 "completeness_forced": completeness_forced,
-                "grounding_forced": grounding_forced,
+                "grounding_forced": grounding_content_forced or grounding_format_forced,
+                "grounding_content_forced": grounding_content_forced,
+                "grounding_format_forced": grounding_format_forced,
+                "citation_repairs": citation_repairs,
                 "review_seen": review_seen,
                 "review_can_finalize": review_can_finalize,
                 "review_stale": review_stale,
                 "review_required_follow_up": review_required_follow_up,
                 "review_required_disclosures": review_required_disclosures,
-                "review_satisfied_disclosures": sorted(review_satisfied_disclosures),
+                "review_satisfied_disclosures": sorted(
+                    code for code, item in disclosure_state.items() if item.get("citation_valid")
+                ),
+                "disclosure_state": disclosure_state,
                 "review_unsupported_claims": review_unsupported_claims,
                 "evidence_aliases": evidence_aliases,
                 "cost_budget_usd": self.max_answer_cost_usd or None,
@@ -720,6 +809,134 @@ class ModelDirectedBimAgent:
                 "iterations": iterations,
             },
         )
+
+    def _budget_answer(
+        self,
+        *,
+        question: str,
+        input_items: list[Any],
+        candidate_answer: str,
+        evidence: dict[str, dict[str, Any]],
+        evidence_aliases: dict[str, str],
+        disclosure_codes: list[str],
+        require_disclaimer: bool,
+        trace: TraceLog,
+        usage_records: list[dict[str, Any]],
+        response_ids: list[str],
+        iteration: int,
+        trigger: str,
+    ) -> tuple[str, dict[str, Any], dict[str, dict[str, Any]], list[dict[str, Any]]]:
+        """Produce one bounded, no-tools answer from accumulated evidence when investigation spending stops."""
+        draft = candidate_answer.strip()
+        generated_response_id = ""
+        generation_error = ""
+        finalization_attempted = not bool(draft)
+        generated = False
+        if not draft:
+            try:
+                response = self.client.responses.create(
+                    model=self.model,
+                    instructions=(
+                        AGENT_INSTRUCTIONS
+                        + "\nThe investigation cost budget is exhausted. Do not call any tool. Give a concise "
+                          "best-effort answer using only observations already present in the input. Cite every "
+                          "factual sentence with an existing [ref: call_id]. State that a requested value is "
+                          "unavailable when the observations do not establish it. Do not write disclosure or "
+                          "cost-budget notices; the runtime appends them."
+                    ),
+                    input=[
+                        *input_items,
+                        {
+                            "role": "user",
+                            "content": (
+                                "Stop investigating and answer now from the evidence already collected. "
+                                "Do not request or call another tool."
+                            ),
+                        },
+                    ],
+                    reasoning={"effort": "low"},
+                    store=False,
+                    max_output_tokens=1200,
+                    prompt_cache_key=f"{self.prompt_cache_key}-budget"[:64],
+                    timeout=self.openai_timeout_seconds,
+                )
+                usage_records.append(response_usage_record(
+                    response,
+                    configured_model=self.model,
+                    purpose="budget_finalization",
+                ))
+                generated_response_id = str(getattr(response, "id", "") or "")
+                if generated_response_id:
+                    response_ids.append(generated_response_id)
+                draft = str(getattr(response, "output_text", "") or "").strip()
+                generated = bool(draft)
+                trace.transcript(
+                    "assistant",
+                    response_id=generated_response_id,
+                    text=draft,
+                    function_calls=[],
+                    budget_finalization=True,
+                )
+            except Exception as exc:
+                generation_error = f"{type(exc).__name__}: {exc}"
+                trace.event(
+                    "budget_finalization_error",
+                    iteration=iteration,
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                )
+        draft = draft.replace(COST_BUDGET_NOTICE, "").strip()
+        if not draft:
+            draft = (
+                "The accumulated observations were insufficient to produce a verified substantive answer."
+            )
+        if require_disclaimer and UNVERIFIED_STANDARDS_DISCLAIMER not in draft:
+            draft = f"{draft.rstrip()}\n\n{UNVERIFIED_STANDARDS_DISCLAIMER}"
+        draft, disclosure_state = _ensure_review_disclosures(
+            question,
+            draft,
+            evidence,
+            evidence_aliases=evidence_aliases,
+            disclosure_codes=disclosure_codes,
+        )
+        trusted_disclosures = {
+            str(item.get("text", ""))
+            for item in disclosure_state.values()
+            if item.get("citation_valid")
+        }
+        draft, citation_repairs = _repair_citation_placement(
+            question,
+            draft,
+            evidence,
+            evidence_aliases=evidence_aliases,
+            trusted_claims=trusted_disclosures,
+        )
+        grounding_issues = _grounding_issues(
+            question,
+            draft,
+            evidence,
+            evidence_aliases=evidence_aliases,
+            require_disclaimer=require_disclaimer,
+            trusted_claims=trusted_disclosures,
+        )
+        final_answer = _append_budget_notice(draft)
+        metadata = {
+            "trigger": trigger,
+            "finalization_attempted": finalization_attempted,
+            "generated": generated,
+            "fallback_used": finalization_attempted and not generated,
+            "response_id": generated_response_id,
+            "generation_error": generation_error or None,
+            "grounding_issues": grounding_issues,
+        }
+        trace.event(
+            "cost_budget_exceeded",
+            iteration=iteration,
+            max_answer_cost_usd=self.max_answer_cost_usd,
+            best_effort_answer=True,
+            **metadata,
+        )
+        return final_answer, metadata, disclosure_state, citation_repairs
 
     def _execute_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "run_local_python":
@@ -784,6 +1001,7 @@ class ModelDirectedBimAgent:
 
 
 _REF_RE = re.compile(r"\[ref:\s*([A-Za-z0-9_.:-]+)\s*\]", re.IGNORECASE)
+_SPACED_REF_RE = re.compile(r"\s*\[ref:\s*[A-Za-z0-9_.:-]+\s*\]", re.IGNORECASE)
 _NUMBER_RE = re.compile(r"(?<![A-Za-z_])-?\d+(?:,\d{3})*(?:\.\d+)?")
 _NUMBER_WORD_VALUES = {
     "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
@@ -799,6 +1017,20 @@ _PROJECT_TERMS = re.compile(
     r"geometry|volumes?|areas?|lengths?|properties)\b",
     re.IGNORECASE,
 )
+_HEBREW_PROJECT_TERMS = re.compile(
+    "(?:\u05e4\u05e8\u05d5\u05d9\u05e7\u05d8|\u05de\u05d5\u05d3\u05dc|\u05e7\u05d5\u05de(?:\u05d4|\u05d5\u05ea)|"
+    "\u05d7\u05d3\u05e8(?:\u05d9\u05dd)?|\u05e9\u05d8\u05d7(?:\u05d9\u05dd)?|\u05ea\u05d0\u05d5\u05e8\u05d4|"
+    "\u05d0\u05dc\u05de\u05e0\u05d8(?:\u05d9\u05dd)?|\u05d2\u05d5\u05e4\u05d9 \u05ea\u05d0\u05d5\u05e8\u05d4)"
+)
+_HEBREW_DATA_OPERATION_TERMS = re.compile(
+    "(?:\u05dc\u05db\u05dc|\u05d1\u05db\u05dc|\u05db\u05de\u05d4|\u05e1\u05db\u05d5\u05dd|\u05e1\u05da|"
+    "\u05de\u05de\u05d5\u05e6\u05e2|\u05de\u05d9\u05e0\u05d9\u05de\u05d5\u05dd|\u05de\u05e7\u05e1\u05d9\u05de\u05d5\u05dd|"
+    "\u05dc\u05e4\u05d9|\u05e6\u05e4\u05d9\u05e4\u05d5\u05ea)"
+)
+
+
+def _is_project_question(value: str) -> bool:
+    return bool(_PROJECT_TERMS.search(value) or _HEBREW_PROJECT_TERMS.search(value))
 
 
 def _classify_route(question: str) -> dict[str, Any]:
@@ -807,7 +1039,8 @@ def _classify_route(question: str) -> dict[str, Any]:
         r"\b(how many|count|total|sum|average|mean|minimum|maximum|min|max|group|per|each|"
         r"filter|where|whose|with|without|join|list all|all objects|all records)\b",
         normalized,
-    )) and bool(_PROJECT_TERMS.search(question))
+    )) or bool(_HEBREW_DATA_OPERATION_TERMS.search(normalized))
+    data_operation = data_operation and _is_project_question(question)
     return {
         "project_data_operation": data_operation,
         "general_compute_path": "sql_only" if data_operation else "adaptive",
@@ -818,7 +1051,16 @@ def _classify_route(question: str) -> dict[str, Any]:
 
 
 def _tool_cache_key(name: str, arguments: dict[str, Any]) -> str:
-    canonical = json.dumps(arguments, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
+    normalized_arguments = copy.deepcopy(arguments)
+    if name == "query_bim_workspace" and isinstance(normalized_arguments.get("sql"), str):
+        normalized_arguments["sql"] = normalized_arguments["sql"].strip().rstrip(";").rstrip()
+    canonical = json.dumps(
+        normalized_arguments,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
     return hashlib.sha256(f"{name}\0{canonical}".encode("utf-8")).hexdigest()
 
 
@@ -855,11 +1097,11 @@ def _completion_issues(
     normalized = question.casefold()
     issues: list[str] = []
     substantive = tool_categories.difference({"reconciliation", "review", "pagination", "schema"})
-    project_question = bool(_PROJECT_TERMS.search(question))
+    project_question = _is_project_question(question)
     quantitative = bool(re.search(
         r"\b(how many|count|total|sum|average|mean|minimum|maximum|min|max|largest|smallest|longest|shortest)\b",
         normalized,
-    ))
+    )) or bool(_HEBREW_DATA_OPERATION_TERMS.search(normalized))
     if project_question and not substantive:
         issues.append("any project observation")
     if project_question and quantitative and not ({"sql", "geometry"} & substantive):
@@ -873,7 +1115,10 @@ def _completion_issues(
         issues.append(
             "population reconciliation before an exhaustive, ranking, cross-source, or compliance claim"
         )
-    if re.search(r"\b(floor|level|storey|story|room|zone|location|located)\b", normalized) and not (
+    if (
+        re.search(r"\b(floor|level|storey|story|room|zone|location|located)\b", normalized)
+        or re.search("(?:\u05e7\u05d5\u05de(?:\u05d4|\u05d5\u05ea)|\u05d7\u05d3\u05e8(?:\u05d9\u05dd)?)", normalized)
+    ) and not (
         {"sql", "records", "geometry"} & substantive
     ):
         issues.append("the location condition")
@@ -905,7 +1150,7 @@ def _review_completion_issues(
     review_stale: bool,
     required_follow_up: list[str],
     required_disclosures: list[str],
-    satisfied_disclosures: set[str],
+    disclosure_state: dict[str, dict[str, Any]],
     unsupported_claims: list[str],
 ) -> list[str]:
     if not review_seen:
@@ -917,7 +1162,8 @@ def _review_completion_issues(
         detail = "; ".join(required_follow_up[:4]) or "the material gaps identified by evidence review"
         issues.append(f"the evidence review's required follow-up: {detail}")
     for disclosure_code in required_disclosures:
-        if disclosure_code not in satisfied_disclosures:
+        state = disclosure_state.get(disclosure_code, {})
+        if not state.get("citation_valid"):
             disclosure = _review_disclosure_text(
                 disclosure_code, bool(re.search(r"[\u0590-\u05FF]", answer))
             )
@@ -930,6 +1176,31 @@ def _review_completion_issues(
     return issues
 
 
+def _split_line_claims(line: str) -> list[str]:
+    """Split prose into sentences while binding each inline ref to the sentence immediately before it."""
+    claims: list[str] = []
+    cursor = 0
+    while cursor < len(line):
+        while cursor < len(line) and line[cursor].isspace():
+            cursor += 1
+        if cursor >= len(line):
+            break
+        punctuation = re.search(r"[.!?](?=\s|$)", line[cursor:])
+        if punctuation is None:
+            claims.append(line[cursor:].strip())
+            break
+        end = cursor + punctuation.end()
+        reference_end = end
+        while True:
+            reference = _SPACED_REF_RE.match(line, reference_end)
+            if reference is None:
+                break
+            reference_end = reference.end()
+        claims.append(line[cursor:reference_end].strip())
+        cursor = reference_end
+    return [item for item in claims if item]
+
+
 def _grounding_issues(
     question: str,
     answer: str,
@@ -937,27 +1208,35 @@ def _grounding_issues(
     *,
     evidence_aliases: dict[str, str] | None = None,
     require_disclaimer: bool,
+    trusted_claims: set[str] | None = None,
 ) -> list[str]:
     issues: list[str] = []
     if require_disclaimer and UNVERIFIED_STANDARDS_DISCLAIMER not in answer:
         issues.append(f"The mandatory disclaimer is missing: {UNVERIFIED_STANDARDS_DISCLAIMER}")
-    requires_grounding = bool(evidence) or bool(_PROJECT_TERMS.search(question)) or bool(_NUMBER_RE.search(answer))
+    requires_grounding = bool(evidence) or _is_project_question(question) or bool(_NUMBER_RE.search(answer))
     if not requires_grounding:
         return issues
 
     claims = [
         item.strip(" -•\t")
-        for item in re.split(r"(?<=[.!?])\s+(?!\[ref:)|\n+", answer, flags=re.IGNORECASE)
+        for line in answer.splitlines()
+        for item in _split_line_claims(line)
         if item.strip(" -•\t")
     ]
     for claim in claims:
         if claim == UNVERIFIED_STANDARDS_DISCLAIMER or claim.endswith(":"):
             continue
-        if _markdown_table_scaffolding(claim):
+        if _markdown_heading_scaffolding(claim) or _markdown_table_scaffolding(claim):
             continue
         refs = _REF_RE.findall(claim)
         claim_text = _REF_RE.sub("", claim).strip()
         if not any(character.isalnum() for character in claim_text):
+            continue
+        normalized_claim = " ".join(claim_text.casefold().split())
+        if any(
+            normalized_claim == " ".join(item.casefold().split())
+            for item in (trusted_claims or set())
+        ):
             continue
         if not refs:
             issues.append(f"Claim has no inline tool reference: {claim_text[:180]!r}.")
@@ -997,12 +1276,58 @@ def _grounding_issues(
     return issues
 
 
+def _grounding_issue_category(issues: list[str]) -> str:
+    if issues and all(item.startswith("Claim has no inline tool reference:") for item in issues):
+        return "formatting"
+    return "content"
+
+
+def _repair_citation_placement(
+    question: str,
+    answer: str,
+    evidence: dict[str, dict[str, Any]],
+    *,
+    evidence_aliases: dict[str, str],
+    trusted_claims: set[str] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Copy trailing citations to earlier sentences only when those citations independently ground them."""
+    repaired_lines: list[str] = []
+    repairs: list[dict[str, Any]] = []
+    for line in answer.splitlines():
+        sentences = _split_line_claims(line)
+        if len(sentences) < 2:
+            repaired_lines.append(line)
+            continue
+        trailing_refs = _REF_RE.findall(sentences[-1])
+        if not trailing_refs:
+            repaired_lines.append(line)
+            continue
+        citation_text = " ".join(f"[ref: {reference}]" for reference in trailing_refs)
+        for index, sentence in enumerate(sentences[:-1]):
+            claim_text = _REF_RE.sub("", sentence).strip()
+            if not claim_text or _REF_RE.search(sentence) or claim_text.endswith(":"):
+                continue
+            trial = f"{sentence.rstrip()} {citation_text}"
+            if not _grounding_issues(
+                question,
+                trial,
+                evidence,
+                evidence_aliases=evidence_aliases,
+                require_disclaimer=False,
+                trusted_claims=trusted_claims,
+            ):
+                sentences[index] = trial
+                repairs.append({"claim": claim_text, "references": trailing_refs})
+        repaired_lines.append(" ".join(sentences))
+    return "\n".join(repaired_lines), repairs
+
+
 def _looks_project_claim(question: str, claim: str, *, project_context: bool = False) -> bool:
     standards_claim = bool(re.search(
         r"\b(standard|code|regulation|requirement|guidance)\b", claim, re.IGNORECASE
     ))
-    return bool(_PROJECT_TERMS.search(claim)) or (
-        bool(_PROJECT_TERMS.search(question))
+    return _is_project_question(claim) or (
+        _is_project_question(question)
         and not standards_claim
     ) or (
         project_context and not standards_claim
@@ -1059,10 +1384,17 @@ def _needs_reconciliation(name: str, result: dict[str, Any]) -> bool:
         "explore_object_scope", "review_scope_and_evidence", "research_standards",
     }:
         return False
+    if result.get("truncated") or result.get("cursor"):
+        return False
+    if name == "query_bim_workspace":
+        columns = {str(item).casefold() for item in result.get("columns", [])}
+        identity_columns = {
+            "object_id", "record_object_id", "record_objectid", "ifc_step_id", "global_id",
+        }
+        return bool(columns) and columns.issubset(identity_columns)
     return name in {
-        "inspect_project", "list_tree_children", "search_records", "get_records", "fetch_more",
-        "aggregate_records", "search_ifc", "query_bim_workspace", "analyze_ifc_geometry",
-        "rank_ifc_geometry", "analyze_ifc_graph",
+        "list_tree_children", "search_records", "get_records", "fetch_more",
+        "analyze_ifc_geometry", "rank_ifc_geometry",
     }
 
 
@@ -1072,6 +1404,11 @@ def _requires_population_reconciliation(question: str) -> bool:
         r"\b(all|every|complete|exhaustive|entire|whole|total|ranking|ranked|largest|smallest|"
         r"longest|shortest|top\s+\d+|bottom\s+\d+|compliance|compliant|comply|audit|"
         r"reconcile|cross[- ]source|across (?:the )?sources)\b",
+        normalized,
+    ):
+        return True
+    if re.search(
+        "(?:\u05dc\u05db\u05dc|\u05d1\u05db\u05dc|\u05db\u05dc \u05e7\u05d5\u05de(?:\u05d4|\u05d5\u05ea))",
         normalized,
     ):
         return True
@@ -1266,32 +1603,62 @@ def _ensure_review_disclosures(
     *,
     evidence_aliases: dict[str, str],
     disclosure_codes: list[str],
-) -> tuple[str, set[str]]:
-    if not disclosure_codes:
-        return answer, set()
+) -> tuple[str, dict[str, dict[str, Any]]]:
     alias_by_id = {call_id: alias for alias, call_id in evidence_aliases.items()}
     project_reference = ""
     review_reference = ""
+    project_reference_id = ""
+    review_reference_id = ""
     for call_id, observation in evidence.items():
         if observation.get("evidence_class") == "project" and not project_reference:
             project_reference = alias_by_id.get(call_id, call_id)
+            project_reference_id = call_id
         if observation.get("tool") == "review_scope_and_evidence":
             review_reference = alias_by_id.get(call_id, call_id)
-    if not project_reference or not review_reference:
-        return answer, set()
+            review_reference_id = call_id
+    desired_codes = list(dict.fromkeys([
+        *(("loaded_snapshot",) if project_reference else ()),
+        *disclosure_codes,
+    ]))
+    if not desired_codes:
+        return answer, {}
     hebrew = bool(re.search(r"[\u0590-\u05FF]", question))
-    output = answer.rstrip()
-    satisfied: set[str] = set()
-    for code in disclosure_codes:
+    output = _strip_model_disclosures(answer, desired_codes).rstrip()
+    state: dict[str, dict[str, Any]] = {}
+    for code in desired_codes:
         disclosure = _review_disclosure_text(code, hebrew)
-        if _disclosure_present(code, output):
-            satisfied.add(code)
-            continue
-        output += (
-            f"\n\n{disclosure} [ref: {project_reference}] [ref: {review_reference}]"
-        )
-        satisfied.add(code)
-    return output, satisfied
+        references = [project_reference] if project_reference else []
+        resolved_references = [project_reference_id] if project_reference_id else []
+        review_required = code in disclosure_codes
+        if review_required and review_reference:
+            references.append(review_reference)
+            resolved_references.append(review_reference_id)
+        citation_valid = bool(project_reference) and (not review_required or bool(review_reference))
+        state[code] = {
+            "code": code,
+            "text": disclosure,
+            "references": references,
+            "resolved_references": resolved_references,
+            "citation_valid": citation_valid,
+        }
+        if citation_valid:
+            citations = " ".join(f"[ref: {reference}]" for reference in references)
+            output += f"\n\n{disclosure} {citations}"
+    return output, state
+
+
+def _strip_model_disclosures(answer: str, disclosure_codes: list[str]) -> str:
+    output_lines: list[str] = []
+    for line in answer.splitlines():
+        kept: list[str] = []
+        claims = [item.strip() for item in _split_line_claims(line) if item.strip()]
+        for claim in claims:
+            claim_text = _REF_RE.sub("", claim).strip()
+            if any(_disclosure_present(code, claim_text) for code in disclosure_codes):
+                continue
+            kept.append(claim)
+        output_lines.append(" ".join(kept))
+    return "\n".join(output_lines)
 
 
 def _disclosure_present(code: str, answer: str) -> bool:
@@ -1349,12 +1716,27 @@ def _markdown_table_scaffolding(claim: str) -> bool:
     return not _NUMBER_RE.search(stripped) and "`" not in stripped
 
 
+def _markdown_heading_scaffolding(claim: str) -> bool:
+    stripped = _REF_RE.sub("", claim).strip()
+    if not re.match(r"^#{1,6}\s+", stripped):
+        return False
+    heading = re.sub(r"^#{1,6}\s+", "", stripped).strip()
+    # Plain section labels are presentation, while headings containing a value,
+    # rating, or explicit proposition still pass through factual grounding.
+    return bool(heading) and not any(marker in heading for marker in (":", "**", "`")) and not _NUMBER_RE.search(heading)
+
+
 def _is_single_clarifying_question(answer: str) -> bool:
     stripped = answer.strip()
     if not stripped.endswith("?") or _REF_RE.search(stripped) or _NUMBER_RE.search(stripped):
         return False
     sentences = [part for part in re.split(r"[.!?]+", stripped) if part.strip()]
     return len(sentences) == 1 and len(stripped) <= 500
+
+
+def _append_budget_notice(answer: str) -> str:
+    substantive = answer.replace(COST_BUDGET_NOTICE, "").strip()
+    return f"{substantive}\n\n{COST_BUDGET_NOTICE}" if substantive else COST_BUDGET_NOTICE
 
 
 def _cost_limit_reached(

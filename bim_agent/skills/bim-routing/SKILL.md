@@ -1,6 +1,6 @@
 # BIM Tool Routing Rules
 
-Version: 1.2.0
+Version: 1.2.1
 
 These rules are runtime instructions for the BIM answer agent. They are deliberately kept outside the loop code so routing changes can be reviewed and tested independently.
 
@@ -34,7 +34,7 @@ Do not use `calculate` to derive an aggregate directly from project records. Do 
 - If project tools cannot resolve a material ambiguity, ask the engineer one concise clarifying question instead of guessing the scope.
 - Preserve distinct dimension axes and units. IFC geometry uses the project units declared by `IfcUnitAssignment`; confirm those units before comparing IFC geometry with JSON exports. Treat JSON units as source-specific unless an explicit unit accompanies the value, and convert only after both source units are known.
 - When sources disagree about the same property for the same resolved element identity, do not silently choose one value. Report the conflicting values with separate references and source labels, check whether units, identity mapping, or provenance resolves the disagreement, and otherwise mark it unresolved.
-- Treat the loaded tree, properties, and IFC files as one analysis snapshot, not as proof that the files are current or mutually synchronized. If revision, export time, or synchronization metadata is absent, say that freshness/version alignment is unverified and scope conclusions to the loaded snapshot.
+- Treat the loaded tree, properties, and IFC files as one analysis snapshot, not as proof that the files are current or mutually synchronized. If revision, export time, or synchronization metadata is absent, scope conclusions to the loaded snapshot. Do not author the disclosure sentence; the runtime appends its canonical cited form.
 - Use `analyze_ifc_geometry` or `rank_ifc_geometry` for physical geometry questions.
 - Use named IFC relationships and `analyze_ifc_graph` for reachability or connectivity.
 - Treat reconciliation mismatches as unresolved evidence that must be investigated or disclosed.
