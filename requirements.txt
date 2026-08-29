@@ -1,5 +1,7 @@
 fastapi>=0.110
-openai>=2.0
+ifcopenshell>=0.8.5
+numpy>=1.26
+openai>=2.53.0
 pydantic>=2.6
+shapely>=2.0
 uvicorn>=0.29
-

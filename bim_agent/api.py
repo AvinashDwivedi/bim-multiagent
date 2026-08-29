@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from .project_tools import ProjectError
+from .agent_loop import _is_retryable_api_error
 from .runtime import BimAgent
 
 
@@ -29,6 +30,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
                 "status": "ok",
                 "raw_records": len(agent.tools.records),
                 "model_directed": True,
+                "hosted_python": agent.agent.python_workspace.status(),
             }
         except (ProjectError, RuntimeError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -44,10 +46,20 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
     def ask(request: AskRequest) -> dict:
         try:
             return get_agent().ask(request.question).to_dict()
-        except (ProjectError, RuntimeError) as exc:
+        except ProjectError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            retryable = _is_retryable_api_error(exc)
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "upstream_unavailable" if retryable else "agent_error",
+                    "retryable": retryable,
+                    "message": str(exc),
+                },
+            ) from exc
 
     return app
 
