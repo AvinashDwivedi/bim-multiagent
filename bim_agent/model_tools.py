@@ -4,6 +4,12 @@ import json
 from typing import Any
 
 from .project_tools import RawProjectTools
+from .pricing import response_usage_record
+
+
+UNVERIFIED_STANDARDS_DISCLAIMER = (
+    "⚠️ Unverified — not sourced from project data or a cited standard."
+)
 
 
 class ModelAssistedTools:
@@ -21,6 +27,24 @@ class ModelAssistedTools:
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.project_tools = project_tools
+        self._usage_records: list[dict[str, Any]] = []
+        self.prompt_cache_key = _prompt_cache_key(model, project_tools)
+
+    def reset_usage(self) -> None:
+        self._usage_records = []
+
+    def usage_records(self) -> list[dict[str, Any]]:
+        return list(self._usage_records)
+
+    def _record_usage(
+        self, response: Any, purpose: str, *, excluded_tool_fees: list[str] | None = None,
+    ) -> None:
+        self._usage_records.append(response_usage_record(
+            response,
+            configured_model=self.model,
+            purpose=purpose,
+            excluded_tool_fees=excluded_tool_fees,
+        ))
 
     def definitions(self) -> list[dict[str, Any]]:
         return [
@@ -47,7 +71,7 @@ class ModelAssistedTools:
             ),
             _strict_tool(
                 "research_standards",
-                "Use model-directed web research for a normative BIM, engineering, safety, or code-compliance question. Returns a concise standards summary with source URLs, jurisdiction/edition uncertainty, measurable criteria, and data required for comparison. Use only when external requirements are necessary; project facts must still come from project tools.",
+                "Use model-directed web research for a normative BIM, engineering, safety, or code-compliance question. Returns a concise standards summary with source URLs, jurisdiction/edition uncertainty, measurable criteria, and data required for comparison. If no source URL is retrieved, the result is marked unverified and carries a mandatory final-answer disclaimer. Use only when external requirements are necessary; project facts must still come from project tools.",
                 {
                     "query": {"type": "string"},
                     "jurisdiction": {"type": "string"},
@@ -66,7 +90,11 @@ class ModelAssistedTools:
         raise ValueError(f"Unknown model-assisted tool: {name}")
 
     def _explore_scope(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        profile = self.project_tools.scope_profile()
+        profile = self.project_tools.scope_profile(
+            max_nodes=40,
+            sample_limit=3,
+            terms=[str(item) for item in arguments.get("candidate_concepts", [])],
+        )
         payload = {
             "question": arguments.get("question", ""),
             "candidate_concepts": arguments.get("candidate_concepts", []),
@@ -85,8 +113,10 @@ class ModelAssistedTools:
             input=json.dumps(payload, ensure_ascii=False),
             reasoning={"effort": self.reasoning_effort},
             store=False,
-            max_output_tokens=3000,
+            max_output_tokens=1400,
+            prompt_cache_key=f"{self.prompt_cache_key}-scope"[:64],
         )
+        self._record_usage(response, "scope_exploration")
         analysis = _required_model_text(response, "scope explorer")
         return {
             "analysis": analysis,
@@ -106,7 +136,10 @@ class ModelAssistedTools:
                 "question", "selected_scope", "exclusions", "evidence", "reconciliation", "draft_answer",
             )
         }
-        payload["project_hierarchy_profile"] = self.project_tools.scope_profile()
+        profile = self.project_tools.scope_profile(max_nodes=0, sample_limit=0)
+        payload["project_summary"] = {
+            key: value for key, value in profile.items() if key != "hierarchy_nodes"
+        }
         response = self.client.responses.create(
             model=self.model,
             instructions=(
@@ -116,6 +149,9 @@ class ModelAssistedTools:
                 "exclusions, property-versus-geometry conflicts, unreconciled totals, merged dimensional axes, "
                 "missing counterexamples, and relationship directionality. Reject connectivity claims based only "
                 "on raw references, and reject rankings that did not compare the complete selected population. "
+                "Flag conflicting values for the same resolved identity across tree/properties/IFC and do not "
+                "silently select a winner. Check whether revision/export metadata establishes that the supplied "
+                "files are synchronized; otherwise require snapshot-scoped wording. "
                 "Compare relevant raw-record, "
                 "external-ID, IFC-ID, and geometry cardinalities; repeated values are not proof of duplication. "
                 "Return prioritized gaps and concrete follow-up tool "
@@ -124,8 +160,10 @@ class ModelAssistedTools:
             input=json.dumps(payload, ensure_ascii=False),
             reasoning={"effort": self.reasoning_effort},
             store=False,
-            max_output_tokens=2500,
+            max_output_tokens=1200,
+            prompt_cache_key=f"{self.prompt_cache_key}-review"[:64],
         )
+        self._record_usage(response, "evidence_review")
         review = _required_model_text(response, "evidence reviewer")
         return {
             "review": review,
@@ -150,11 +188,20 @@ class ModelAssistedTools:
             reasoning={"effort": self.reasoning_effort},
             store=False,
             max_output_tokens=3000,
+            prompt_cache_key=f"{self.prompt_cache_key}-standards"[:64],
         )
+        self._record_usage(response, "standards_research", excluded_tool_fees=["web_search"])
         research = _required_model_text(response, "standards researcher")
+        sources = _response_urls(response)
+        verified = bool(sources)
+        if not verified and UNVERIFIED_STANDARDS_DISCLAIMER not in research:
+            research = f"{UNVERIFIED_STANDARDS_DISCLAIMER}\n{research}"
         return {
             "research": research,
-            "sources": _response_urls(response),
+            "sources": sources,
+            "evidence_class": "external_standard" if verified else "unverified_external_guidance",
+            "verified": verified,
+            "mandatory_disclaimer": None if verified else UNVERIFIED_STANDARDS_DISCLAIMER,
             "response_id": str(getattr(response, "id", "") or ""),
         }
 
@@ -172,6 +219,15 @@ def _strict_tool(name: str, description: str, properties: dict[str, Any]) -> dic
         },
         "strict": True,
     }
+
+
+def _prompt_cache_key(model: str, project_tools: RawProjectTools) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    for item in project_tools.manifest():
+        digest.update(str(item.get("sha256", "")).encode("ascii", errors="ignore"))
+    return f"bim-model-tools-{model}-{digest.hexdigest()[:16]}"[:48]
 
 
 def _required_model_text(response: Any, tool_label: str) -> str:

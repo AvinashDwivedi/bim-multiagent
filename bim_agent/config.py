@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -50,11 +51,13 @@ class Settings:
     reasoning_effort: str
     max_agent_iterations: int = 20
     max_tool_output_chars: int = 80000
+    max_answer_cost_usd: float = 0.0
     enable_hosted_python: bool = False
     python_memory_limit: str = "4g"
-    python_expiry_minutes: int = 120
+    python_expiry_minutes: int = 20
     openai_max_retries: int = 4
     openai_timeout_seconds: float = 180.0
+    pricing_overrides: dict[str, dict[str, float]] = field(default_factory=dict)
 
     @classmethod
     def from_env(
@@ -67,6 +70,7 @@ class Settings:
         memory_limit = os.getenv("BIM_PYTHON_MEMORY_LIMIT", "4g").casefold()
         if memory_limit not in {"1g", "4g", "16g", "64g"}:
             raise ValueError("BIM_PYTHON_MEMORY_LIMIT must be one of: 1g, 4g, 16g, 64g.")
+        pricing_overrides = _pricing_overrides(os.getenv("BIM_MODEL_PRICING_JSON", ""))
         return cls(
             data_dir=selected_data.resolve(),
             trace_dir=Path(os.getenv("BIM_TRACE_DIR", "logs/traces")).resolve(),
@@ -74,11 +78,15 @@ class Settings:
             reasoning_effort=os.getenv("BIM_REASONING_EFFORT", "medium"),
             max_agent_iterations=max(1, int(os.getenv("BIM_MAX_AGENT_ITERATIONS", "20"))),
             max_tool_output_chars=max(2000, int(os.getenv("BIM_MAX_TOOL_OUTPUT_CHARS", "80000"))),
+            max_answer_cost_usd=max(0.0, float(os.getenv("BIM_MAX_ANSWER_COST_USD", "0"))),
             enable_hosted_python=_env_bool("BIM_ENABLE_HOSTED_PYTHON", False),
             python_memory_limit=memory_limit,
-            python_expiry_minutes=max(20, int(os.getenv("BIM_PYTHON_EXPIRY_MINUTES", "120"))),
+            python_expiry_minutes=min(
+                20, max(1, int(os.getenv("BIM_PYTHON_EXPIRY_MINUTES", "20")))
+            ),
             openai_max_retries=max(0, int(os.getenv("BIM_OPENAI_MAX_RETRIES", "4"))),
             openai_timeout_seconds=max(10.0, float(os.getenv("BIM_OPENAI_TIMEOUT_SECONDS", "180"))),
+            pricing_overrides=pricing_overrides,
         )
 
 
@@ -87,3 +95,20 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().casefold() not in {"0", "false", "no", "off"}
+
+
+def _pricing_overrides(raw: str) -> dict[str, dict[str, float]]:
+    if not raw.strip():
+        return {}
+    try:
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise TypeError("top-level value must be an object")
+        output: dict[str, dict[str, float]] = {}
+        for model, rates in value.items():
+            if not isinstance(rates, dict):
+                raise TypeError(f"rates for {model!r} must be an object")
+            output[str(model)] = {str(key): float(rate) for key, rate in rates.items()}
+        return output
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError(f"BIM_MODEL_PRICING_JSON must be a model-to-rates JSON object: {exc}") from exc

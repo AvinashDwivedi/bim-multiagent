@@ -44,6 +44,7 @@ def evaluator_payload(
     ]
     return {
         "answer": report.answer,
+        "cost": report.cost,
         "verification_status": report.status,
         "limitations": limitations,
         "stages_used": ["Model-Directed BIM Agent", *[f"Tool: {name}" for name in tools_used]],

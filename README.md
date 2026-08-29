@@ -9,22 +9,25 @@ The model owns planning, tool selection, iteration, interpretation, checking, an
 while not finished:
     response = model(question, observations, tools)
     if response calls tools:
-        observations += execute(tool calls)
+        observations += execute_or_reuse(tool calls)
+        observations += automatic_population_reconciliation
     else:
+        completeness_gate(response)
+        citation_grounding_gate(response)
         return response
 ```
 
-There is no heuristic planner, typed query planner, fixed executor, replay verifier, answer template,
-supervisor, subagent, fixed stage order, or offline fallback.
+There is no heuristic planner, typed query planner, answer template, supervisor, subagent, fixed stage order,
+or offline answer fallback. Termination is constrained by deterministic completeness and citation-grounding checks.
 
 The application exposes generic read-only project capabilities plus model-backed analysis helpers:
 
 - `inspect_project`: source metadata, raw tree roots, record count, and property keys.
-- `list_tree_children`: arbitrary hierarchy traversal.
-- `search_records`: raw name, path, property-key, and property-value search.
+- `list_tree_children`: cursor-paginated arbitrary hierarchy traversal.
+- `search_records`: cursor-paginated raw name, path, property-key, and property-value search.
 - `get_records`: exact raw records and properties by object ID.
-- `aggregate_records`: count, distinct count, sum, average, minimum, maximum, grouping, and unit conversion.
-- `search_ifc`: raw STEP IFC text search.
+- `search_ifc`: cursor-paginated raw STEP IFC text search.
+- `fetch_more`: resumes any cursor returned by the pageable tree/record/IFC tools.
 - `calculate`: safe arithmetic.
 - `describe_bim_workspace` / `query_bim_workspace`: model-authored, read-only SQL over normalized records,
   properties, arbitrary-depth hierarchy, named IFC objects and relationships, and record-to-IFC identity candidates.
@@ -45,9 +48,13 @@ On GPT-5.6 models, Programmatic Tool Calling is also enabled. The model may writ
 to coordinate predictable project-tool calls for filtering, joining, deduplication, aggregation, and evidence
 compression. Adaptive scope choices and the final answer remain direct model decisions.
 
-The model decides which tools are relevant, supplies their arguments, observes their output, changes direction
-when needed, and decides when the answer is complete. Python performs only file parsing, requested search and
-arithmetic operations, API transport, tracing, output-size limits, and the iteration safety bound.
+The model decides which tools are relevant, supplies their arguments, observes their output, and changes direction
+when needed. Python additionally enforces per-run call deduplication, automatic population reconciliation,
+one-shot completeness continuation, unresolved-page checks, and claim-level `[ref: call_id]` validation. Numeric
+citations are accepted only when the cited observation contains the claimed value. Routing rules live in the
+versioned `bim_agent/skills/bim-routing/SKILL.md`; ordinary project filters, joins, and aggregates are routed to SQL.
+The older `aggregate_records` executor remains callable only through the internal Python API for compatibility; it
+is not exposed to model runs.
 
 ## Input contract
 
@@ -80,17 +87,23 @@ BIM_PROJECTS_ROOT=
 BIM_TRACE_DIR=logs/traces
 BIM_MAX_AGENT_ITERATIONS=40
 BIM_MAX_TOOL_OUTPUT_CHARS=80000
+BIM_MAX_ANSWER_COST_USD=0
 BIM_ENABLE_HOSTED_PYTHON=false
 BIM_PYTHON_MEMORY_LIMIT=4g
-BIM_PYTHON_EXPIRY_MINUTES=120
+BIM_PYTHON_EXPIRY_MINUTES=20
 BIM_OPENAI_MAX_RETRIES=4
 BIM_OPENAI_TIMEOUT_SECONDS=180
+BIM_MODEL_PRICING_JSON=
 ```
 
 Hosted Python is opt-in because it uploads the selected project's three source files and a generated analysis snapshot to an OpenAI
 Code Interpreter container. The container has outbound networking disabled, a configured memory cap, and expires
-after inactivity. Set `BIM_ENABLE_HOSTED_PYTHON=true` only when project policy permits this upload; the local
+after inactivity. Uploaded project inputs are isolated snapshots with no mount or write-back route to the source
+directory, and the Responses request has a configured execution timeout. Set `BIM_ENABLE_HOSTED_PYTHON=true` only when project policy permits this upload; the local
 read-only SQL and IFC geometry tools remain available when it is disabled.
+Each individual upload is kept below 49 MB. Larger raw or generated artifacts are transported losslessly as gzip;
+if a gzip stream is still too large, it is split into ordered parts. `upload_manifest.json` records hashes, original
+names, and deterministic reconstruction instructions for Code Interpreter.
 
 The workspace is built lazily for the selected project. The agent asks for its schema and writes its own SQL for
 the current question; there are no question-specific queries, expected answers, or semantic mappings. Only one
@@ -123,8 +136,21 @@ Endpoints:
 - `POST /api/ask` with `{"question":"..."}`
 - Evaluator compatibility: `POST /api/chat` and `POST /api/chat/stream`
 
-Every answer includes source hashes, model response IDs, tool-call telemetry, and a request-scoped JSONL trace.
-It does not claim independent verification because no deterministic verifier remains.
+Every answer includes source hashes, model response IDs, tool-call telemetry, and a request-scoped JSONL audit trace.
+The trace carries a session ID and the full model/tool transcript (with secret-key redaction), including arguments,
+cached-call markers, automatic reconciliation, and untrimmed tool observations.
+
+Every report also includes `cost`, which totals token usage across all Responses API calls needed for that answer,
+including nested scope exploration, evidence review, and standards research. It reports USD list-price estimates,
+cached/uncached input tokens, output tokens, per-request breakdowns, pricing date/source, and whether the estimate is
+complete. GPT-5.4 and GPT-5.6 Sol defaults follow their official model pages. Unknown/private model prices can be
+supplied with `BIM_MODEL_PRICING_JSON`; tool-specific fees such as web search or Code Interpreter are listed as
+excluded rather than silently reported as zero.
+`BIM_MAX_ANSWER_COST_USD` is an opt-in guard. It defaults to `0` (disabled) while real question-cost distributions
+are collected; set a positive amount only after choosing a threshold from observed workloads. When enabled, it stops
+further model/tool turns once the running list-price estimate reaches the configured amount. The completed request may
+exceed the threshold slightly because usage is available only after that request returns. Stable prompt-cache keys and
+compact model-facing observations reduce repeated input.
 Retryable upstream failures are returned as HTTP 503 with a structured `retryable` flag. The health response
 reports the loaded hosted-Python configuration; containers are still created lazily on a question that needs one.
 

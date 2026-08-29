@@ -29,12 +29,14 @@ class BimAgent:
             reasoning_effort=self.settings.reasoning_effort,
             max_iterations=self.settings.max_agent_iterations,
             max_tool_output_chars=self.settings.max_tool_output_chars,
+            max_answer_cost_usd=self.settings.max_answer_cost_usd,
             enable_hosted_python=self.settings.enable_hosted_python,
             python_memory_limit=self.settings.python_memory_limit,
             python_expiry_minutes=self.settings.python_expiry_minutes,
             python_cache_root=self.settings.trace_dir.parent / "python-workspaces",
             openai_max_retries=self.settings.openai_max_retries,
             openai_timeout_seconds=self.settings.openai_timeout_seconds,
+            pricing_overrides=self.settings.pricing_overrides,
             client=client,
         )
 

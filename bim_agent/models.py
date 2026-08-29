@@ -10,6 +10,7 @@ class AnswerReport:
     status: str
     sources: list[dict[str, Any]]
     trace_path: str
+    cost: dict[str, Any] = field(default_factory=dict)
     agent_loop: dict[str, Any] = field(default_factory=dict)
     limitations: list[str] = field(default_factory=list)
 

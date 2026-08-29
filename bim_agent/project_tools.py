@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import hashlib
 import json
 import math
@@ -55,6 +56,9 @@ class RawProjectTools:
         self._workspace_lock = threading.RLock()
         self._workspace_ifc_attached = False
         self.ifc_analysis = IfcAnalysisEngine(self.files.ifc, self.records)
+        self._cursor_key = hashlib.sha256(
+            "|".join(item["sha256"] for item in self.manifest()).encode("ascii")
+        ).digest()
 
     @staticmethod
     def _discover(data_dir: Path) -> ProjectFiles:
@@ -129,10 +133,12 @@ class RawProjectTools:
     def definitions(self) -> list[dict[str, Any]]:
         return [
             _tool("inspect_project", "Inspect source files, tree roots, record count, and available property keys.", {}),
-            _tool("list_tree_children", "List direct child nodes for a tree object ID. Use null parent_object_id for roots.", {
+            _tool("list_tree_children", "List a page of direct child nodes for a tree object ID. Use null parent_object_id for roots and fetch_more when cursor is non-null.", {
                 "parent_object_id": {"type": ["string", "null"]},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
             }),
-            _tool("search_records", "Search raw record names, hierarchy paths, property keys, and property values. Semantics are chosen by you.", {
+            _tool("search_records", "Search a page of raw record names, hierarchy paths, property keys, and property values. Use fetch_more when cursor is non-null.", {
                 "terms": {"type": "array", "items": {"type": "string"}},
                 "match": {"type": "string", "enum": ["all", "any"]},
                 "path_terms": {"type": "array", "items": {"type": "string"}},
@@ -151,12 +157,15 @@ class RawProjectTools:
                 "group_by": {"type": ["string", "null"]},
                 "output_unit": {"type": ["string", "null"]},
             }, required=["object_ids", "operation"]),
-            _tool("search_ifc", "Search raw IFC text lines for entity names, GUIDs, relationships, placements, systems, or values.", {
+            _tool("search_ifc", "Search a page of raw IFC text lines for entity names, GUIDs, relationships, placements, systems, or values. Use fetch_more when cursor is non-null.", {
                 "terms": {"type": "array", "items": {"type": "string"}},
                 "match": {"type": "string", "enum": ["all", "any"]},
                 "offset": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200},
             }, required=["terms"]),
+            _tool("fetch_more", "Fetch the next page represented by an opaque cursor returned by list_tree_children, search_records, or search_ifc.", {
+                "cursor": {"type": "string"},
+            }, required=["cursor"]),
             _tool("calculate", "Evaluate arithmetic using numbers, parentheses, +, -, *, /, %, and powers. Use this instead of mental arithmetic.", {
                 "expression": {"type": "string"},
             }, required=["expression"]),
@@ -285,15 +294,17 @@ class RawProjectTools:
                 ids = [key for key, path in self.paths.items() if len(path) == 1]
             else:
                 ids = self.children.get(str(parent), [])
-            return {"children": [
+            results = [
                 {
                     "object_id": item,
                     "name": self.names.get(item, ""),
                     "path": self.paths.get(item, []),
                     "child_count": len(self.children.get(item, [])),
                 }
-                for item in ids[:500]
-            ]}
+                for item in ids
+            ]
+            page = self._page("list_tree_children", arguments, results)
+            return {**page, "children": page["results"]}
         if name == "search_records":
             return self.search_records(arguments)
         if name == "get_records":
@@ -302,6 +313,8 @@ class RawProjectTools:
             return self.aggregate(arguments)
         if name == "search_ifc":
             return self.search_ifc(arguments)
+        if name == "fetch_more":
+            return self.fetch_more(str(arguments.get("cursor", "")))
         if name == "calculate":
             return {"expression": str(arguments.get("expression", "")), "value": _safe_calculate(str(arguments.get("expression", "")))}
         if name == "describe_bim_workspace":
@@ -319,6 +332,63 @@ class RawProjectTools:
         if name == "bim_analysis_workspace":
             return self.analysis_workspace(arguments)
         raise ProjectError(f"Unknown tool: {name}")
+
+    def fetch_more(self, cursor: str) -> dict[str, Any]:
+        payload = self._decode_cursor(cursor)
+        name = str(payload.get("tool", ""))
+        if name not in {"list_tree_children", "search_records", "search_ifc"}:
+            raise ProjectError("Cursor does not identify a pageable project tool.")
+        arguments = payload.get("arguments")
+        if not isinstance(arguments, dict):
+            raise ProjectError("Cursor arguments are invalid.")
+        return self.execute(name, arguments)
+
+    def _page(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        results: list[dict[str, Any]],
+        *,
+        default_limit: int = 100,
+    ) -> dict[str, Any]:
+        offset = max(0, int(arguments.get("offset", 0)))
+        limit = min(200, max(1, int(arguments.get("limit", default_limit))))
+        page_results = results[offset:offset + limit]
+        next_offset = offset + len(page_results)
+        cursor = None
+        if next_offset < len(results):
+            next_arguments = {
+                key: value for key, value in arguments.items() if key not in {"offset", "cursor"}
+            }
+            next_arguments.update({"offset": next_offset, "limit": limit})
+            cursor = self._encode_cursor({"tool": tool_name, "arguments": next_arguments})
+        return {
+            "results": page_results,
+            "total_count": len(results),
+            "returned_count": len(page_results),
+            "cursor": cursor,
+            "offset": offset,
+        }
+
+    def _encode_cursor(self, payload: dict[str, Any]) -> str:
+        raw = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        signature = hashlib.sha256(self._cursor_key + raw).hexdigest()[:24].encode("ascii")
+        return base64.urlsafe_b64encode(signature + b"." + raw).decode("ascii").rstrip("=")
+
+    def _decode_cursor(self, cursor: str) -> dict[str, Any]:
+        try:
+            padded = cursor + "=" * (-len(cursor) % 4)
+            signed = base64.urlsafe_b64decode(padded.encode("ascii"))
+            signature, raw = signed.split(b".", 1)
+            expected = hashlib.sha256(self._cursor_key + raw).hexdigest()[:24].encode("ascii")
+            if signature != expected:
+                raise ValueError("signature mismatch")
+            payload = json.loads(raw)
+        except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ProjectError("Cursor is invalid or belongs to different project data.") from exc
+        if not isinstance(payload, dict):
+            raise ProjectError("Cursor payload is invalid.")
+        return payload
 
     def reconcile_populations(self, arguments: dict[str, Any]) -> dict[str, Any]:
         populations = arguments.get("populations") or []
@@ -811,8 +881,16 @@ class RawProjectTools:
             kinds.append(self.files.ifc.name)
         return kinds or [item.name for item in (self.files.tree, self.files.properties, self.files.ifc)]
 
-    def scope_profile(self, max_nodes: int = 800) -> dict[str, Any]:
+    def scope_profile(
+        self,
+        max_nodes: int = 80,
+        *,
+        sample_limit: int = 5,
+        terms: list[str] | None = None,
+    ) -> dict[str, Any]:
         """Compact raw hierarchy evidence for a model-controlled scope exploration call."""
+        max_nodes = max(0, int(max_nodes))
+        sample_limit = max(0, min(10, int(sample_limit)))
         parents = {
             child_id: parent_id
             for parent_id, children in self.children.items()
@@ -847,10 +925,10 @@ class RawProjectTools:
                 "leaf_descendant_count": len(leaves),
                 "leaf_samples": [
                     {"object_id": item, "name": self.names.get(item, "")}
-                    for item in leaves[:20]
+                    for item in leaves[:sample_limit]
                 ],
                 "leaf_path_samples": [
-                    " > ".join(self.paths.get(item, [])) for item in leaves[:20]
+                    " > ".join(self.paths.get(item, [])) for item in leaves[:sample_limit]
                 ],
                 "direct_child_samples": [
                     {
@@ -858,9 +936,27 @@ class RawProjectTools:
                         "name": self.names.get(item, ""),
                         "child_count": len(self.children.get(item, [])),
                     }
-                    for item in children[:30]
+                    for item in children[:sample_limit]
                 ],
             })
+        normalized_terms = [
+            str(term).strip().casefold() for term in (terms or []) if str(term).strip()
+        ]
+        if normalized_terms:
+            matched = [
+                item for item in nodes
+                if any(
+                    term in " ".join([
+                        str(item["name"]),
+                        *map(str, item["path"]),
+                        *(str(sample["name"]) for sample in item["direct_child_samples"]),
+                        *(str(sample["name"]) for sample in item["leaf_samples"]),
+                    ]).casefold()
+                    for term in normalized_terms
+                )
+            ]
+            if matched:
+                nodes = matched
         nodes.sort(key=lambda item: (len(item["path"]), item["path"]))
         return {
             "record_count": len(self.records),
@@ -996,9 +1092,13 @@ class RawProjectTools:
                 "external_id": record["external_id"], "path": record["path"],
                 "matched_properties": matched,
             })
-        offset = max(0, int(arguments.get("offset", 0)))
-        limit = min(200, max(1, int(arguments.get("limit", 100))))
-        return {"total_matches": len(matches), "offset": offset, "returned": len(matches[offset:offset + limit]), "records": matches[offset:offset + limit]}
+        page = self._page("search_records", arguments, matches)
+        return {
+            **page,
+            "total_matches": page["total_count"],
+            "returned": page["returned_count"],
+            "records": page["results"],
+        }
 
     def aggregate(self, arguments: dict[str, Any]) -> dict[str, Any]:
         records = [self.by_id[item] for item in map(str, arguments.get("object_ids", [])) if item in self.by_id]
@@ -1075,9 +1175,8 @@ class RawProjectTools:
             hits = [term in normalized for term in terms]
             if terms and (all(hits) if match_all else any(hits)):
                 matches.append({"line": index, "text": line[:4000]})
-        offset = max(0, int(arguments.get("offset", 0)))
-        limit = min(200, max(1, int(arguments.get("limit", 100))))
-        return {"total_matches": len(matches), "offset": offset, "matches": matches[offset:offset + limit]}
+        page = self._page("search_ifc", arguments, matches)
+        return {**page, "total_matches": page["total_count"], "matches": page["results"]}
 
     def _ifc_inventory(self) -> dict[str, Any]:
         if self.files.ifc.read_bytes()[:16] != b"SQLite format 3\x00":
@@ -1120,9 +1219,13 @@ class RawProjectTools:
                     hits = [term in text for term in terms]
                     if terms and (all(hits) if match_all else any(hits)):
                         matches.append({"table": table, "row": dict(zip(columns, values))})
-        offset = max(0, int(arguments.get("offset", 0)))
-        limit = min(200, max(1, int(arguments.get("limit", 100))))
-        return {"format": "SQLite", "total_matches": len(matches), "offset": offset, "matches": matches[offset:offset + limit]}
+        page = self._page("search_ifc", arguments, matches)
+        return {
+            **page,
+            "format": "SQLite",
+            "total_matches": page["total_count"],
+            "matches": page["results"],
+        }
 
     def _connect_ifc_sqlite(self) -> sqlite3.Connection:
         return sqlite3.connect(self.files.ifc.as_uri() + "?mode=ro", uri=True)

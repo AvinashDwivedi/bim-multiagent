@@ -28,6 +28,14 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+def _cost_label(cost: dict) -> str:
+    value = cost.get("estimated_cost_usd")
+    if value is None:
+        return "unavailable (API usage or model pricing missing)"
+    qualifier = "estimated" if cost.get("is_complete") else "estimated subtotal"
+    return f"${float(value):.6f} USD ({qualifier})"
+
+
 def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -60,11 +68,15 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             report = agent.ask(question)
             print(report.answer)
-            print(f"Status: {report.status} | Trace: {report.trace_path}\n")
+            print(
+                f"Status: {report.status} | Cost: {_cost_label(report.cost)} | "
+                f"Trace: {report.trace_path}\n"
+            )
     report = agent.ask(args.question)
     print(report_json(report) if args.as_json else report.answer)
     if not args.as_json:
         print(f"\nStatus: {report.status}")
+        print(f"Cost: {_cost_label(report.cost)}")
         print(f"Trace: {Path(report.trace_path)}")
     return 0
 

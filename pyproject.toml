@@ -26,6 +26,9 @@ bim-agent = "bim_agent.cli:main"
 [tool.setuptools.packages.find]
 include = ["bim_agent*", "bim_agents*"]
 
+[tool.setuptools.package-data]
+bim_agent = ["skills/*/*.md"]
+
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

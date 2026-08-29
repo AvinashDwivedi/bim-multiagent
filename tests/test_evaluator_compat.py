@@ -17,11 +17,16 @@ def test_evaluator_payload_reports_model_tools_without_fake_verification(
 ) -> None:
     client = fake_client_factory(
         tool_response(1, "search_records", {"terms": ["Pipe"], "limit": 20}),
-        final_response(2, "There are two pipes."),
+        tool_response(2, "query_bim_workspace", {
+            "sql": "SELECT COUNT(*) AS count FROM records WHERE name LIKE ?",
+            "parameters": ["Pipe [%"], "row_limit": 20,
+        }),
+        final_response(3, "There are 2 pipes. [ref: call-2]"),
     )
     report = BimAgent(sample_data, client=client).ask("How many pipes?")
     payload = evaluator_payload(report, client_id="client", project_id="project")
     assert payload["verification_status"] == "completed"
+    assert payload["cost"] == report.cost
     assert "Tool: search_records" in payload["stages_used"]
     assert payload["semantic_checks"] == []
     assert payload["artifact_ids"]
@@ -29,7 +34,16 @@ def test_evaluator_payload_reports_model_tools_without_fake_verification(
 
 def test_compatibility_http_chat(sample_data: Path, monkeypatch, fake_client_factory) -> None:
     monkeypatch.setenv("BIM_DATA_DIR", str(sample_data))
-    client = fake_client_factory(final_response(1, "There are two pipes."))
+    client = fake_client_factory(
+        tool_response(1, "query_bim_workspace", {
+            "sql": "SELECT COUNT(*) AS count FROM records WHERE name LIKE ?",
+            "parameters": ["Pipe [%"], "row_limit": 20,
+        }),
+        tool_response(2, "reconcile_populations", {
+            "populations": [{"label": "pipes", "object_ids": ["43", "44"]}],
+        }),
+        final_response(3, "There are 2 pipes. [ref: call-1] [ref: call-2]"),
+    )
     import openai
 
     monkeypatch.setattr(openai, "OpenAI", lambda: client)
@@ -48,7 +62,16 @@ def test_http_project_id_routes_through_projects_root(
 ) -> None:
     monkeypatch.setenv("BIM_PROJECTS_ROOT", str(sample_data.parent))
     monkeypatch.setenv("BIM_DATA_DIR", str(sample_data))
-    client = fake_client_factory(final_response(1, "There are two pipes."))
+    client = fake_client_factory(
+        tool_response(1, "query_bim_workspace", {
+            "sql": "SELECT COUNT(*) AS count FROM records WHERE name LIKE ?",
+            "parameters": ["Pipe [%"], "row_limit": 20,
+        }),
+        tool_response(2, "reconcile_populations", {
+            "populations": [{"label": "pipes", "object_ids": ["43", "44"]}],
+        }),
+        final_response(3, "There are 2 pipes. [ref: call-1] [ref: call-2]"),
+    )
     import openai
 
     monkeypatch.setattr(openai, "OpenAI", lambda: client)
@@ -60,7 +83,7 @@ def test_http_project_id_routes_through_projects_root(
         "/api/chat", json={"question": "How many pipes?", "project_id": sample_data.name}
     )
     assert response.status_code == 200
-    assert "two" in response.json()["answer"]
+    assert "2" in response.json()["answer"]
     assert http.post("/api/chat", json={"question": "x", "project_id": "missing"}).status_code == 404
 
 

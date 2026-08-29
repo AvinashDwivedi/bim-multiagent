@@ -19,22 +19,26 @@ def test_model_chooses_tools_and_owns_completion(
         tool_response(2, "search_records", {
             "terms": ["Pipe ["], "match": "all", "limit": 100,
         }),
-        tool_response(3, "aggregate_records", {
-            "object_ids": ["43", "44"], "operation": "sum",
-            "field": "Dimensions.Length", "output_unit": "m",
+        tool_response(3, "query_bim_workspace", {
+            "sql": (
+                "SELECT SUM(CAST(REPLACE(property_value, ' m', '') AS REAL)) AS total_m "
+                "FROM properties WHERE property_key = ? AND object_id IN (?, ?)"
+            ),
+            "parameters": ["Dimensions.Length", "43", "44"], "row_limit": 20,
         }),
-        final_response(4, "The total pipe length is 5.5 m."),
+        final_response(4, "The total pipe length is 5.5 m. [ref: call-3]"),
     )
     report = BimAgent(sample_data, client=client).ask("What is the total pipe length?")
 
     assert report.status == "completed"
-    assert report.answer == "The total pipe length is 5.5 m."
+    assert report.answer == "The total pipe length is 5.5 m. [ref: call-3]"
     assert report.agent_loop["pattern"] == "model_directed_tool_loop"
     assert [
         call["tool"]
         for turn in report.agent_loop["iterations"]
         for call in turn.get("calls", [])
-    ] == ["inspect_project", "search_records", "aggregate_records"]
+        if not call.get("automatic")
+    ] == ["inspect_project", "search_records", "query_bim_workspace"]
     assert len(client.responses.requests) == 4
     assert all(request["tool_choice"] == "auto" for request in client.responses.requests)
     assert all(request["parallel_tool_calls"] is False for request in client.responses.requests)
@@ -47,10 +51,10 @@ def test_no_fixed_tool_order_or_required_pipeline(
     monkeypatch.setenv("BIM_TRACE_DIR", str(tmp_path / "traces"))
     client = fake_client_factory(
         tool_response(1, "calculate", {"expression": "21 + 1"}),
-        final_response(2, "The calculation result is 22."),
+        final_response(2, "The calculation result is 22. [ref: call-1]"),
     )
     report = BimAgent(sample_data, client=client).ask("Calculate 21 + 1")
-    assert report.answer.endswith("22.")
+    assert report.answer.endswith("[ref: call-1]")
     assert report.agent_loop["iterations"][0]["calls"][0]["tool"] == "calculate"
     assert report.agent_loop["iterations_used"] == 2
 
@@ -82,7 +86,7 @@ def test_invalid_null_tool_observation_is_rejected_and_returned_as_an_error(
     )
     agent = BimAgent(sample_data, client=client)
     monkeypatch.setattr(agent.tools, "execute", lambda _name, _arguments: None)
-    report = agent.ask("Inspect the project")
+    report = agent.ask("Use the inspect capability")
     call = report.agent_loop["iterations"][0]["calls"][0]
     assert call["outcome"] == "error"
     observation = client.responses.requests[1]["input"][-1]["output"]
@@ -111,7 +115,7 @@ def test_gpt_56_enables_programmatic_tool_calling_with_scoped_callers(
         max_agent_iterations=4,
     )
     client = fake_client_factory(final_response(1, "Done."))
-    report = BimAgent(settings=settings, client=client).ask("Inspect this project")
+    report = BimAgent(settings=settings, client=client).ask("Say done")
 
     request_tools = client.responses.requests[0]["tools"]
     assert {item.get("type") for item in request_tools} >= {"function", "programmatic_tool_calling"}
@@ -136,7 +140,7 @@ def test_programmatic_function_caller_is_preserved_on_tool_output(
     call.caller = SimpleNamespace(type="program", caller_id="program-123")
     client = fake_client_factory(
         SimpleNamespace(id="resp-1", output=[call], output_text=""),
-        final_response(2, "5"),
+        final_response(2, "5 [ref: call-1]"),
     )
     BimAgent(settings=settings, client=client).ask("Calculate 2 + 3")
 
@@ -155,7 +159,7 @@ def test_primary_agent_can_invoke_model_backed_evidence_review(
         trace_dir=tmp_path / "traces",
         model="gpt-5.4",
         reasoning_effort="medium",
-        max_agent_iterations=4,
+        max_agent_iterations=5,
     )
     client = fake_client_factory(
         tool_response(1, "review_scope_and_evidence", {
@@ -167,7 +171,14 @@ def test_primary_agent_can_invoke_model_backed_evidence_review(
             "draft_answer": "3",
         }),
         final_response(2, "Check the Electrical Fixtures category as a plausible broader scope."),
-        final_response(3, "There are 3 lighting switches; a broader definition may include another device."),
+        tool_response(3, "query_bim_workspace", {
+            "sql": "SELECT COUNT(*) AS count FROM records WHERE name LIKE ?",
+            "parameters": ["Alpha Switch [%"], "row_limit": 20,
+        }),
+        tool_response(4, "reconcile_populations", {
+            "populations": [{"label": "lighting switches", "object_ids": ["13", "14", "16"]}],
+        }),
+        final_response(5, "There are 3 lighting switches. [ref: call-3] [ref: call-4]"),
     )
     report = BimAgent(settings=settings, client=client).ask("How many switches?")
 
@@ -175,5 +186,10 @@ def test_primary_agent_can_invoke_model_backed_evidence_review(
     assert report.agent_loop["iterations"][0]["calls"][0]["tool"] == "review_scope_and_evidence"
     nested_request = client.responses.requests[1]
     assert "critical BIM evidence-review tool" in nested_request["instructions"]
-    model_observation = client.responses.requests[2]["input"][-1]["output"]
+    assert "hierarchy_nodes" not in nested_request["input"]
+    assert nested_request["max_output_tokens"] == 1200
+    model_observation = next(
+        item["output"] for item in client.responses.requests[2]["input"]
+        if isinstance(item, dict) and item.get("type") == "function_call_output"
+    )
     assert "Electrical Fixtures" in model_observation
