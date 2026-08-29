@@ -48,8 +48,9 @@ def _fingerprint(data_dir: Path) -> tuple[tuple[str, int, int], ...]:
 def _configuration_fingerprint() -> tuple[tuple[str, str], ...]:
     names = (
         "BIM_MODEL", "BIM_OPENAI_AGENT_MODEL", "BIM_REASONING_EFFORT", "BIM_MAX_AGENT_ITERATIONS",
-        "BIM_MAX_TOOL_OUTPUT_CHARS", "BIM_ENABLE_HOSTED_PYTHON", "BIM_PYTHON_MEMORY_LIMIT",
-        "BIM_PYTHON_EXPIRY_MINUTES", "BIM_OPENAI_MAX_RETRIES", "BIM_OPENAI_TIMEOUT_SECONDS",
+        "BIM_MAX_TOOL_OUTPUT_CHARS", "BIM_ENABLE_LOCAL_PYTHON", "BIM_LOCAL_PYTHON_IMAGE",
+        "BIM_PYTHON_MEMORY_LIMIT", "BIM_LOCAL_PYTHON_CPUS", "BIM_LOCAL_PYTHON_TIMEOUT_SECONDS",
+        "BIM_LOCAL_PYTHON_OUTPUT_CHARS", "BIM_OPENAI_MAX_RETRIES", "BIM_OPENAI_TIMEOUT_SECONDS",
     )
     values = [(name, os.getenv(name, "")) for name in names]
     dotenv = Path.cwd() / ".env"
@@ -85,7 +86,7 @@ def health() -> dict:
             "status": "ok",
             "raw_records": len(agent.tools.records),
             "model_directed": True,
-            "hosted_python": agent.agent.python_workspace.status(),
+            "local_python": agent.agent.python_sandbox.status(),
         }
     except (ProjectError, RuntimeError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

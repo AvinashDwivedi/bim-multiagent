@@ -59,7 +59,7 @@ class ModelAssistedTools:
             ),
             _strict_tool(
                 "review_scope_and_evidence",
-                "Ask a model-backed critic to challenge a proposed BIM answer without using expected answers. It checks alternative interpretations, omitted populations, unsupported exclusions, property-versus-geometry conflicts, missing counterexamples, arithmetic reconciliation, and whether clarification is truly necessary. Returns advice only; the primary agent decides whether to investigate further or finish.",
+                "Ask a model-backed critic to challenge a proposed BIM answer without using expected answers. It checks alternative interpretations, omitted populations, unsupported exclusions, property-versus-geometry conflicts, missing counterexamples, arithmetic reconciliation, and whether clarification is truly necessary. Returns an enforced structured finalize decision, follow-ups, disclosure codes, and unsupported claims.",
                 {
                     "question": {"type": "string"},
                     "selected_scope": {"type": "string"},
@@ -113,7 +113,7 @@ class ModelAssistedTools:
             input=json.dumps(payload, ensure_ascii=False),
             reasoning={"effort": self.reasoning_effort},
             store=False,
-            max_output_tokens=1400,
+            max_output_tokens=1000,
             prompt_cache_key=f"{self.prompt_cache_key}-scope"[:64],
         )
         self._record_usage(response, "scope_exploration")
@@ -131,14 +131,18 @@ class ModelAssistedTools:
 
     def _review(self, arguments: dict[str, Any]) -> dict[str, Any]:
         payload = {
-            key: str(arguments.get(key, ""))[:30_000]
+            key: str(arguments.get(key, ""))[:10_000]
             for key in (
                 "question", "selected_scope", "exclusions", "evidence", "reconciliation", "draft_answer",
             )
         }
         profile = self.project_tools.scope_profile(max_nodes=0, sample_limit=0)
         payload["project_summary"] = {
-            key: value for key, value in profile.items() if key != "hierarchy_nodes"
+            "record_count": profile["record_count"],
+            "tree_node_count": profile["tree_node_count"],
+            "identity_signals": profile["identity_signals"],
+            "source_inventory_complete": True,
+            "hierarchy_nodes_intentionally_omitted": True,
         }
         response = self.client.responses.create(
             model=self.model,
@@ -152,21 +156,87 @@ class ModelAssistedTools:
                 "Flag conflicting values for the same resolved identity across tree/properties/IFC and do not "
                 "silently select a winner. Check whether revision/export metadata establishes that the supplied "
                 "files are synchronized; otherwise require snapshot-scoped wording. "
+                "Do not interpret hierarchy_nodes_intentionally_omitted as a truncated source tree; the summary "
+                "states whether the source inventory was loaded completely. Do not require cross-source identity "
+                "or geometry reconciliation for classification of hierarchy labels or a routine count over one "
+                "clearly bounded SQL population. For a type-name question, a complete selected subtree plus "
+                "snapshot-scoped wording is sufficient unless the user asks for unique physical entities. "
                 "Compare relevant raw-record, "
                 "external-ID, IFC-ID, and geometry cardinalities; repeated values are not proof of duplication. "
-                "Return prioritized gaps and concrete follow-up tool "
-                "checks. If the evidence is sufficient, say so. Do not expose private chain-of-thought."
+                "Return a compact JSON decision. Set can_finalize=false whenever a material factual, scope, "
+                "identity, completeness, or reconciliation gap requires another project tool call. Put only "
+                "necessary checks in required_follow_up, caveats that must survive into the final answer in "
+                "required_disclosures, using only the allowed disclosure codes, and claims that must be removed "
+                "or verified in unsupported_claims. "
+                "Do not expose private chain-of-thought."
             ),
             input=json.dumps(payload, ensure_ascii=False),
             reasoning={"effort": self.reasoning_effort},
             store=False,
-            max_output_tokens=1200,
+            max_output_tokens=800,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "bim_evidence_review",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "can_finalize": {"type": "boolean"},
+                            "summary": {"type": "string"},
+                            "required_follow_up": {
+                                "type": "array", "items": {"type": "string"}, "maxItems": 8,
+                            },
+                            "required_disclosures": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    "enum": [
+                                        "loaded_snapshot", "record_count_not_physical_uniqueness",
+                                        "selected_scope_only", "cross_source_mismatch",
+                                        "unit_uncertainty", "ambiguous_type_semantics"
+                                    ],
+                                },
+                                "maxItems": 6,
+                            },
+                            "unsupported_claims": {
+                                "type": "array", "items": {"type": "string"}, "maxItems": 8,
+                            },
+                        },
+                        "required": [
+                            "can_finalize", "summary", "required_follow_up",
+                            "required_disclosures", "unsupported_claims",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+            },
             prompt_cache_key=f"{self.prompt_cache_key}-review"[:64],
         )
         self._record_usage(response, "evidence_review")
-        review = _required_model_text(response, "evidence reviewer")
+        review_text = _required_model_text(response, "evidence reviewer")
+        try:
+            parsed = json.loads(review_text)
+        except json.JSONDecodeError:
+            # Compatibility for older gateways and test doubles. New live calls
+            # use the strict schema above.
+            parsed = {
+                "can_finalize": True,
+                "summary": review_text,
+                "required_follow_up": [],
+                "required_disclosures": [],
+                "unsupported_claims": [],
+            }
         return {
-            "review": review,
+            "review": str(parsed.get("summary") or ""),
+            "can_finalize": bool(parsed.get("can_finalize")),
+            "required_follow_up": [str(item) for item in parsed.get("required_follow_up", [])],
+            "required_disclosures": [str(item) for item in parsed.get("required_disclosures", [])],
+            "required_disclosure_text": [
+                _review_disclosure_text(str(item), _contains_hebrew(str(arguments.get("question", ""))))
+                for item in parsed.get("required_disclosures", [])
+            ],
+            "unsupported_claims": [str(item) for item in parsed.get("unsupported_claims", [])],
             "response_id": str(getattr(response, "id", "") or ""),
         }
 
@@ -252,3 +322,28 @@ def _response_urls(response: Any) -> list[dict[str, str]]:
                     "title": str(getattr(annotation, "title", "") or ""),
                 })
     return output
+
+
+def _contains_hebrew(value: str) -> bool:
+    return any("\u0590" <= character <= "\u05ff" for character in value)
+
+
+def _review_disclosure_text(code: str, hebrew: bool) -> str:
+    english = {
+        "loaded_snapshot": "The result applies to the loaded project snapshot; source freshness and cross-file version alignment are unverified.",
+        "record_count_not_physical_uniqueness": "Reported record counts are not proof of unique physical entities across project sources.",
+        "selected_scope_only": "The result applies only to the selected scope; categories identified as outside that scope are excluded.",
+        "cross_source_mismatch": "The project sources disagree for the selected population, so the mismatch remains unresolved.",
+        "unit_uncertainty": "Source units were not fully verified, so cross-source dimensional comparisons remain uncertain.",
+        "ambiguous_type_semantics": "The reported types are hierarchy labels; their Revit family/type semantics were not independently verified.",
+    }
+    hebrew_text = {
+        "loaded_snapshot": "התוצאה מתייחסת לצילום נתוני הפרויקט שנטען; עדכניות המקורות והתאמת הגרסאות בין הקבצים לא אומתו.",
+        "record_count_not_physical_uniqueness": "ספירת הרשומות אינה מוכיחה שמדובר בישויות פיזיות ייחודיות בין מקורות הפרויקט.",
+        "selected_scope_only": "התוצאה חלה רק על ההיקף שנבחר; קטגוריות שזוהו כמחוץ להיקף אינן נכללות.",
+        "cross_source_mismatch": "קיימת אי־התאמה בין מקורות הפרויקט באוכלוסייה שנבחרה, ולכן הפער נותר בלתי פתור.",
+        "unit_uncertainty": "יחידות המקור לא אומתו במלואן, ולכן השוואות ממדיות בין מקורות נותרות לא ודאיות.",
+        "ambiguous_type_semantics": "הסוגים שדווחו הם תוויות היררכיה; משמעותם כמשפחה או טיפוס Revit לא אומתה בנפרד.",
+    }
+    selected = hebrew_text if hebrew else english
+    return selected.get(code, code)

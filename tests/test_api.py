@@ -29,6 +29,9 @@ def test_api_health_and_model_answer(sample_data: Path, monkeypatch, fake_client
     assert health.json()["model_directed"] is True
     response = http.post("/api/ask", json={"question": "How many pipes?"})
     assert response.status_code == 200
-    assert response.json()["answer"] == "There are 2 pipes. [ref: call-1] [ref: call-2]"
+    assert response.json()["answer"].startswith(
+        "There are 2 pipes. [ref: call-1] [ref: call-2]"
+    )
+    assert "cross-file version alignment are unverified" in response.json()["answer"]
     assert "cost" in response.json()
     assert response.json()["agent_loop"]["finished"] is True

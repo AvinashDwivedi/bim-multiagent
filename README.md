@@ -40,9 +40,9 @@ The application exposes generic read-only project capabilities plus model-backed
 - `review_scope_and_evidence`: a model-backed critic that challenges omissions, duplicates, identities, conflicting
   evidence, exclusions, and unreconciled totals without consulting expected answers.
 - `research_standards`: model-directed web research for external codes and standards, kept separate from project facts.
-- `code_interpreter`: model-written Python in an isolated hosted container with networking disabled. The container
-  receives the three raw project files plus `bim_workspace.sqlite`, including normalized hierarchy, IFC identity,
-  relationships, and a full-product geometry inventory for dataframe, graph, ranking, and reconciliation work.
+- `run_local_python`: model-written Python in an on-device Docker sandbox. Networking is disabled, project inputs
+  and the normalized workspace are mounted read-only, the container root filesystem is read-only, and only an
+  ephemeral `/tmp` is writable. No OpenAI Containers or Files API is used.
 
 On GPT-5.6 models, Programmatic Tool Calling is also enabled. The model may write a short hosted JavaScript program
 to coordinate predictable project-tool calls for filtering, joining, deduplication, aggregation, and evidence
@@ -88,22 +88,33 @@ BIM_TRACE_DIR=logs/traces
 BIM_MAX_AGENT_ITERATIONS=40
 BIM_MAX_TOOL_OUTPUT_CHARS=80000
 BIM_MAX_ANSWER_COST_USD=0
-BIM_ENABLE_HOSTED_PYTHON=false
+BIM_ENABLE_LOCAL_PYTHON=true
+BIM_LOCAL_PYTHON_IMAGE=python:3.12-slim
 BIM_PYTHON_MEMORY_LIMIT=4g
-BIM_PYTHON_EXPIRY_MINUTES=20
+BIM_LOCAL_PYTHON_CPUS=1.0
+BIM_LOCAL_PYTHON_TIMEOUT_SECONDS=120
+BIM_LOCAL_PYTHON_OUTPUT_CHARS=40000
 BIM_OPENAI_MAX_RETRIES=4
 BIM_OPENAI_TIMEOUT_SECONDS=180
 BIM_MODEL_PRICING_JSON=
 ```
 
-Hosted Python is opt-in because it uploads the selected project's three source files and a generated analysis snapshot to an OpenAI
-Code Interpreter container. The container has outbound networking disabled, a configured memory cap, and expires
-after inactivity. Uploaded project inputs are isolated snapshots with no mount or write-back route to the source
-directory, and the Responses request has a configured execution timeout. Set `BIM_ENABLE_HOSTED_PYTHON=true` only when project policy permits this upload; the local
-read-only SQL and IFC geometry tools remain available when it is disabled.
-Each individual upload is kept below 49 MB. Larger raw or generated artifacts are transported losslessly as gzip;
-if a gzip stream is still too large, it is split into ordered parts. `upload_manifest.json` records hashes, original
-names, and deterministic reconstruction instructions for Code Interpreter.
+Python analysis runs only on the device through Docker. Install Docker Desktop (or another compatible local Docker
+engine), start it, and install the configured image once:
+
+```powershell
+docker pull python:3.12-slim
+```
+
+The application never pulls an image automatically and never sends the raw BIM files through OpenAI's Containers
+or Files APIs. At execution time it mounts the selected project at `/project` and the generated SQLite workspace at
+`/workspace`, both read-only. The container uses `--network none`, a read-only root filesystem, dropped Linux
+capabilities, `no-new-privileges`, a non-root user, CPU/memory/PID caps, an execution timeout, bounded output, and an
+ephemeral `/tmp`. Configure a preinstalled custom image with `BIM_LOCAL_PYTHON_IMAGE` if analyses require packages
+beyond the Python standard library.
+
+The question and compact tool observations still go to the configured OpenAI model because this is a Responses API
+agent. Raw BIM source files remain on the device and are never uploaded by the Python integration.
 
 The workspace is built lazily for the selected project. The agent asks for its schema and writes its own SQL for
 the current question; there are no question-specific queries, expected answers, or semantic mappings. Only one
@@ -144,15 +155,16 @@ Every report also includes `cost`, which totals token usage across all Responses
 including nested scope exploration, evidence review, and standards research. It reports USD list-price estimates,
 cached/uncached input tokens, output tokens, per-request breakdowns, pricing date/source, and whether the estimate is
 complete. GPT-5.4 and GPT-5.6 Sol defaults follow their official model pages. Unknown/private model prices can be
-supplied with `BIM_MODEL_PRICING_JSON`; tool-specific fees such as web search or Code Interpreter are listed as
-excluded rather than silently reported as zero.
+supplied with `BIM_MODEL_PRICING_JSON`; tool-specific fees such as web search are listed as excluded rather than
+silently reported as zero. Local Docker execution has no OpenAI tool fee.
 `BIM_MAX_ANSWER_COST_USD` is an opt-in guard. It defaults to `0` (disabled) while real question-cost distributions
 are collected; set a positive amount only after choosing a threshold from observed workloads. When enabled, it stops
 further model/tool turns once the running list-price estimate reaches the configured amount. The completed request may
 exceed the threshold slightly because usage is available only after that request returns. Stable prompt-cache keys and
 compact model-facing observations reduce repeated input.
 Retryable upstream failures are returned as HTTP 503 with a structured `retryable` flag. The health response
-reports the loaded hosted-Python configuration; containers are still created lazily on a question that needs one.
+reports whether the local Docker runtime and configured image are ready. A local container is created only if the
+model calls `run_local_python`, and it is removed immediately after the call.
 
 ## Tests
 

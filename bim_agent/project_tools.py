@@ -973,7 +973,7 @@ class RawProjectTools:
         }
 
     def export_python_workspace(self, directory: Path) -> list[Path]:
-        """Stage raw sources plus a query-friendly snapshot for hosted Python."""
+        """Build a query-friendly snapshot for the on-device Python sandbox."""
         directory.mkdir(parents=True, exist_ok=True)
         database_path = directory / "bim_workspace.sqlite"
         guide_path = directory / "bim_workspace_guide.json"
@@ -1045,8 +1045,13 @@ class RawProjectTools:
         if not guide_path.is_file():
             description = self._describe_workspace(self._workspace_database())
             guide_path.write_text(json.dumps({
-                "purpose": "Read-only source bundle for model-authored Python BIM analysis.",
+                "purpose": "Read-only local bundle for model-authored Python BIM analysis.",
                 "raw_source_files": [path.name for path in (self.files.tree, self.files.properties, self.files.ifc)],
+                "local_container_paths": {
+                    "raw_sources": "/project",
+                    "normalized_workspace": "/workspace",
+                    "temporary_writes": "/tmp",
+                },
                 "sqlite_file": database_path.name,
                 "sqlite_tables": [item["name"] for item in description["tables"]] + ["ifc_geometry"],
                 "ifc_geometry_units": {"length": "m", "area": "m2", "volume": "m3"},
@@ -1055,8 +1060,9 @@ class RawProjectTools:
                     "Treat record_object_id, external_id, IFC STEP id, and GlobalId as different identity signals.",
                     "Do not infer duplicates merely because records share a type GUID or another repeated property.",
                     "Reconcile totals against raw populations and preserve counterexamples.",
-                    "Use parameterized sqlite3 queries and print compact JSON evidence for the parent agent.",
-                    "The container has no outbound network access and cannot access the application host filesystem.",
+                    "Open /workspace/bim_workspace.sqlite with sqlite3 URI mode=ro and print compact JSON evidence.",
+                    "The local container has no outbound network access; project and workspace mounts are read-only.",
+                    "Only /tmp is writable and it is removed with the container after execution.",
                 ],
             }, ensure_ascii=False, indent=2), encoding="utf-8")
 

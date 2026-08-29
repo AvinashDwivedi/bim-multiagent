@@ -30,7 +30,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
                 "status": "ok",
                 "raw_records": len(agent.tools.records),
                 "model_directed": True,
-                "hosted_python": agent.agent.python_workspace.status(),
+                "local_python": agent.agent.python_sandbox.status(),
             }
         except (ProjectError, RuntimeError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc

@@ -43,14 +43,16 @@ def test_model_pricing_can_be_overridden_from_environment(
         Settings.from_env(data_dir=sample_data)
 
 
-def test_cost_guard_and_container_expiry_are_loaded_safely(
+def test_cost_guard_and_local_python_limits_are_loaded_safely(
     sample_data: Path, tmp_path: Path, monkeypatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("BIM_MAX_ANSWER_COST_USD", "0.42")
-    monkeypatch.setenv("BIM_PYTHON_EXPIRY_MINUTES", "120")
+    monkeypatch.setenv("BIM_LOCAL_PYTHON_TIMEOUT_SECONDS", "75")
+    monkeypatch.setenv("BIM_LOCAL_PYTHON_CPUS", "1.5")
 
     settings = Settings.from_env(data_dir=sample_data)
 
     assert settings.max_answer_cost_usd == 0.42
-    assert settings.python_expiry_minutes == 20
+    assert settings.local_python_timeout_seconds == 75
+    assert settings.local_python_cpus == 1.5

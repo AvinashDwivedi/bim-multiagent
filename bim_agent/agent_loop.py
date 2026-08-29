@@ -7,8 +7,8 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .hosted_python import HostedPythonWorkspace
-from .model_tools import ModelAssistedTools, UNVERIFIED_STANDARDS_DISCLAIMER
+from .local_python import LocalPythonSandbox
+from .model_tools import ModelAssistedTools, UNVERIFIED_STANDARDS_DISCLAIMER, _review_disclosure_text
 from .models import AnswerReport
 from .project_tools import RawProjectTools
 from .pricing import estimate_run_cost, response_usage_record
@@ -30,12 +30,16 @@ aggregates, use the read-only SQL workspace; use calculate only for arithmetic o
 Distinguish hierarchy/definition records from
 physical instances using the evidence you inspect; do not assume a category boundary without looking at paths
 and properties. Treat the three supplied files as the available project scope and disclose material uncertainty.
+Scope explorers and evidence reviewers are model-assisted advice, not project observations: cite a direct project
+tool as well for every category, exclusion, count, or other project fact, in every language.
 Do not assume the files are current or mutually synchronized. When revision/export metadata is unavailable, scope
 the answer to the loaded snapshot. If JSON properties and IFC data disagree for the same resolved identity and
 concept, report both source-labelled values and treat the conflict as unresolved unless units or provenance explain it.
 
 For bounded, tool-heavy analysis, call describe_bim_workspace once and then author compact queries with
-query_bim_workspace. Use named IFC tables and identity candidates before raw IFC text. Never assume a fixed tree
+query_bim_workspace. Return grouped counts and totals in the same compact SQL observation whenever the answer will
+state both; every cited total must occur literally in its cited observation. Do not retrieve individual leaves when
+an aggregate plus a few representative IDs will answer the question. Use named IFC tables and identity candidates before raw IFC text. Never assume a fixed tree
 depth identifies instances, and never treat a repeated GUID or property value as proof that physical records are
 duplicates. When a concept or category boundary is ambiguous, use explore_object_scope and then
 choose among its alternatives yourself. Use analyze_ifc_geometry whenever placement, actual dimensions, area,
@@ -43,11 +47,11 @@ volume, or spatial containment matters; compare geometry-derived and property-de
 for largest/smallest/longest comparisons across a population. Preserve every material dimension axis: do not merge
 objects that share width but differ in height, depth, material, type, or unit unless you explicitly disclose that
 aggregation. Keep property length, bounding-box X/Y/Z, maximum extent, bounding-box volume, and solid volume distinct.
-When available, use the sandboxed code_interpreter for multi-stage dataframe work, graph traversal, all-model geometry ranking,
-statistical checks, or reconciliations that are cumbersome in one SQL query. Read bim_workspace_guide.json first;
-also read upload_manifest.json and reconstruct any gzip or multipart-gzip artifacts before opening them.
-the container contains the three raw source files and bim_workspace.sqlite, including the full ifc_geometry table.
-Print compact evidence, row counts, excluded populations, and reconciliation totals. Its network is disabled.
+When available, use run_local_python for multi-stage Python, graph traversal, all-model geometry ranking,
+statistical checks, or reconciliations that are cumbersome in one SQL query. It runs in a local Docker sandbox,
+not in an OpenAI container. Read /workspace/bim_workspace_guide.json first. Raw project files are read-only under
+/project and bim_workspace.sqlite is read-only under /workspace. Use sqlite3 URI mode=ro, write temporary data only
+under /tmp, and print compact evidence, row counts, excluded populations, and reconciliation totals. Networking is disabled.
 For exhaustive, ranking, cross-source, or compliance conclusions, use reconcile_populations (or an equivalent
 explicit Python reconciliation) to reconcile the selected population and compare the relevant raw-record,
 external-ID, IFC-ID, and geometry identities. A routine count over a clear SQL-defined population does not require
@@ -92,9 +96,12 @@ class ModelDirectedBimAgent:
         max_iterations: int,
         max_tool_output_chars: int,
         max_answer_cost_usd: float = 0.0,
-        enable_hosted_python: bool,
+        enable_local_python: bool,
+        local_python_image: str,
         python_memory_limit: str,
-        python_expiry_minutes: int,
+        local_python_cpus: float,
+        local_python_timeout_seconds: float,
+        local_python_output_chars: int,
         python_cache_root: Path,
         openai_max_retries: int = 4,
         openai_timeout_seconds: float = 180.0,
@@ -130,14 +137,15 @@ class ModelDirectedBimAgent:
             reasoning_effort=reasoning_effort,
             project_tools=tools,
         )
-        self.python_workspace = HostedPythonWorkspace(
-            client=client,
+        self.python_sandbox = LocalPythonSandbox(
             project_tools=tools,
             cache_root=python_cache_root,
-            enabled=enable_hosted_python,
+            enabled=enable_local_python,
+            image=local_python_image,
             memory_limit=python_memory_limit,
-            expiry_minutes=python_expiry_minutes,
-            execution_timeout_seconds=self.openai_timeout_seconds,
+            cpus=local_python_cpus,
+            execution_timeout_seconds=local_python_timeout_seconds,
+            max_output_characters=local_python_output_chars,
         )
         self.programmatic_tool_calling = model.casefold().startswith("gpt-5.6")
         self.prompt_cache_key = _prompt_cache_key("agent", model, tools)
@@ -167,10 +175,17 @@ class ModelDirectedBimAgent:
         cost_budget_exceeded = False
         fetch_more_calls = 0
         unverified_disclaimer_required = False
+        review_seen = False
+        review_can_finalize = True
+        review_stale = False
+        review_required_follow_up: list[str] = []
+        review_required_disclosures: list[str] = []
+        review_unsupported_claims: list[str] = []
+        review_satisfied_disclosures: set[str] = set()
         usage_records: list[dict[str, Any]] = []
         model_tool_usage_index = 0
         self.model_tools.reset_usage()
-        python_status_at_start = self.python_workspace.status()
+        python_status_at_start = self.python_sandbox.status()
         trace.transcript("user", content=question)
         trace.event(
             "model_agent_start",
@@ -179,7 +194,7 @@ class ModelDirectedBimAgent:
             tools=tool_names,
             route=route,
             programmatic_tool_calling=self.programmatic_tool_calling,
-            hosted_python=python_status_at_start,
+            local_python=python_status_at_start,
             max_answer_cost_usd=self.max_answer_cost_usd or None,
             reconciliation_required=reconciliation_required,
         )
@@ -196,7 +211,6 @@ class ModelDirectedBimAgent:
                     reasoning={"effort": self.reasoning_effort},
                     store=False,
                     max_output_tokens=5000,
-                    include=["code_interpreter_call.outputs"],
                     prompt_cache_key=self.prompt_cache_key,
                     timeout=self.openai_timeout_seconds,
                 )
@@ -215,15 +229,11 @@ class ModelDirectedBimAgent:
             output = list(getattr(response, "output", []) or [])
             calls = [item for item in output if getattr(item, "type", None) == "function_call"]
             candidate_answer = str(getattr(response, "output_text", "") or "").strip()
-            python_calls = [
-                _code_interpreter_record(item)
-                for item in output if getattr(item, "type", None) == "code_interpreter_call"
-            ]
+            python_calls: list[dict[str, Any]] = []
             usage_records.append(response_usage_record(
                 response,
                 configured_model=self.model,
                 purpose="agent_turn",
-                excluded_tool_fees=["code_interpreter"] if python_calls else None,
             ))
             if calls and _cost_limit_reached(
                 usage_records,
@@ -248,18 +258,6 @@ class ModelDirectedBimAgent:
                     max_answer_cost_usd=self.max_answer_cost_usd,
                 )
                 break
-            for python_call in python_calls:
-                tool_categories.add("custom_compute")
-                python_call_id = str(python_call.get("call_id", ""))
-                if python_call_id:
-                    evidence[python_call_id] = {
-                        "tool": "code_interpreter",
-                        "output": json.dumps(python_call, ensure_ascii=False, default=str),
-                        "result": python_call,
-                        "evidence_class": "derived_calculation",
-                    }
-                trace.event("python_execution", iteration=iteration, **python_call)
-                trace.transcript("tool", tool="code_interpreter", **python_call)
             trace.transcript(
                 "assistant",
                 response_id=response_id,
@@ -296,11 +294,35 @@ class ModelDirectedBimAgent:
                             "python_calls": python_calls,
                         })
                         break
+                    candidate_answer, review_satisfied_disclosures = _ensure_review_disclosures(
+                        question,
+                        candidate_answer,
+                        evidence,
+                        evidence_aliases=evidence_aliases,
+                        disclosure_codes=review_required_disclosures,
+                    )
+                    candidate_answer = _ensure_snapshot_disclosure(
+                        question,
+                        candidate_answer,
+                        evidence,
+                        evidence_aliases=evidence_aliases,
+                    )
                     completion_issues = _completion_issues(
                         question,
                         tool_categories=tool_categories,
                         outstanding_cursors=outstanding_cursors,
                     )
+                    completion_issues.extend(_review_completion_issues(
+                        candidate_answer,
+                        review_seen=review_seen,
+                        review_can_finalize=review_can_finalize,
+                        review_stale=review_stale,
+                        required_follow_up=review_required_follow_up,
+                        required_disclosures=review_required_disclosures,
+                        satisfied_disclosures=review_satisfied_disclosures,
+                        unsupported_claims=review_unsupported_claims,
+                    ))
+                    completion_issues = list(dict.fromkeys(completion_issues))
                     if completion_issues and not completeness_forced and iteration < self.max_iterations:
                         completeness_forced = True
                         feedback = "You haven't verified " + "; ".join(completion_issues) + ". Continue."
@@ -444,7 +466,7 @@ class ModelDirectedBimAgent:
                         result = self._execute_tool(name, arguments)
                         cache[cache_key] = copy.deepcopy(result)
                     _validate_tool_result(name, result)
-                    model_result = _model_tool_result(result)
+                    model_result = _model_tool_result(name, result)
                     model_result["_citation_reference"] = citation_alias
                     output_text, truncated = _tool_output(model_result, self.max_tool_output_chars)
                     outcome = "ok"
@@ -483,6 +505,22 @@ class ModelDirectedBimAgent:
                         "evidence_class": evidence_class,
                     }
                     evidence_aliases[citation_alias] = call_id
+                    if name == "review_scope_and_evidence" and isinstance(result, dict):
+                        review_seen = True
+                        review_can_finalize = bool(result.get("can_finalize", True))
+                        review_stale = False
+                        review_required_follow_up = [
+                            str(item) for item in result.get("required_follow_up", [])
+                        ]
+                        review_required_disclosures = [
+                            str(item) for item in result.get("required_disclosures", [])
+                        ]
+                        review_satisfied_disclosures = set()
+                        review_unsupported_claims = [
+                            str(item) for item in result.get("unsupported_claims", [])
+                        ]
+                    elif review_seen and _is_project_observation(name):
+                        review_stale = True
                     if (
                         name == "research_standards"
                         and isinstance(result, dict)
@@ -604,18 +642,18 @@ class ModelDirectedBimAgent:
         limitations = [
             "Semantic scope remains model-directed; deterministic completeness, pagination, reconciliation, and citation-grounding guards check termination."
         ]
-        python_status = self.python_workspace.status()
+        python_status = self.python_sandbox.status()
         if python_status["enabled"] and not any(
-            item.get("type") == "code_interpreter" for item in api_tools
+            item.get("name") == "run_local_python" for item in api_tools
         ):
             if route["project_data_operation"]:
                 limitations.append(
-                    "Hosted Python was intentionally not exposed because this project filter/aggregate is routed to read-only SQL."
+                    "Local Python was intentionally not exposed because this project filter/aggregate is routed to read-only SQL."
                 )
             else:
                 limitations.append(
-                    "The optional hosted Python workspace was unavailable for this run: "
-                    + str(python_status.get("last_error") or "the configured client does not expose containers")
+                    "The optional local Docker Python sandbox was unavailable for this run: "
+                    + str(python_status.get("last_error") or "Docker is not ready")
                 )
         if status != "completed":
             final_answer = final_answer or (
@@ -667,6 +705,13 @@ class ModelDirectedBimAgent:
                 "route": route,
                 "completeness_forced": completeness_forced,
                 "grounding_forced": grounding_forced,
+                "review_seen": review_seen,
+                "review_can_finalize": review_can_finalize,
+                "review_stale": review_stale,
+                "review_required_follow_up": review_required_follow_up,
+                "review_required_disclosures": review_required_disclosures,
+                "review_satisfied_disclosures": sorted(review_satisfied_disclosures),
+                "review_unsupported_claims": review_unsupported_claims,
                 "evidence_aliases": evidence_aliases,
                 "cost_budget_usd": self.max_answer_cost_usd or None,
                 "cost_budget_exceeded": cost_budget_exceeded,
@@ -677,6 +722,8 @@ class ModelDirectedBimAgent:
         )
 
     def _execute_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if name == "run_local_python":
+            return self.python_sandbox.execute(arguments)
         if name in {item["name"] for item in self.model_tools.definitions()}:
             return self.model_tools.execute(name, arguments)
         return self.tools.execute(name, arguments)
@@ -696,20 +743,22 @@ class ModelDirectedBimAgent:
                     item for item in project_definitions if item.get("name") != "calculate"
                 ]
             else:
-                python_definition = self.python_workspace.tool_definition()
+                python_definition = self.python_sandbox.tool_definition()
         else:
-            python_definition = self.python_workspace.tool_definition()
-        native_tools = [python_definition] if python_definition is not None else []
+            python_definition = self.python_sandbox.tool_definition()
+        local_tools = [python_definition] if python_definition is not None else []
         if not self.programmatic_tool_calling:
-            return [*project_definitions, *model_definitions, *native_tools]
+            return [*project_definitions, *model_definitions, *local_tools]
         for definition in project_definitions:
             definition["allowed_callers"] = ["direct", "programmatic"]
         for definition in model_definitions:
             definition["allowed_callers"] = ["direct"]
+        for definition in local_tools:
+            definition["allowed_callers"] = ["direct"]
         return [
             *project_definitions,
             *model_definitions,
-            *native_tools,
+            *local_tools,
             {"type": "programmatic_tool_calling"},
         ]
 
@@ -725,7 +774,7 @@ class ModelDirectedBimAgent:
                 for item in api_tools
             ],
             "programmatic_tool_calling": self.programmatic_tool_calling,
-            "hosted_python": self.python_workspace.status(),
+            "local_python": self.python_sandbox.status(),
             "deterministic_semantic_components": [
                 "tool_route_filter", "call_deduplication", "automatic_reconciliation",
                 "completeness_gate", "pagination_gate", "citation_grounding_gate", "cost_budget_gate",
@@ -763,7 +812,7 @@ def _classify_route(question: str) -> dict[str, Any]:
         "project_data_operation": data_operation,
         "general_compute_path": "sql_only" if data_operation else "adaptive",
         "calculate_exposed": not data_operation,
-        "hosted_python_exposed": not data_operation,
+        "local_python_exposed": not data_operation,
         "routing_rules": str(_ROUTING_PATH),
     }
 
@@ -792,6 +841,7 @@ def _tool_category(name: str) -> str:
         "explore_object_scope": "scope",
         "review_scope_and_evidence": "review",
         "research_standards": "standards",
+        "run_local_python": "custom_compute",
     }
     return mapping.get(name, "other")
 
@@ -847,6 +897,39 @@ def _completion_issues(
     return list(dict.fromkeys(issues))
 
 
+def _review_completion_issues(
+    answer: str,
+    *,
+    review_seen: bool,
+    review_can_finalize: bool,
+    review_stale: bool,
+    required_follow_up: list[str],
+    required_disclosures: list[str],
+    satisfied_disclosures: set[str],
+    unsupported_claims: list[str],
+) -> list[str]:
+    if not review_seen:
+        return []
+    issues: list[str] = []
+    if review_stale:
+        issues.append("the new project evidence with a fresh review_scope_and_evidence call")
+    if not review_can_finalize:
+        detail = "; ".join(required_follow_up[:4]) or "the material gaps identified by evidence review"
+        issues.append(f"the evidence review's required follow-up: {detail}")
+    for disclosure_code in required_disclosures:
+        if disclosure_code not in satisfied_disclosures:
+            disclosure = _review_disclosure_text(
+                disclosure_code, bool(re.search(r"[\u0590-\u05FF]", answer))
+            )
+            issues.append(f"the evidence review's required disclosure: {disclosure}")
+    normalized_answer = " ".join(answer.casefold().split())
+    for claim in unsupported_claims:
+        normalized = " ".join(claim.casefold().split())
+        if normalized and normalized in normalized_answer:
+            issues.append(f"removal or verification of the unsupported claim: {claim}")
+    return issues
+
+
 def _grounding_issues(
     question: str,
     answer: str,
@@ -890,7 +973,8 @@ def _grounding_issues(
             continue
         cited = [evidence[ref] for ref in resolved_refs]
         combined_output = "\n".join(str(item.get("output", "")) for item in cited)
-        if _looks_project_claim(question, claim_text) and not any(
+        project_context = any(item.get("evidence_class") == "project" for item in evidence.values())
+        if _looks_project_claim(question, claim_text, project_context=project_context) and not any(
             item.get("evidence_class") == "project" for item in cited
         ):
             issues.append(f"Project claim is backed only by non-project evidence: {claim_text[:180]!r}.")
@@ -913,10 +997,15 @@ def _grounding_issues(
     return issues
 
 
-def _looks_project_claim(question: str, claim: str) -> bool:
+def _looks_project_claim(question: str, claim: str, *, project_context: bool = False) -> bool:
+    standards_claim = bool(re.search(
+        r"\b(standard|code|regulation|requirement|guidance)\b", claim, re.IGNORECASE
+    ))
     return bool(_PROJECT_TERMS.search(claim)) or (
         bool(_PROJECT_TERMS.search(question))
-        and not re.search(r"\b(standard|code|regulation|requirement|guidance)\b", claim, re.IGNORECASE)
+        and not standards_claim
+    ) or (
+        project_context and not standards_claim
     )
 
 
@@ -957,6 +1046,8 @@ def _evidence_class(name: str, result: dict[str, Any] | None) -> str:
         return "external_standard"
     if name == "calculate":
         return "derived_calculation"
+    if name == "run_local_python":
+        return "project"
     if name in {"explore_object_scope", "review_scope_and_evidence"}:
         return "model_review"
     return "project"
@@ -964,7 +1055,7 @@ def _evidence_class(name: str, result: dict[str, Any] | None) -> str:
 
 def _needs_reconciliation(name: str, result: dict[str, Any]) -> bool:
     if name in {
-        "reconcile_populations", "calculate", "describe_bim_workspace",
+        "reconcile_populations", "calculate", "run_local_python", "describe_bim_workspace",
         "explore_object_scope", "review_scope_and_evidence", "research_standards",
     }:
         return False
@@ -1078,8 +1169,13 @@ def _tool_output(result: dict[str, Any], max_chars: int) -> tuple[str, bool]:
     }, ensure_ascii=False), True
 
 
-def _model_tool_result(result: dict[str, Any]) -> dict[str, Any]:
-    """Remove exact compatibility aliases before placing observations in model context."""
+def _model_tool_result(name: str, result: dict[str, Any]) -> dict[str, Any]:
+    """Create a compact evidence-preserving observation for model context.
+
+    The audit trace retains the complete tool result. Repetitive inventories and
+    raw query rows are bounded here so one exploratory call does not inflate every
+    later Responses request.
+    """
     compact = copy.deepcopy(result)
     if "results" in compact:
         for alias in ("records", "children", "matches"):
@@ -1089,7 +1185,158 @@ def _model_tool_result(result: dict[str, Any]) -> dict[str, Any]:
             compact.pop("total_matches", None)
         if compact.get("returned") == compact.get("returned_count"):
             compact.pop("returned", None)
+    if name == "inspect_project":
+        keys = list(compact.get("property_keys", []))
+        compact["property_key_count"] = len(keys)
+        compact["property_keys"] = keys[:40]
+        compact["property_keys_omitted"] = max(0, len(keys) - 40)
+        for source in compact.get("source_files", []):
+            if isinstance(source, dict) and source.get("path"):
+                source["file_name"] = Path(str(source["path"])).name
+                source.pop("path", None)
+    if name == "query_bim_workspace":
+        rows = list(compact.get("rows", []))
+        model_row_limit = 30
+        if len(rows) > model_row_limit:
+            compact["rows"] = rows[:model_row_limit]
+            compact["model_rows_omitted"] = len(rows) - model_row_limit
+            compact["model_instruction"] = (
+                "The full result is retained in the audit trace, but omitted rows are not model evidence. "
+                "Issue a compact aggregate or narrower representative query before citing omitted facts."
+            )
+    if _is_project_observation(name):
+        compact["_snapshot_scope"] = {
+            "basis": "loaded local project files",
+            "freshness": "unverified",
+            "cross_file_version_alignment": "unverified",
+            "required_disclosure_en": (
+                "Scope: results apply to the loaded project snapshot; source freshness and cross-file "
+                "version alignment are unverified."
+            ),
+            "required_disclosure_he": (
+                "היקף: הממצאים מתייחסים לצילום נתוני הפרויקט שנטען; עדכניות המקורות והתאמת "
+                "הגרסאות בין הקבצים לא אומתו."
+            ),
+        }
     return compact
+
+
+def _is_project_observation(name: str) -> bool:
+    return name in {
+        "inspect_project", "list_tree_children", "search_records", "get_records", "fetch_more",
+        "aggregate_records", "search_ifc", "query_bim_workspace", "analyze_ifc_geometry",
+        "rank_ifc_geometry", "analyze_ifc_graph", "reconcile_populations", "run_local_python",
+    }
+
+
+def _ensure_snapshot_disclosure(
+    question: str,
+    answer: str,
+    evidence: dict[str, dict[str, Any]],
+    *,
+    evidence_aliases: dict[str, str],
+) -> str:
+    alias_by_id = {call_id: alias for alias, call_id in evidence_aliases.items()}
+    reference = ""
+    for call_id, observation in evidence.items():
+        if observation.get("evidence_class") == "project":
+            reference = alias_by_id.get(call_id, call_id)
+            break
+    if not reference:
+        return answer
+    if "cross-file version alignment" in answer or "התאמת הגרסאות בין הקבצים" in answer:
+        return answer
+    if re.search(r"[\u0590-\u05FF]", question):
+        disclosure = (
+            "היקף: הממצאים מתייחסים לצילום נתוני הפרויקט שנטען; עדכניות המקורות והתאמת "
+            "הגרסאות בין הקבצים לא אומתו."
+        )
+    else:
+        disclosure = (
+            "Scope: results apply to the loaded project snapshot; source freshness and cross-file "
+            "version alignment are unverified."
+        )
+    return f"{answer.rstrip()}\n\n{disclosure} [ref: {reference}]"
+
+
+def _ensure_review_disclosures(
+    question: str,
+    answer: str,
+    evidence: dict[str, dict[str, Any]],
+    *,
+    evidence_aliases: dict[str, str],
+    disclosure_codes: list[str],
+) -> tuple[str, set[str]]:
+    if not disclosure_codes:
+        return answer, set()
+    alias_by_id = {call_id: alias for alias, call_id in evidence_aliases.items()}
+    project_reference = ""
+    review_reference = ""
+    for call_id, observation in evidence.items():
+        if observation.get("evidence_class") == "project" and not project_reference:
+            project_reference = alias_by_id.get(call_id, call_id)
+        if observation.get("tool") == "review_scope_and_evidence":
+            review_reference = alias_by_id.get(call_id, call_id)
+    if not project_reference or not review_reference:
+        return answer, set()
+    hebrew = bool(re.search(r"[\u0590-\u05FF]", question))
+    output = answer.rstrip()
+    satisfied: set[str] = set()
+    for code in disclosure_codes:
+        disclosure = _review_disclosure_text(code, hebrew)
+        if _disclosure_present(code, output):
+            satisfied.add(code)
+            continue
+        output += (
+            f"\n\n{disclosure} [ref: {project_reference}] [ref: {review_reference}]"
+        )
+        satisfied.add(code)
+    return output, satisfied
+
+
+def _disclosure_present(code: str, answer: str) -> bool:
+    normalized = " ".join(answer.casefold().split())
+    standardized = {
+        " ".join(_review_disclosure_text(code, False).casefold().split()),
+        " ".join(_review_disclosure_text(code, True).casefold().split()),
+    }
+    if any(text and text in normalized for text in standardized):
+        return True
+    if code == "loaded_snapshot":
+        return (
+            "cross-file version alignment" in normalized
+            or ("loaded" in normalized and "snapshot" in normalized and "freshness" in normalized)
+            or ("צילום" in normalized and "גרס" in normalized)
+        )
+    if code == "record_count_not_physical_uniqueness":
+        return (
+            "physical" in normalized and any(
+                phrase in normalized for phrase in ("not proof", "does not prove", "not necessarily prove")
+            )
+        ) or (
+            "פיזי" in normalized and "מוכיח" in normalized
+        )
+    if code == "selected_scope_only":
+        return (
+            "scope" in normalized and any(
+                phrase in normalized for phrase in ("only", "outside", "exclude")
+            )
+        ) or (
+            "בלבד" in normalized and any(phrase in normalized for phrase in ("אינה כוללת", "לא כולל"))
+        )
+    if code == "cross_source_mismatch":
+        return (
+            "source" in normalized and "mismatch" in normalized and "unresolved" in normalized
+        ) or ("מקור" in normalized and "פער" in normalized and "פתור" in normalized)
+    if code == "unit_uncertainty":
+        return (
+            "unit" in normalized and "uncertain" in normalized
+        ) or ("יחיד" in normalized and "ודא" in normalized)
+    if code == "ambiguous_type_semantics":
+        return (
+            "hierarchy label" in normalized and ("family" in normalized or "type" in normalized)
+        ) or ("תוויות היררכיה" in normalized and ("משפחה" in normalized or "טיפוס" in normalized))
+    return _review_disclosure_text(code, bool(re.search(r"[\u0590-\u05FF]", answer))).casefold() in normalized
 
 
 def _markdown_table_scaffolding(claim: str) -> bool:
@@ -1157,26 +1404,4 @@ def _caller_payload(caller: Any) -> Any | None:
         return {"type": str(caller_type or "program"), "caller_id": str(caller_id or "")}
     return caller
 
-
-def _code_interpreter_record(item: Any) -> dict[str, Any]:
-    outputs = []
-    for output in list(getattr(item, "outputs", []) or []):
-        output_type = str(getattr(output, "type", "") or "")
-        if output_type == "logs":
-            logs = str(getattr(output, "logs", "") or "")
-            outputs.append({
-                "type": "logs", "characters": len(logs), "preview": logs[:2000], "logs": logs,
-            })
-        elif output_type == "image":
-            outputs.append({"type": "image"})
-        else:
-            outputs.append({"type": output_type or "unknown"})
-    code = str(getattr(item, "code", "") or "")
-    return {
-        "call_id": str(getattr(item, "id", "") or ""),
-        "container_id": str(getattr(item, "container_id", "") or ""),
-        "status": str(getattr(item, "status", "") or ""),
-        "code": code,
-        "code_characters": len(code),
-        "outputs": outputs,
-    }
+# End of module.

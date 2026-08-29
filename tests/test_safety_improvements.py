@@ -5,6 +5,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from bim_agent import BimAgent
+from bim_agent.agent_loop import (
+    _disclosure_present,
+    _ensure_review_disclosures,
+    _grounding_issues,
+    _model_tool_result,
+    _review_completion_issues,
+)
+from bim_agent.model_tools import _review_disclosure_text
 from bim_agent.config import Settings
 from bim_agent.model_tools import UNVERIFIED_STANDARDS_DISCLAIMER
 from bim_agent.project_tools import RawProjectTools
@@ -45,6 +53,100 @@ def test_pageable_tools_return_cursor_and_fetch_more(sample_data: Path) -> None:
     assert {row["object_id"] for row in first["results"]}.isdisjoint(
         row["object_id"] for row in second["results"]
     )
+
+
+def test_model_observations_compact_large_inventories_without_changing_trace_results() -> None:
+    inspection = _model_tool_result("inspect_project", {
+        "source_files": [{"kind": "tree", "path": "C:/private/project/model-tree.json"}],
+        "property_keys": [{"key": f"Key {index}", "record_count": 1} for index in range(100)],
+    })
+    query = _model_tool_result("query_bim_workspace", {
+        "columns": ["object_id"],
+        "rows": [{"object_id": str(index)} for index in range(100)],
+        "returned_rows": 100,
+        "truncated": False,
+    })
+
+    assert len(inspection["property_keys"]) == 40
+    assert inspection["property_keys_omitted"] == 60
+    assert inspection["source_files"][0]["file_name"] == "model-tree.json"
+    assert "path" not in inspection["source_files"][0]
+    assert len(query["rows"]) == 30
+    assert query["model_rows_omitted"] == 70
+    assert query["returned_rows"] == 100
+
+
+def test_semantic_review_disclosures_do_not_get_duplicated() -> None:
+    answer = (
+        "בצילום הפרויקט שנטען התוצאה חלה על Cable Trays בלבד ואינה כוללת אביזרים. "
+        "ספירת הרשומות אינה בהכרח מוכיחה ייחודיות פיזית בין המקורות; "
+        "עדכניות המקורות והתאמת הגרסאות בין הקבצים לא אומתו."
+    )
+
+    assert _disclosure_present("loaded_snapshot", answer)
+    assert _disclosure_present("record_count_not_physical_uniqueness", answer)
+    assert _disclosure_present("selected_scope_only", answer)
+
+
+def test_standard_hebrew_scope_disclosure_satisfies_code_gate_without_duplication() -> None:
+    disclosure = _review_disclosure_text("selected_scope_only", True)
+    answer = f"נמצאו שני סוגים. [ref: call_1]\n\n{disclosure} [ref: call_1] [ref: call_2]"
+    evidence = {
+        "project": {
+            "tool": "query_bim_workspace",
+            "output": '{"rows":[{"type_count":2}]}',
+            "evidence_class": "project",
+        },
+        "review": {
+            "tool": "review_scope_and_evidence",
+            "output": '{"required_disclosures":["selected_scope_only"]}',
+            "evidence_class": "model_review",
+        },
+    }
+
+    updated, satisfied = _ensure_review_disclosures(
+        "אילו סוגים קיימים?",
+        answer,
+        evidence,
+        evidence_aliases={"call_1": "project", "call_2": "review"},
+        disclosure_codes=["selected_scope_only"],
+    )
+    issues = _review_completion_issues(
+        updated,
+        review_seen=True,
+        review_can_finalize=True,
+        review_stale=False,
+        required_follow_up=[],
+        required_disclosures=["selected_scope_only"],
+        satisfied_disclosures=satisfied,
+        unsupported_claims=[],
+    )
+
+    assert updated == answer
+    assert satisfied == {"selected_scope_only"}
+    assert issues == []
+
+
+def test_non_english_project_claim_cannot_rely_only_on_model_review() -> None:
+    issues = _grounding_issues(
+        "אילו סוגי מגשים קיימים?",
+        "קיימים שני סוגי מגשים. [ref: review_1]",
+        {
+            "project_1": {
+                "tool": "query_bim_workspace",
+                "output": '{"rows":[{"type_count":2}]}',
+                "evidence_class": "project",
+            },
+            "review_1": {
+                "tool": "review_scope_and_evidence",
+                "output": '{"review":"קיימים שני סוגי מגשים"}',
+                "evidence_class": "model_review",
+            },
+        },
+        require_disclaimer=False,
+    )
+
+    assert any("non-project evidence" in issue for issue in issues)
 
 
 def test_duplicate_tool_calls_are_executed_once_per_run(
@@ -168,10 +270,7 @@ def test_aggregate_question_hides_redundant_compute_tools(
     assert "query_bim_workspace" in names
     assert "aggregate_records" not in names
     assert "calculate" not in names
-    assert not any(
-        item.get("type") == "code_interpreter"
-        for item in client.responses.requests[0]["tools"]
-    )
+    assert "run_local_python" not in names
 
 
 def test_correctly_grounded_routine_sql_count_passes_without_reconciliation(

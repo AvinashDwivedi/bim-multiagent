@@ -52,9 +52,12 @@ class Settings:
     max_agent_iterations: int = 20
     max_tool_output_chars: int = 80000
     max_answer_cost_usd: float = 0.0
-    enable_hosted_python: bool = False
+    enable_local_python: bool = True
+    local_python_image: str = "python:3.12-slim"
     python_memory_limit: str = "4g"
-    python_expiry_minutes: int = 20
+    local_python_cpus: float = 1.0
+    local_python_timeout_seconds: float = 120.0
+    local_python_output_chars: int = 40_000
     openai_max_retries: int = 4
     openai_timeout_seconds: float = 180.0
     pricing_overrides: dict[str, dict[str, float]] = field(default_factory=dict)
@@ -79,10 +82,15 @@ class Settings:
             max_agent_iterations=max(1, int(os.getenv("BIM_MAX_AGENT_ITERATIONS", "20"))),
             max_tool_output_chars=max(2000, int(os.getenv("BIM_MAX_TOOL_OUTPUT_CHARS", "80000"))),
             max_answer_cost_usd=max(0.0, float(os.getenv("BIM_MAX_ANSWER_COST_USD", "0"))),
-            enable_hosted_python=_env_bool("BIM_ENABLE_HOSTED_PYTHON", False),
+            enable_local_python=_env_bool("BIM_ENABLE_LOCAL_PYTHON", True),
+            local_python_image=os.getenv("BIM_LOCAL_PYTHON_IMAGE", "python:3.12-slim"),
             python_memory_limit=memory_limit,
-            python_expiry_minutes=min(
-                20, max(1, int(os.getenv("BIM_PYTHON_EXPIRY_MINUTES", "20")))
+            local_python_cpus=max(0.1, float(os.getenv("BIM_LOCAL_PYTHON_CPUS", "1.0"))),
+            local_python_timeout_seconds=max(
+                1.0, float(os.getenv("BIM_LOCAL_PYTHON_TIMEOUT_SECONDS", "120"))
+            ),
+            local_python_output_chars=max(
+                1000, int(os.getenv("BIM_LOCAL_PYTHON_OUTPUT_CHARS", "40000"))
             ),
             openai_max_retries=max(0, int(os.getenv("BIM_OPENAI_MAX_RETRIES", "4"))),
             openai_timeout_seconds=max(10.0, float(os.getenv("BIM_OPENAI_TIMEOUT_SECONDS", "180"))),

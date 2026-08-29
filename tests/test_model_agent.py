@@ -31,7 +31,8 @@ def test_model_chooses_tools_and_owns_completion(
     report = BimAgent(sample_data, client=client).ask("What is the total pipe length?")
 
     assert report.status == "completed"
-    assert report.answer == "The total pipe length is 5.5 m. [ref: call-3]"
+    assert report.answer.startswith("The total pipe length is 5.5 m. [ref: call-3]")
+    assert "cross-file version alignment are unverified" in report.answer
     assert report.agent_loop["pattern"] == "model_directed_tool_loop"
     assert [
         call["tool"]
@@ -178,7 +179,16 @@ def test_primary_agent_can_invoke_model_backed_evidence_review(
         tool_response(4, "reconcile_populations", {
             "populations": [{"label": "lighting switches", "object_ids": ["13", "14", "16"]}],
         }),
-        final_response(5, "There are 3 lighting switches. [ref: call-3] [ref: call-4]"),
+        tool_response(5, "review_scope_and_evidence", {
+            "question": "How many switches?",
+            "selected_scope": "Lighting Devices",
+            "exclusions": "Switchboards and door switches",
+            "evidence": "Three leaf records",
+            "reconciliation": "3 unique object IDs = 3 found records",
+            "draft_answer": "3 lighting switches",
+        }),
+        final_response(6, "The selected scope is sufficient."),
+        final_response(7, "There are 3 lighting switches. [ref: call_2] [ref: call_3]"),
     )
     report = BimAgent(settings=settings, client=client).ask("How many switches?")
 
@@ -186,10 +196,121 @@ def test_primary_agent_can_invoke_model_backed_evidence_review(
     assert report.agent_loop["iterations"][0]["calls"][0]["tool"] == "review_scope_and_evidence"
     nested_request = client.responses.requests[1]
     assert "critical BIM evidence-review tool" in nested_request["instructions"]
-    assert "hierarchy_nodes" not in nested_request["input"]
-    assert nested_request["max_output_tokens"] == 1200
+    assert '"hierarchy_nodes":' not in nested_request["input"]
+    assert '"source_inventory_complete": true' in nested_request["input"]
+    assert nested_request["max_output_tokens"] == 800
+    assert nested_request["text"]["format"]["name"] == "bim_evidence_review"
     model_observation = next(
         item["output"] for item in client.responses.requests[2]["input"]
         if isinstance(item, dict) and item.get("type") == "function_call_output"
     )
     assert "Electrical Fixtures" in model_observation
+
+
+def test_structured_review_blocks_finalization_until_follow_up_is_re_reviewed(
+    sample_data: Path, tmp_path: Path, fake_client_factory
+) -> None:
+    settings = Settings(
+        data_dir=sample_data,
+        trace_dir=tmp_path / "traces",
+        model="gpt-5.4",
+        reasoning_effort="medium",
+        max_agent_iterations=8,
+        enable_local_python=False,
+    )
+    review_args = {
+        "question": "How many pipes?",
+        "selected_scope": "Pipes",
+        "exclusions": "Definitions",
+        "evidence": "Two records",
+        "reconciliation": "Routine SQL population",
+        "draft_answer": "2 pipes",
+    }
+    client = fake_client_factory(
+        tool_response(1, "query_bim_workspace", {
+            "sql": "SELECT COUNT(*) AS count FROM records WHERE name LIKE ?",
+            "parameters": ["Pipe [%"], "row_limit": 20,
+        }),
+        tool_response(2, "review_scope_and_evidence", review_args),
+        final_response(3, json.dumps({
+            "can_finalize": False,
+            "summary": "Verify the selected leaves.",
+            "required_follow_up": ["Return the selected object IDs."],
+            "required_disclosures": [],
+            "unsupported_claims": [],
+        })),
+        final_response(4, "There are 2 pipes. [ref: call_1]"),
+        tool_response(5, "query_bim_workspace", {
+            "sql": "SELECT object_id FROM records WHERE name LIKE ? ORDER BY object_id",
+            "parameters": ["Pipe [%"], "row_limit": 20,
+        }),
+        tool_response(6, "review_scope_and_evidence", {
+            **review_args,
+            "evidence": "Two selected records: 43 and 44",
+        }),
+        final_response(7, json.dumps({
+            "can_finalize": True,
+            "summary": "The selected scope is supported.",
+            "required_follow_up": [],
+            "required_disclosures": [],
+            "unsupported_claims": [],
+        })),
+        final_response(8, "There are 2 pipes. [ref: call_1] [ref: call_3]"),
+    )
+
+    report = BimAgent(settings=settings, client=client).ask("How many pipes?")
+
+    assert report.status == "completed"
+    assert report.agent_loop["completeness_forced"] is True
+    assert report.agent_loop["review_can_finalize"] is True
+    assert report.agent_loop["review_stale"] is False
+    assert any(
+        item.get("action") == "completeness_continue"
+        and "required follow-up" in " ".join(item.get("issues", []))
+        for item in report.agent_loop["iterations"]
+    )
+
+
+def test_structured_review_disclosure_codes_are_appended_with_project_and_review_refs(
+    sample_data: Path, tmp_path: Path, fake_client_factory
+) -> None:
+    settings = Settings(
+        data_dir=sample_data,
+        trace_dir=tmp_path / "traces",
+        model="gpt-5.4",
+        reasoning_effort="medium",
+        max_agent_iterations=4,
+        enable_local_python=False,
+    )
+    client = fake_client_factory(
+        tool_response(1, "query_bim_workspace", {
+            "sql": "SELECT COUNT(*) AS count FROM records WHERE name LIKE ?",
+            "parameters": ["Pipe [%"], "row_limit": 20,
+        }),
+        tool_response(2, "review_scope_and_evidence", {
+            "question": "How many pipes?",
+            "selected_scope": "Pipes",
+            "exclusions": "Definitions",
+            "evidence": "Two records",
+            "reconciliation": "Routine SQL population",
+            "draft_answer": "2 pipes",
+        }),
+        final_response(3, json.dumps({
+            "can_finalize": True,
+            "summary": "The count is sufficient with scope caveats.",
+            "required_follow_up": [],
+            "required_disclosures": [
+                "loaded_snapshot", "record_count_not_physical_uniqueness",
+            ],
+            "unsupported_claims": [],
+        })),
+        final_response(4, "There are 2 pipe records. [ref: call_1]"),
+    )
+
+    report = BimAgent(settings=settings, client=client).ask("How many pipes?")
+
+    assert report.status == "completed"
+    assert "source freshness and cross-file version alignment are unverified" in report.answer
+    assert "not proof of unique physical entities" in report.answer
+    assert "[ref: call_1] [ref: call_2]" in report.answer
+    assert report.agent_loop["completeness_forced"] is False
