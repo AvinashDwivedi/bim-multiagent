@@ -56,3 +56,28 @@ def test_cost_guard_and_local_python_limits_are_loaded_safely(
     assert settings.max_answer_cost_usd == 0.42
     assert settings.local_python_timeout_seconds == 75
     assert settings.local_python_cpus == 1.5
+
+
+def test_question_planning_can_be_enabled_and_inherits_the_execution_model(
+    sample_data: Path, tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BIM_ENABLE_QUESTION_PLANNING", "true")
+    monkeypatch.setenv("BIM_MODEL", "schema-capable-model")
+    monkeypatch.delenv("BIM_PLANNING_MODEL", raising=False)
+
+    settings = Settings.from_env(data_dir=sample_data)
+
+    assert settings.enable_question_planning is True
+    assert settings.planning_model == "schema-capable-model"
+
+
+def test_reasoning_effort_defaults_to_high(
+    sample_data: Path, tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("BIM_REASONING_EFFORT", raising=False)
+
+    settings = Settings.from_env(data_dir=sample_data)
+
+    assert settings.reasoning_effort == "high"

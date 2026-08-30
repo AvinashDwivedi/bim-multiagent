@@ -1,13 +1,16 @@
 # Model-Directed BIM Agent
 
-A single OpenAI Responses API agent for answering questions over Autodesk-style three-file BIM exports.
-The model owns planning, tool selection, iteration, interpretation, checking, and final answer composition.
+A schema-aware OpenAI Responses API agent for answering questions over Autodesk-style three-file BIM exports.
+A structured model preflight binds the requested population, metric, units, relationships, and required evidence
+to the runtime schema. The execution model then owns tool selection, iteration, checking, and answer composition
+within that contract.
 
 ## Architecture
 
 ```text
+plan = schema_aware_preflight(question, runtime_schema)
 while not finished:
-    response = model(question, observations, tools)
+    response = model(question, plan, observations, permitted_tools)
     if response calls tools:
         observations += execute_or_reuse(tool calls)
         observations += automatic_population_reconciliation
@@ -17,8 +20,9 @@ while not finished:
         return response
 ```
 
-There is no heuristic planner, typed query planner, answer template, supervisor, subagent, fixed stage order,
-or offline answer fallback. Termination is constrained by deterministic completeness and citation-grounding checks.
+There is no project-specific router, answer template, supervisor, subagent, fixed execution stage order, or offline
+answer fallback. Invalid or unresolved planning contracts fail open to safe read-only inspection and clarification;
+termination is constrained by deterministic route, completeness, reconciliation, and citation-grounding checks.
 
 The application exposes generic read-only project capabilities plus model-backed analysis helpers:
 
@@ -48,11 +52,11 @@ On GPT-5.6 models, Programmatic Tool Calling is also enabled. The model may writ
 to coordinate predictable project-tool calls for filtering, joining, deduplication, aggregation, and evidence
 compression. Adaptive scope choices and the final answer remain direct model decisions.
 
-The model decides which tools are relevant, supplies their arguments, observes their output, and changes direction
-when needed. Python additionally enforces per-run call deduplication, automatic population reconciliation,
-one-shot completeness continuation, unresolved-page checks, and claim-level `[ref: call_id]` validation. Numeric
+The preflight derives a focused or safe-superset tool route from the discovered schema. The execution model supplies
+tool arguments, observes results, and changes direction when needed. Python additionally enforces per-run call deduplication, automatic population reconciliation,
+iterative evidence-preserving completeness continuation, unresolved-page checks, and claim-level `[ref: call_id]` validation. Numeric
 citations are accepted only when the cited observation contains the claimed value. Routing rules live in the
-versioned `bim_agent/skills/bim-routing/SKILL.md`; ordinary project filters, joins, and aggregates are routed to SQL.
+versioned `bim_agent/skills/bim-routing/` Markdown contracts; ordinary project filters, joins, and aggregates are routed to SQL.
 The older `aggregate_records` executor remains callable only through the internal Python API for compatibility; it
 is not exposed to model runs.
 
@@ -81,7 +85,10 @@ Copy-Item .env.example .env
 ```dotenv
 OPENAI_API_KEY=
 BIM_MODEL=gpt-5.6-sol
-BIM_REASONING_EFFORT=medium
+BIM_REASONING_EFFORT=high
+BIM_ENABLE_QUESTION_PLANNING=true
+# Optional; defaults to BIM_MODEL.
+BIM_PLANNING_MODEL=
 BIM_DATA_DIR=test-project-data
 BIM_PROJECTS_ROOT=
 BIM_TRACE_DIR=logs/traces

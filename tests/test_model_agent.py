@@ -6,8 +6,22 @@ from types import SimpleNamespace
 
 from bim_agent import BimAgent
 from bim_agent.config import Settings
+from bim_agent.question_planning import QuestionPlan
 
 from conftest import final_response, function_call, tool_response
+
+
+class _StaticPlanner:
+    def __init__(self, plan: QuestionPlan):
+        self.plan_result = plan
+
+    def plan(self, question: str) -> QuestionPlan:
+        return self.plan_result
+
+    def resolve_schema_population(
+        self, question: str, initial_plan: QuestionPlan,
+    ) -> QuestionPlan:
+        return initial_plan
 
 
 def test_model_chooses_tools_and_owns_completion(
@@ -332,3 +346,80 @@ def test_structured_review_disclosure_codes_are_appended_with_project_and_review
     assert "not proof of unique physical entities" in report.answer
     assert "[ref: call_1] [ref: call_2]" in report.answer
     assert report.agent_loop["completeness_forced"] is False
+
+
+def test_runtime_executes_with_planned_tool_scope_and_records_contract(
+    sample_data: Path, tmp_path: Path, fake_client_factory,
+) -> None:
+    plan = QuestionPlan(
+        route={
+            "answer_shape": "narrative",
+            "required_capabilities": ["hierarchy"],
+            "required_sources": ["tree"],
+            "preferred_compute": "none",
+            "confidence": 0.8,
+            "uncertainties": ["The requested population is ambiguous."],
+            "tool_policy": "safe_superset",
+            "exposed_tool_names": ["inspect_project"],
+            "project_data_operation": True,
+            "requirements_enforced": True,
+        },
+        interpretation_plan={
+            "objective": "Resolve an ambiguous population.",
+            "population": {
+                "description": "Unresolved project population.",
+                "identity_basis": "Unresolved until inspection.",
+                "universe": "not_applicable",
+                "filters": [],
+                "inclusions": [],
+                "exclusions": [],
+            },
+            "metrics": [],
+            "relationship": {
+                "meaning": "",
+                "direction": "not_applicable",
+                "relationship_types": [],
+            },
+            "inclusion_exclusion_rationale": "No scope was silently selected.",
+            "assumptions": [],
+            "ambiguities": [{
+                "term": "requested population",
+                "alternatives": ["candidate one", "candidate two"],
+                "material": True,
+                "resolution_basis": "The runtime schema does not distinguish user intent.",
+            }],
+            "execution_decision": "clarify",
+            "clarification_question": "Which population should I use?",
+        },
+        schema_fingerprint="schema-fingerprint",
+        response_id="plan-response",
+        usage_record={"usage_available": False, "purpose": "question_planning"},
+        contract_valid=True,
+        contract_error=None,
+    )
+    client = fake_client_factory(
+        tool_response(1, "inspect_project", {}),
+        final_response(2, "Which population should I use?"),
+    )
+    settings = Settings(
+        data_dir=sample_data,
+        trace_dir=tmp_path / "traces",
+        model="gpt-5.6-sol",
+        reasoning_effort="low",
+        max_agent_iterations=2,
+        enable_question_planning=True,
+        enable_local_python=False,
+    )
+    agent = BimAgent(settings=settings, client=client)
+    agent.planner = _StaticPlanner(plan)
+
+    report = agent.ask("Inspect the requested project population.")
+
+    assert report.agent_loop["planning"]["contract_valid"] is True
+    assert report.agent_loop["tools_available"] == ["inspect_project", "programmatic_tool_calling"]
+    assert report.agent_loop["termination_reason"] == "clarification_requested"
+    assert any(
+        "Schema-aware preflight contract" in str(item.get("content") or "")
+        for item in client.responses.requests[0]["input"]
+        if isinstance(item, dict)
+    )

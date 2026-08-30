@@ -9,6 +9,12 @@ from typing import Any
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolate_optional_model_preflight(monkeypatch) -> None:
+    """Keep legacy mocked-agent tests single-stage unless they opt into planning."""
+    monkeypatch.setenv("BIM_ENABLE_QUESTION_PLANNING", "false")
+
+
 @pytest.fixture()
 def sample_data(tmp_path: Path) -> Path:
     data_dir = tmp_path / "three-files"

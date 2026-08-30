@@ -1,8 +1,15 @@
+---
+name: bim-routing
+description: Route schema-aware BIM questions to read-only evidence, computation, reconciliation, and verification tools without assuming a fixed project schema.
+---
+
 # BIM Tool Routing Rules
 
-Version: 1.2.1
+Version: 1.3.0
 
 These rules are runtime instructions for the BIM answer agent. They are deliberately kept outside the loop code so routing changes can be reviewed and tested independently.
+
+The runtime also loads the companion contracts in this directory. They define population and metric selection, identity reconciliation, and bounded query/finalization behavior without encoding project-specific vocabulary or expected answers.
 
 ## Evidence and completion
 

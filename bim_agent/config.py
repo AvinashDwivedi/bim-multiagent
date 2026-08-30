@@ -61,6 +61,8 @@ class Settings:
     openai_max_retries: int = 4
     openai_timeout_seconds: float = 180.0
     pricing_overrides: dict[str, dict[str, float]] = field(default_factory=dict)
+    enable_question_planning: bool = False
+    planning_model: str | None = None
 
     @classmethod
     def from_env(
@@ -74,11 +76,12 @@ class Settings:
         if memory_limit not in {"1g", "4g", "16g", "64g"}:
             raise ValueError("BIM_PYTHON_MEMORY_LIMIT must be one of: 1g, 4g, 16g, 64g.")
         pricing_overrides = _pricing_overrides(os.getenv("BIM_MODEL_PRICING_JSON", ""))
+        model = os.getenv("BIM_MODEL", os.getenv("BIM_OPENAI_AGENT_MODEL", "gpt-5.4"))
         return cls(
             data_dir=selected_data.resolve(),
             trace_dir=Path(os.getenv("BIM_TRACE_DIR", "logs/traces")).resolve(),
-            model=os.getenv("BIM_MODEL", os.getenv("BIM_OPENAI_AGENT_MODEL", "gpt-5.4")),
-            reasoning_effort=os.getenv("BIM_REASONING_EFFORT", "medium"),
+            model=model,
+            reasoning_effort=os.getenv("BIM_REASONING_EFFORT", "high"),
             max_agent_iterations=max(1, int(os.getenv("BIM_MAX_AGENT_ITERATIONS", "20"))),
             max_tool_output_chars=max(2000, int(os.getenv("BIM_MAX_TOOL_OUTPUT_CHARS", "80000"))),
             max_answer_cost_usd=max(0.0, float(os.getenv("BIM_MAX_ANSWER_COST_USD", "0"))),
@@ -95,6 +98,8 @@ class Settings:
             openai_max_retries=max(0, int(os.getenv("BIM_OPENAI_MAX_RETRIES", "4"))),
             openai_timeout_seconds=max(10.0, float(os.getenv("BIM_OPENAI_TIMEOUT_SECONDS", "180"))),
             pricing_overrides=pricing_overrides,
+            enable_question_planning=_env_bool("BIM_ENABLE_QUESTION_PLANNING", True),
+            planning_model=os.getenv("BIM_PLANNING_MODEL", "").strip() or model,
         )
 
 

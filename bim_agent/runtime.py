@@ -8,6 +8,7 @@ from .agent_loop import ModelDirectedBimAgent
 from .config import Settings
 from .models import AnswerReport
 from .project_tools import RawProjectTools
+from .question_planning import QuestionPlan, QuestionPlanner
 from .tracing import TraceLog
 
 
@@ -42,11 +43,36 @@ class BimAgent:
             pricing_overrides=self.settings.pricing_overrides,
             client=client,
         )
+        self.planner = (
+            QuestionPlanner(
+                client=self.agent.client,
+                model=self.settings.planning_model or self.settings.model,
+                reasoning_effort=self.settings.reasoning_effort,
+                project_tools=self.tools,
+            )
+            if self.settings.enable_question_planning
+            else None
+        )
 
     def ask(self, question: str) -> AnswerReport:
         if not question or not question.strip():
             raise ValueError("Question cannot be empty.")
-        return self.agent.run(question, TraceLog(self.settings.trace_dir, question))
+        trace = TraceLog(self.settings.trace_dir, question)
+        plan: QuestionPlan | None = None
+        if self.planner is not None:
+            plan = self.planner.plan(question)
+            plan = self.planner.resolve_schema_population(question, plan)
+            trace.event(
+                "question_plan",
+                contract_valid=plan.contract_valid,
+                contract_error=plan.contract_error,
+                schema_fingerprint=plan.schema_fingerprint,
+                route=plan.route,
+                interpretation_plan=plan.interpretation_plan,
+                normalization_warnings=list(plan.normalization_warnings),
+                schema_resolution=plan.schema_resolution_observation,
+            )
+        return self.agent.run(question, trace, question_plan=plan)
 
     def inspect(self) -> dict[str, Any]:
         return {
@@ -54,6 +80,10 @@ class BimAgent:
             "raw_record_count": len(self.tools.records),
             "sources": self.tools.manifest(),
             "agentic_flow": self.agent.inspect(),
+            "question_planning": {
+                "enabled": self.planner is not None,
+                "model": self.settings.planning_model or self.settings.model,
+            },
         }
 
 

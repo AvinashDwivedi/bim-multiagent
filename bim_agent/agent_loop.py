@@ -13,10 +13,23 @@ from .models import AnswerReport
 from .project_tools import RawProjectTools
 from .pricing import estimate_run_cost, response_usage_record
 from .tracing import TraceLog
+from .question_planning import QuestionPlan
 
 
-_ROUTING_PATH = Path(__file__).with_name("skills") / "bim-routing" / "SKILL.md"
-ROUTING_INSTRUCTIONS = _ROUTING_PATH.read_text(encoding="utf-8")
+_ROUTING_DIRECTORY = Path(__file__).with_name("skills") / "bim-routing"
+_ROUTING_PATHS = tuple(
+    _ROUTING_DIRECTORY / name
+    for name in (
+        "SKILL.md",
+        "SCOPE_AND_METRIC_CONTRACT.md",
+        "IDENTITY_RECONCILIATION_POLICY.md",
+        "QUERY_AND_STOP_PLAYBOOK.md",
+    )
+)
+_ROUTING_PATH = _ROUTING_PATHS[0]
+ROUTING_INSTRUCTIONS = "\n\n".join(
+    path.read_text(encoding="utf-8") for path in _ROUTING_PATHS
+)
 
 COST_BUDGET_NOTICE = (
     "The answer was stopped because the configured per-answer cost budget was reached before the evidence "
@@ -24,9 +37,10 @@ COST_BUDGET_NOTICE = (
 )
 
 
-AGENT_INSTRUCTIONS = """You are the only BIM analysis agent. There is no fixed planner, executor,
-verifier, answer template, supervisor, or fallback agent. Decide for yourself which tools to call, in which
-order, and when the investigation is finished.
+AGENT_INSTRUCTIONS = """You are the BIM analysis execution agent. A schema-aware preflight contract may be
+provided with the request. Treat its validated population, metric, unit, relationship, ambiguity, and route as
+execution constraints, but never as project evidence. Decide which permitted tools to call, in which order, and
+when the investigation is finished.
 
 Ground every project claim in the supplied read-only tools. Begin by inspecting or searching the project when
 you need project facts. You may revisit tools, change interpretation, inspect counterexamples, retrieve raw
@@ -157,16 +171,55 @@ class ModelDirectedBimAgent:
         self.programmatic_tool_calling = model.casefold().startswith("gpt-5.6")
         self.prompt_cache_key = _prompt_cache_key("agent", model, tools)
 
-    def run(self, question: str, trace: TraceLog) -> AnswerReport:
+    def run(
+        self,
+        question: str,
+        trace: TraceLog,
+        *,
+        question_plan: QuestionPlan | None = None,
+    ) -> AnswerReport:
         input_items: list[Any] = [{"role": "user", "content": question}]
+        if question_plan is not None:
+            planning_payload = question_plan.as_dict()
+            input_items.append({
+                "role": "developer",
+                "content": (
+                    "Schema-aware preflight contract (constraints, not project evidence): "
+                    + json.dumps(planning_payload, ensure_ascii=False, separators=(",", ":"))
+                    + " Execute within this contract. If execution_decision is clarify, perform only bounded "
+                      "read-only inspection that can resolve the stated ambiguity; otherwise ask the supplied "
+                      "clarification question. If execution_decision is report_alternatives, preserve every "
+                      "material alternative in the answer."
+                ),
+            })
+            if question_plan.schema_resolution_observation is not None:
+                input_items.append({
+                    "role": "developer",
+                    "content": (
+                        "Mandatory runtime schema-resolution observation (validated planning constraint, not "
+                        "answer evidence): "
+                        + json.dumps(
+                            question_plan.schema_resolution_observation,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    ),
+                })
         iterations: list[dict[str, Any]] = []
         response_ids: list[str] = []
         final_answer = ""
         status = "limited"
         termination_reason = "iteration_limit"
-        route = _classify_route(question)
-        reconciliation_required = _requires_population_reconciliation(question)
-        api_tools = self._api_tools(question)
+        route = (
+            copy.deepcopy(question_plan.route)
+            if question_plan is not None
+            else _classify_route(question)
+        )
+        reconciliation_required = (
+            "reconciliation" in set(route.get("required_capabilities", []))
+            or _requires_population_reconciliation(question)
+        )
+        api_tools = self._api_tools(question, planned_route=route if question_plan is not None else None)
         tool_names = [_tool_label(item) for item in api_tools]
         exposed_function_names = {
             str(item.get("name")) for item in api_tools if item.get("type") == "function"
@@ -176,8 +229,12 @@ class ModelDirectedBimAgent:
         evidence_aliases: dict[str, str] = {}
         tool_call_ordinal = 0
         tool_categories: set[str] = set()
+        observed_sources: set[str] = set()
         outstanding_cursors: set[str] = set()
         completeness_forced = False
+        completeness_attempts = 0
+        completion_limited = False
+        unresolved_completion_issues: list[str] = []
         grounding_content_forced = False
         grounding_format_forced = False
         cost_budget_exceeded = False
@@ -191,7 +248,11 @@ class ModelDirectedBimAgent:
         review_unsupported_claims: list[str] = []
         disclosure_state: dict[str, dict[str, Any]] = {}
         citation_repairs: list[dict[str, Any]] = []
-        usage_records: list[dict[str, Any]] = []
+        usage_records: list[dict[str, Any]] = (
+            [copy.deepcopy(item) for item in question_plan.all_usage_records]
+            if question_plan is not None
+            else []
+        )
         model_tool_usage_index = 0
         self.model_tools.reset_usage()
         python_status_at_start = self.python_sandbox.status()
@@ -206,6 +267,7 @@ class ModelDirectedBimAgent:
             local_python=python_status_at_start,
             max_answer_cost_usd=self.max_answer_cost_usd or None,
             reconciliation_required=reconciliation_required,
+            planning=question_plan.as_dict() if question_plan is not None else None,
         )
 
         for iteration in range(1, self.max_iterations + 1):
@@ -325,6 +387,9 @@ class ModelDirectedBimAgent:
                         question,
                         tool_categories=tool_categories,
                         outstanding_cursors=outstanding_cursors,
+                        route=route,
+                        observed_sources=observed_sources,
+                        reconciliation_required=reconciliation_required,
                     )
                     completion_issues.extend(_review_completion_issues(
                         candidate_answer,
@@ -337,9 +402,17 @@ class ModelDirectedBimAgent:
                         unsupported_claims=review_unsupported_claims,
                     ))
                     completion_issues = list(dict.fromkeys(completion_issues))
-                    if completion_issues and not completeness_forced and iteration < self.max_iterations:
+                    if completion_issues and iteration < self.max_iterations:
                         completeness_forced = True
-                        feedback = "You haven't verified " + "; ".join(completion_issues) + ". Continue."
+                        completeness_attempts += 1
+                        feedback = (
+                            "Do not finalize yet. Continue from all accumulated observations and resolve only "
+                            "these outstanding verification checks: "
+                            + "; ".join(completion_issues)
+                            + ". Reuse existing evidence and completed reconciliations. Call additional tools "
+                              "only where a listed check still lacks evidence, then return the strongest fully "
+                              "supported answer."
+                        )
                         input_items.extend([
                             {"role": "assistant", "content": candidate_answer},
                             {"role": "user", "content": feedback},
@@ -354,22 +427,18 @@ class ModelDirectedBimAgent:
                         })
                         continue
                     if completion_issues:
-                        final_answer = (
-                            "The answer was withheld because the required project scope, population, or "
-                            "pagination checks were still incomplete after one correction attempt."
-                        )
-                        termination_reason = "completeness_rejected"
+                        completion_limited = True
+                        unresolved_completion_issues = list(completion_issues)
                         trace.transcript(
                             "gate", gate="completeness", accepted=False, issues=completion_issues
                         )
                         iterations.append({
                             "iteration": iteration,
                             "response_id": response_id,
-                            "action": "completeness_rejected",
+                            "action": "completeness_limited",
                             "issues": completion_issues,
                             "python_calls": python_calls,
                         })
-                        break
 
                     trusted_disclosures = {
                         str(item.get("text", ""))
@@ -454,9 +523,15 @@ class ModelDirectedBimAgent:
                         })
                         break
 
-                    final_answer = candidate_answer
-                    status = "completed"
-                    termination_reason = "completed"
+                    final_answer = (
+                        _append_incomplete_checks(candidate_answer, unresolved_completion_issues)
+                        if completion_limited
+                        else candidate_answer
+                    )
+                    status = "limited" if completion_limited else "completed"
+                    termination_reason = (
+                        "completed_with_incomplete_checks" if completion_limited else "completed"
+                    )
                     trace.transcript("gate", gate="grounding", accepted=True)
                     iterations.append({
                         "iteration": iteration,
@@ -547,6 +622,7 @@ class ModelDirectedBimAgent:
                 category = _tool_category(name)
                 if outcome == "ok":
                     tool_categories.add(category)
+                    observed_sources.update(_observed_sources(name, result))
                     if name == "fetch_more":
                         outstanding_cursors.discard(str(arguments.get("cursor", "")))
                     if isinstance(result, dict) and result.get("cursor"):
@@ -709,7 +785,13 @@ class ModelDirectedBimAgent:
                 break
 
         limitations = [
-            "Semantic scope remains model-directed; deterministic completeness, pagination, reconciliation, and citation-grounding guards check termination."
+            (
+                "Semantic scope was constrained by a schema-aware preflight; deterministic completeness, "
+                "pagination, reconciliation, and citation-grounding guards check execution and termination."
+                if question_plan is not None and question_plan.contract_valid
+                else "Semantic scope remains model-directed; deterministic completeness, pagination, "
+                     "reconciliation, and citation-grounding guards check termination."
+            )
         ]
         python_status = self.python_sandbox.status()
         if python_status["enabled"] and not any(
@@ -730,10 +812,10 @@ class ModelDirectedBimAgent:
             )
             if termination_reason == "grounding_rejected":
                 limitations.append("The final draft failed the citation-grounding check after one forced retry.")
-            elif termination_reason == "completeness_rejected":
+            elif termination_reason == "completed_with_incomplete_checks":
                 limitations.append(
-                    "The required scope, population reconciliation, or pagination check remained incomplete "
-                    "after one forced correction."
+                    "The answer preserves grounded findings, but one or more required scope, population, "
+                    "source, reconciliation, or pagination checks remained incomplete at the iteration limit."
                 )
             elif termination_reason == "cost_budget_exceeded":
                 limitations.append(
@@ -786,7 +868,11 @@ class ModelDirectedBimAgent:
                 "trace_session_id": trace.session_id,
                 "tools_available": tool_names,
                 "route": route,
+                "planning": question_plan.as_dict() if question_plan is not None else None,
                 "completeness_forced": completeness_forced,
+                "completeness_attempts": completeness_attempts,
+                "completion_limited": completion_limited,
+                "unresolved_completion_issues": unresolved_completion_issues,
                 "grounding_forced": grounding_content_forced or grounding_format_forced,
                 "grounding_content_forced": grounding_content_forced,
                 "grounding_format_forced": grounding_format_forced,
@@ -945,11 +1031,32 @@ class ModelDirectedBimAgent:
             return self.model_tools.execute(name, arguments)
         return self.tools.execute(name, arguments)
 
-    def _api_tools(self, question: str | None = None) -> list[dict[str, Any]]:
+    def _api_tools(
+        self,
+        question: str | None = None,
+        *,
+        planned_route: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         project_definitions = copy.deepcopy(self.tools.definitions())
         model_definitions = copy.deepcopy(self.model_tools.definitions())
         python_definition: dict[str, Any] | None = None
-        if question is not None:
+        if planned_route is not None:
+            allowed = {
+                str(item) for item in planned_route.get("exposed_tool_names", []) if str(item)
+            }
+            # The deprecated aggregate tool is never restored by a plan; SQL is
+            # the single certifying path for JSON-backed aggregates.
+            allowed.discard("aggregate_records")
+            project_definitions = [
+                item for item in project_definitions
+                if item.get("name") in allowed and item.get("name") != "aggregate_records"
+            ]
+            model_definitions = [
+                item for item in model_definitions if item.get("name") in allowed
+            ]
+            if "run_local_python" in allowed:
+                python_definition = self.python_sandbox.tool_definition()
+        elif question is not None:
             route = _classify_route(question)
             # SQL is the sole general aggregation/filter/join path over project data.
             project_definitions = [
@@ -1093,6 +1200,10 @@ def _completion_issues(
     *,
     tool_categories: set[str],
     outstanding_cursors: set[str],
+    route: dict[str, Any] | None = None,
+    observed_sources: set[str] | None = None,
+    reconciliation_required: bool | None = None,
+    reconciliation_status: str | None = None,
 ) -> list[str]:
     normalized = question.casefold()
     issues: list[str] = []
@@ -1107,9 +1218,14 @@ def _completion_issues(
     if project_question and quantitative and not ({"sql", "geometry"} & substantive):
         issues.append("the requested project aggregate or complete comparison through SQL/geometry evidence")
     complete_population = quantitative or bool(re.search(r"\b(all|every|complete|list|ranking)\b", normalized))
+    requires_reconciliation = (
+        _requires_population_reconciliation(question)
+        if reconciliation_required is None
+        else reconciliation_required
+    )
     if (
         project_question
-        and _requires_population_reconciliation(question)
+        and requires_reconciliation
         and "reconciliation" not in tool_categories
     ):
         issues.append(
@@ -1139,7 +1255,72 @@ def _completion_issues(
         issues.append("the ambiguous category, location, or property boundary with explore_object_scope")
     if project_question and ambiguous_scope and "scope" in tool_categories and "review" not in tool_categories:
         issues.append("the chosen ambiguous scope with review_scope_and_evidence")
+    if route and route.get("requirements_enforced"):
+        capability_categories = {
+            "schema_inspection": {"schema"},
+            "hierarchy": {"hierarchy"},
+            "record_query": {"sql", "records"},
+            "ifc_semantics": {"ifc", "graph"},
+            "geometry": {"geometry"},
+            "graph": {"graph"},
+            "reconciliation": {"reconciliation"},
+            "arithmetic": {"arithmetic"},
+            "local_python": {"custom_compute"},
+            "standards_research": {"standards"},
+        }
+        for capability in route.get("required_capabilities", []):
+            accepted = capability_categories.get(str(capability), set())
+            if accepted and not accepted.intersection(tool_categories):
+                issues.append(f"the planned {capability} capability")
+        source_categories = {
+            "tree": {"tree"},
+            "properties": {"properties"},
+            "ifc_semantics": {"ifc_semantics"},
+            "ifc_geometry": {"ifc_geometry"},
+            "external_standard": {"external_standard"},
+        }
+        seen_sources = observed_sources or set()
+        for source in route.get("required_sources", []):
+            accepted = source_categories.get(str(source), set())
+            if accepted and not accepted.intersection(seen_sources):
+                issues.append(f"the planned {source} evidence source")
+        if (
+            "reconciliation" in route.get("required_capabilities", [])
+            and reconciliation_status in {"mismatched", "incomplete"}
+        ):
+            issues.append("a matched, provenance-valid population reconciliation")
     return list(dict.fromkeys(issues))
+
+
+def _observed_sources(name: str, result: dict[str, Any] | None) -> set[str]:
+    """Map successful observations to source roles without inferring facts."""
+    if name in {"inspect_project", "list_tree_children"}:
+        return {"tree"}
+    if name in {"search_records", "get_records"}:
+        return {"properties"}
+    if name == "query_bim_workspace":
+        serialized = json.dumps(result or {}, ensure_ascii=True).casefold()
+        sources: set[str] = set()
+        if any(term in serialized for term in ("record", "propert", "tree_node")):
+            sources.add("properties")
+        if "tree_node" in serialized:
+            sources.add("tree")
+        if any(term in serialized for term in ("ifc_", "global_id", "ifc_step_id")):
+            sources.add("ifc_semantics")
+        # A SQL observation may intentionally project aliases without table
+        # names. Treat it as properties evidence unless it proves an IFC role.
+        return sources or {"properties"}
+    if name in {"search_ifc", "analyze_ifc_graph"}:
+        return {"ifc_semantics"}
+    if name in {"analyze_ifc_geometry", "rank_ifc_geometry"}:
+        return {"ifc_geometry", "ifc_semantics"}
+    if name == "research_standards":
+        return {"external_standard"}
+    if name == "run_local_python":
+        return {"properties", "ifc_semantics", "ifc_geometry"}
+    if name == "reconcile_populations":
+        return {"tree", "properties", "ifc_semantics"}
+    return set()
 
 
 def _review_completion_issues(
@@ -1737,6 +1918,21 @@ def _is_single_clarifying_question(answer: str) -> bool:
 def _append_budget_notice(answer: str) -> str:
     substantive = answer.replace(COST_BUDGET_NOTICE, "").strip()
     return f"{substantive}\n\n{COST_BUDGET_NOTICE}" if substantive else COST_BUDGET_NOTICE
+
+
+def _append_incomplete_checks(answer: str, issues: list[str]) -> str:
+    """Preserve grounded findings while making unfinished verification explicit."""
+    substantive = answer.strip()
+    unique_issues = [item for item in dict.fromkeys(issues) if str(item).strip()]
+    if not unique_issues:
+        return substantive
+    checklist = "\n".join(f"- {item}" for item in unique_issues)
+    notice = (
+        "Verification still pending because the investigation reached its iteration limit:\n"
+        + checklist
+        + "\nThe result above is retained only to the extent supported by its cited evidence."
+    )
+    return f"{substantive}\n\n{notice}" if substantive else notice
 
 
 def _cost_limit_reached(

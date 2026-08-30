@@ -524,6 +524,45 @@ def test_completeness_gate_forces_project_data_verification(
     assert report.agent_loop["iterations"][0]["action"] == "completeness_continue"
 
 
+def test_completeness_gate_preserves_grounded_answer_after_iterative_retries(
+    sample_data: Path, tmp_path: Path, fake_client_factory,
+) -> None:
+    answer = "There are 2 pipe records. [ref: call-1]"
+    client = fake_client_factory(
+        tool_response(1, "query_bim_workspace", {
+            "sql": "SELECT COUNT(*) AS count FROM records WHERE name LIKE ?",
+            "parameters": ["Pipe [%"], "row_limit": 20,
+        }),
+        final_response(2, answer),
+        final_response(3, answer),
+        final_response(4, answer),
+    )
+    settings = Settings(
+        data_dir=sample_data,
+        trace_dir=tmp_path / "traces",
+        model="gpt-5.4",
+        reasoning_effort="high",
+        max_agent_iterations=4,
+        enable_local_python=False,
+    )
+
+    report = BimAgent(settings=settings, client=client).ask(
+        "How many pipe records are in the entire project?"
+    )
+
+    assert report.status == "limited"
+    assert report.answer.startswith(answer)
+    assert "Verification still pending" in report.answer
+    assert "answer was withheld" not in report.answer.casefold()
+    assert report.agent_loop["completeness_attempts"] == 2
+    assert report.agent_loop["completion_limited"] is True
+    assert report.agent_loop["termination_reason"] == "completed_with_incomplete_checks"
+    assert any(
+        item["action"] == "completeness_limited"
+        for item in report.agent_loop["iterations"]
+    )
+
+
 def test_data_observation_automatically_injects_population_reconciliation(
     sample_data: Path, fake_client_factory,
 ) -> None:
