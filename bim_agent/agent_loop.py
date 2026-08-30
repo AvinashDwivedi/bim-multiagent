@@ -43,6 +43,18 @@ NO_SUPPORTED_PARTIAL_NOTICE = (
     "⚠️ Partial answer: no factual statement from the final draft could be retained as supported by its cited "
     "observations. The collected evidence remains available for a revised answer or rerun."
 )
+HEBREW_COST_BUDGET_NOTICE = (
+    "⚠️ תשובה חלקית: הושגה מגבלת העלות שהוגדרה לתשובה. הממצאים לעיל מוגבלים "
+    "לראיות שכבר נאספו; בדיקות שנותרו פתוחות לא הושלמו."
+)
+HEBREW_EVIDENCE_PARTIAL_NOTICE = (
+    "⚠️ תשובה חלקית: נכללו רק טענות הנתמכות בתצפיות כלים מצוטטות; טענות שלא נתמכו "
+    "או שנותרו ללא הכרעה הושמטו מהטיוטה."
+)
+HEBREW_NO_SUPPORTED_PARTIAL_NOTICE = (
+    "⚠️ תשובה חלקית: לא ניתן היה לשמר אף טענה עובדתית מהטיוטה הסופית כנתמכת בתצפיות "
+    "המצוטטות. הראיות שנאספו נשארו זמינות לתשובה מתוקנת או להרצה חוזרת."
+)
 
 
 AGENT_INSTRUCTIONS = """You are the BIM analysis execution agent. A schema-aware preflight contract may be
@@ -85,6 +97,12 @@ For exhaustive, ranking, cross-source, or compliance conclusions, use reconcile_
 explicit Python reconciliation) to reconcile the selected population and compare the relevant raw-record,
 external-ID, IFC-ID, and geometry identities. A routine count over a clear SQL-defined population does not require
 reconciliation by itself. A mismatch is a reason to investigate, not permission to pick the smallest count.
+Always name the identity namespace precisely. Never write bare phrases such as "missing identifiers" or "unique
+IDs." Population reconciliation reports record object-ID coverage only unless its observation explicitly names
+another namespace; it does not establish whether authored domain or business fields are populated. Missing IFC
+mappings are incomplete cross-source coverage, not a value mismatch. For a resolved count, list, or grouped total,
+stop once compact SQL establishes the requested population, metric, and material exclusions. Do not audit unrelated
+properties, geometry, or identifiers.
 For connectivity questions, inspect named relationship roles and use analyze_ifc_graph when reachability matters.
 Distinguish missing metadata, containment, logical system membership, physical port connectivity, and actual graph
 reachability; raw IFC references alone are not connectivity evidence.
@@ -103,7 +121,7 @@ Answer in the user's language. Give the direct result first, then concise eviden
 private chain-of-thought. Do not author snapshot, scope, uniqueness, source-mismatch, unit, or type-semantics
 disclosure sentences yourself; the runtime appends required disclosures in canonical cited form. Return a normal
 assistant message only when you judge the substantive answer ready. Preserve any material, evidence-backed
-exclusion that changes the meaning of a reported total, such as separately modeled accessories or fittings.
+exclusion that changes the meaning of a reported total, such as separately modeled subordinate components.
 
 The versioned routing and evidence rules below are mandatory:
 """ + ROUTING_INSTRUCTIONS
@@ -234,6 +252,11 @@ class ModelDirectedBimAgent:
         if question_plan is not None:
             route["scope_preflight_resolved"] = _plan_has_resolved_scope(question_plan)
             route["model_review_required"] = _plan_requires_model_review(question_plan)
+            route["direct_sql_population_summary"] = _plan_is_direct_sql_population_summary(
+                question_plan
+            )
+            if route["direct_sql_population_summary"]:
+                route["routine_query_limit"] = 4
         reconciliation_required = (
             "reconciliation" in set(route.get("required_capabilities", []))
             or _requires_population_reconciliation(question)
@@ -267,6 +290,9 @@ class ModelDirectedBimAgent:
         grounding_format_forced = False
         cost_budget_exceeded = False
         fetch_more_calls = 0
+        successful_routine_queries = 0
+        routine_evidence_stop_forced = False
+        routine_reconciliation_only_forced = False
         unverified_disclaimer_required = False
         review_seen = False
         review_can_finalize = True
@@ -546,7 +572,9 @@ class ModelDirectedBimAgent:
                                 )
                                 citation_repairs.extend(current_repairs)
                             else:
-                                final_answer = _append_budget_notice(NO_SUPPORTED_PARTIAL_NOTICE)
+                                final_answer = _append_budget_notice(
+                                    _no_supported_partial_notice(question), question
+                                )
                                 budget_metadata = {
                                     "trigger": "after_grounding_rejection",
                                     "finalization_attempted": False,
@@ -612,7 +640,7 @@ class ModelDirectedBimAgent:
                                     final_answer, unresolved_completion_issues
                                 )
                             if best_grounded_candidate_is_salvaged:
-                                final_answer = _append_partial_notice(final_answer)
+                                final_answer = _append_partial_notice(final_answer, question)
                             termination_reason = "evidence_supported_partial_after_rejected_retry"
                             iterations.append({
                                 "iteration": iteration,
@@ -623,7 +651,7 @@ class ModelDirectedBimAgent:
                                 "python_calls": python_calls,
                             })
                         else:
-                            final_answer = NO_SUPPORTED_PARTIAL_NOTICE
+                            final_answer = _no_supported_partial_notice(question)
                             termination_reason = "no_supported_partial_after_rejected_retry"
                             iterations.append({
                                 "iteration": iteration,
@@ -836,6 +864,13 @@ class ModelDirectedBimAgent:
                         "evidence_class": evidence_class,
                     }
                     evidence_aliases[citation_alias] = call_id
+                    if (
+                        route.get("direct_sql_population_summary")
+                        and name == "query_bim_workspace"
+                        and isinstance(result, dict)
+                        and not result.get("truncated")
+                    ):
+                        successful_routine_queries += 1
                     if name == "reconcile_populations" and isinstance(result, dict):
                         population_mismatch_observed = (
                             population_mismatch_observed or _reconciliation_mismatch(result)
@@ -980,6 +1015,63 @@ class ModelDirectedBimAgent:
                 "calls": call_records,
                 "python_calls": python_calls,
             })
+            routine_query_limit = int(route.get("routine_query_limit") or 0)
+            routine_reconciliation_ready = (
+                not reconciliation_required or "reconciliation" in tool_categories
+            )
+            if (
+                routine_query_limit
+                and successful_routine_queries >= routine_query_limit
+                and not routine_reconciliation_ready
+                and not routine_reconciliation_only_forced
+            ):
+                routine_reconciliation_only_forced = True
+                api_tools = [
+                    item for item in api_tools
+                    if item.get("type") == "function"
+                    and item.get("name") == "reconcile_populations"
+                ]
+                exposed_function_names = {"reconcile_populations"}
+                input_items.append({
+                    "role": "developer",
+                    "content": (
+                        "The SQL evidence budget is complete. The only remaining permitted operation is the "
+                        "required population reconciliation. Reconcile the already selected record object IDs "
+                        "once; do not broaden the requested metric or inspect unrelated identity namespaces."
+                    ),
+                })
+                trace.event(
+                    "routine_reconciliation_only",
+                    iteration=iteration,
+                    successful_sql_observations=successful_routine_queries,
+                    query_limit=routine_query_limit,
+                )
+            if (
+                routine_query_limit
+                and successful_routine_queries >= routine_query_limit
+                and routine_reconciliation_ready
+                and not routine_evidence_stop_forced
+            ):
+                routine_evidence_stop_forced = True
+                api_tools = []
+                exposed_function_names = set()
+                input_items.append({
+                    "role": "developer",
+                    "content": (
+                        "The bounded evidence budget for this resolved population summary is complete. "
+                        "No more tools are available. Answer now from the non-truncated SQL and reconciliation "
+                        "observations already collected. State the exact identity namespace when describing "
+                        "matching or missing identifiers, preserve material exclusions, and omit unrelated "
+                        "quality audits."
+                    ),
+                })
+                trace.event(
+                    "routine_evidence_stop",
+                    iteration=iteration,
+                    successful_sql_observations=successful_routine_queries,
+                    query_limit=routine_query_limit,
+                    reconciliation_ready=routine_reconciliation_ready,
+                )
             if _cost_limit_reached(
                 usage_records,
                 limit_usd=self.max_answer_cost_usd,
@@ -1013,7 +1105,7 @@ class ModelDirectedBimAgent:
                 best_grounded_candidate, unresolved_completion_issues
             )
             if best_grounded_candidate_is_salvaged:
-                final_answer = _append_partial_notice(final_answer)
+                final_answer = _append_partial_notice(final_answer, question)
             termination_reason = "best_grounded_candidate_at_iteration_limit"
 
         limitations = [
@@ -1075,7 +1167,7 @@ class ModelDirectedBimAgent:
             cost_budget_exceeded = True
             termination_reason = "cost_budget_exceeded"
             status = "limited"
-            final_answer = _append_budget_notice(final_answer)
+            final_answer = _append_budget_notice(final_answer, question)
             limitations.append(
                 f"The run reached the configured ${self.max_answer_cost_usd:g} per-answer cost guard."
             )
@@ -1138,6 +1230,9 @@ class ModelDirectedBimAgent:
                 "evidence_aliases": evidence_aliases,
                 "cost_budget_usd": self.max_answer_cost_usd or None,
                 "cost_budget_exceeded": cost_budget_exceeded,
+                "routine_evidence_stop_forced": routine_evidence_stop_forced,
+                "routine_reconciliation_only_forced": routine_reconciliation_only_forced,
+                "successful_routine_queries": successful_routine_queries,
                 "termination_reason": termination_reason,
                 "programmatic_tool_calling": self.programmatic_tool_calling,
                 "iterations": iterations,
@@ -1219,9 +1314,9 @@ class ModelDirectedBimAgent:
                     error_type=type(exc).__name__,
                     message=str(exc),
                 )
-        draft = draft.replace(COST_BUDGET_NOTICE, "").strip()
+        draft = _strip_runtime_notices(draft)
         if not draft:
-            draft = NO_SUPPORTED_PARTIAL_NOTICE
+            draft = _no_supported_partial_notice(question)
         if require_disclaimer and UNVERIFIED_STANDARDS_DISCLAIMER not in draft:
             draft = f"{draft.rstrip()}\n\n{UNVERIFIED_STANDARDS_DISCLAIMER}"
         draft, disclosure_state = _ensure_review_disclosures(
@@ -1264,8 +1359,8 @@ class ModelDirectedBimAgent:
                 draft = supported_partial
                 partial_salvage_used = True
             else:
-                draft = NO_SUPPORTED_PARTIAL_NOTICE
-        final_answer = _append_budget_notice(draft)
+                draft = _no_supported_partial_notice(question)
+        final_answer = _append_budget_notice(draft, question)
         metadata = {
             "trigger": trigger,
             "finalization_attempted": finalization_attempted,
@@ -1312,6 +1407,8 @@ class ModelDirectedBimAgent:
                 allowed.discard("explore_object_scope")
             if not planned_route.get("model_review_required", True):
                 allowed.discard("review_scope_and_evidence")
+            if planned_route.get("direct_sql_population_summary"):
+                allowed.intersection_update({"query_bim_workspace", "reconcile_populations"})
             project_definitions = [
                 item for item in project_definitions
                 if item.get("name") in allowed and item.get("name") != "aggregate_records"
@@ -1491,8 +1588,31 @@ def _plan_requires_model_review(plan: QuestionPlan) -> bool:
     capabilities = {str(item) for item in route.get("required_capabilities", [])}
     if capabilities.intersection({"geometry", "graph", "standards_research"}):
         return True
+    if answer_shape in {"count", "list", "grouped_total"}:
+        return False
     sources = {str(item) for item in route.get("required_sources", [])}
     return len(sources) > 1
+
+
+def _plan_is_direct_sql_population_summary(plan: QuestionPlan) -> bool:
+    """Identify resolved population summaries that need SQL, not open-ended investigation."""
+    if not plan.contract_valid or not _plan_has_resolved_scope(plan):
+        return False
+    answer_shape = str(plan.route.get("answer_shape") or "")
+    if answer_shape not in {"count", "list", "grouped_total"}:
+        return False
+    capabilities = {str(item) for item in plan.route.get("required_capabilities", [])}
+    exposed = {str(item) for item in plan.route.get("exposed_tool_names", [])}
+    has_sql_route = (
+        "query_bim_workspace" in exposed
+        and (
+            "record_query" in capabilities
+            or str(plan.route.get("preferred_compute") or "") == "sql"
+        )
+    )
+    return has_sql_route and not capabilities.intersection(
+        {"geometry", "graph", "standards_research"}
+    )
 
 
 def _completion_issues(
@@ -2295,16 +2415,52 @@ def _is_single_clarifying_question(answer: str) -> bool:
     return len(sentences) == 1 and len(stripped) <= 500
 
 
-def _append_budget_notice(answer: str) -> str:
-    substantive = answer.replace(COST_BUDGET_NOTICE, "").strip()
-    return f"{substantive}\n\n{COST_BUDGET_NOTICE}" if substantive else COST_BUDGET_NOTICE
+def _uses_hebrew(text: str) -> bool:
+    return bool(re.search(r"[\u0590-\u05FF]", text))
 
 
-def _append_partial_notice(answer: str) -> str:
-    substantive = answer.replace(EVIDENCE_PARTIAL_NOTICE, "").strip()
+def _runtime_notice(question: str, english: str, hebrew: str) -> str:
+    return hebrew if _uses_hebrew(question) else english
+
+
+def _no_supported_partial_notice(question: str) -> str:
+    return _runtime_notice(
+        question, NO_SUPPORTED_PARTIAL_NOTICE, HEBREW_NO_SUPPORTED_PARTIAL_NOTICE
+    )
+
+
+def _strip_runtime_notices(answer: str) -> str:
+    substantive = answer
+    for notice in (
+        COST_BUDGET_NOTICE,
+        EVIDENCE_PARTIAL_NOTICE,
+        NO_SUPPORTED_PARTIAL_NOTICE,
+        HEBREW_COST_BUDGET_NOTICE,
+        HEBREW_EVIDENCE_PARTIAL_NOTICE,
+        HEBREW_NO_SUPPORTED_PARTIAL_NOTICE,
+    ):
+        substantive = substantive.replace(notice, "")
+    return substantive.strip()
+
+
+def _append_budget_notice(answer: str, question: str = "") -> str:
+    notice = _runtime_notice(question, COST_BUDGET_NOTICE, HEBREW_COST_BUDGET_NOTICE)
+    substantive = answer
+    for budget_notice in (COST_BUDGET_NOTICE, HEBREW_COST_BUDGET_NOTICE):
+        substantive = substantive.replace(budget_notice, "")
+    substantive = substantive.strip()
+    return f"{substantive}\n\n{notice}" if substantive else notice
+
+
+def _append_partial_notice(answer: str, question: str = "") -> str:
+    notice = _runtime_notice(question, EVIDENCE_PARTIAL_NOTICE, HEBREW_EVIDENCE_PARTIAL_NOTICE)
+    substantive = answer
+    for partial_notice in (EVIDENCE_PARTIAL_NOTICE, HEBREW_EVIDENCE_PARTIAL_NOTICE):
+        substantive = substantive.replace(partial_notice, "")
+    substantive = substantive.strip()
     return (
-        f"{substantive}\n\n{EVIDENCE_PARTIAL_NOTICE}"
-        if substantive else NO_SUPPORTED_PARTIAL_NOTICE
+        f"{substantive}\n\n{notice}"
+        if substantive else _no_supported_partial_notice(question)
     )
 
 

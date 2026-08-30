@@ -154,18 +154,109 @@ def test_resolved_preflight_removes_redundant_scope_and_review_tools(
     agent = BimAgent(settings=settings, client=fake_client_factory(final_response(1, "Done.")))
     tools = agent.agent._api_tools(planned_route={
         "exposed_tool_names": [
-            "describe_bim_workspace", "query_bim_workspace",
-            "explore_object_scope", "review_scope_and_evidence",
+            "inspect_project", "describe_bim_workspace", "query_bim_workspace",
+            "list_tree_children", "search_records", "get_records",
+            "analyze_ifc_geometry", "run_local_python", "calculate",
+            "reconcile_populations", "explore_object_scope", "review_scope_and_evidence",
         ],
         "scope_preflight_resolved": True,
         "model_review_required": False,
+        "direct_sql_population_summary": True,
     })
 
     names = {item.get("name") for item in tools}
-    assert "describe_bim_workspace" in names
-    assert "query_bim_workspace" in names
-    assert "explore_object_scope" not in names
-    assert "review_scope_and_evidence" not in names
+    assert names == {"query_bim_workspace", "reconcile_populations", None}
+
+
+def test_resolved_population_summary_stops_after_four_successful_sql_observations(
+    sample_data: Path, tmp_path: Path, fake_client_factory,
+) -> None:
+    plan = QuestionPlan(
+        route={
+            "answer_shape": "count",
+            "required_capabilities": ["record_query"],
+            "required_sources": ["properties"],
+            "preferred_compute": "sql",
+            "confidence": 0.98,
+            "uncertainties": [],
+            "tool_policy": "focused",
+            "exposed_tool_names": [
+                "inspect_project", "describe_bim_workspace", "query_bim_workspace",
+                "list_tree_children", "search_records", "get_records", "run_local_python",
+                "review_scope_and_evidence", "reconcile_populations",
+            ],
+            "project_data_operation": True,
+            "requirements_enforced": True,
+        },
+        interpretation_plan={
+            "objective": "Count the schema-resolved project population.",
+            "population": {
+                "description": "The selected record population.",
+                "identity_basis": "records.object_id",
+                "universe": "filtered_records",
+                "filters": [{
+                    "source": "records", "field": "name", "operator": "contains",
+                    "value": "Pipe", "binding": "verbatim",
+                }],
+                "inclusions": [],
+                "exclusions": [],
+            },
+            "metrics": [{
+                "name": "record count", "aggregation": "count", "source_basis": "property",
+                "field": "records.object_id", "unit": "records", "null_policy": "fail",
+            }],
+            "relationship": {
+                "meaning": "", "direction": "not_applicable", "relationship_types": [],
+            },
+            "inclusion_exclusion_rationale": "The record filter resolves the requested scope.",
+            "assumptions": [],
+            "ambiguities": [],
+            "execution_decision": "execute",
+            "clarification_question": "",
+        },
+        schema_fingerprint="schema-fingerprint",
+        response_id="plan-response",
+        usage_record={"usage_available": False, "purpose": "question_planning"},
+        contract_valid=True,
+        contract_error=None,
+    )
+    client = fake_client_factory(
+        *[
+            tool_response(index, "query_bim_workspace", {
+                "sql": "SELECT ? AS count FROM records LIMIT 1",
+                "parameters": [index],
+                "row_limit": 20,
+            })
+            for index in range(1, 5)
+        ],
+        final_response(5, "The selected project population contains 4 records. [ref: call-4]"),
+    )
+    settings = Settings(
+        data_dir=sample_data,
+        trace_dir=tmp_path / "traces",
+        model="gpt-5.6-sol",
+        reasoning_effort="high",
+        max_agent_iterations=6,
+        enable_question_planning=True,
+        enable_local_python=True,
+    )
+    agent = BimAgent(settings=settings, client=client)
+    agent.planner = _StaticPlanner(plan)
+
+    report = agent.ask("How many project records match the selected scope?")
+
+    first_names = {item.get("name") for item in client.responses.requests[0]["tools"]}
+    assert first_names == {"query_bim_workspace", "reconcile_populations", None}
+    assert client.responses.requests[4]["tools"] == []
+    assert any(
+        "bounded evidence budget" in str(item.get("content") or "")
+        for item in client.responses.requests[4]["input"]
+        if isinstance(item, dict)
+    )
+    assert report.status == "completed"
+    assert report.agent_loop["routine_evidence_stop_forced"] is True
+    assert report.agent_loop["successful_routine_queries"] == 4
+    assert report.agent_loop["route"]["routine_query_limit"] == 4
 
 
 def test_programmatic_function_caller_is_preserved_on_tool_output(
@@ -249,6 +340,8 @@ def test_primary_agent_can_invoke_model_backed_evidence_review(
     assert report.agent_loop["iterations"][0]["calls"][0]["tool"] == "review_scope_and_evidence"
     nested_request = client.responses.requests[1]
     assert "critical BIM evidence-review tool" in nested_request["instructions"]
+    assert "Keep review bounded to the user's requested population" in nested_request["instructions"]
+    assert "Missing IFC mappings mean incomplete cross-source coverage" in nested_request["instructions"]
     assert '"hierarchy_nodes":' not in nested_request["input"]
     assert '"source_inventory_complete": true' in nested_request["input"]
     assert nested_request["max_output_tokens"] == 1000

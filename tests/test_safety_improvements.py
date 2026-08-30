@@ -8,7 +8,12 @@ from bim_agent import BimAgent
 from bim_agent.agent_loop import (
     COST_BUDGET_NOTICE,
     EVIDENCE_PARTIAL_NOTICE,
+    HEBREW_COST_BUDGET_NOTICE,
+    HEBREW_EVIDENCE_PARTIAL_NOTICE,
+    HEBREW_NO_SUPPORTED_PARTIAL_NOTICE,
     NO_SUPPORTED_PARTIAL_NOTICE,
+    _append_budget_notice,
+    _append_partial_notice,
     _classify_route,
     _disclosure_present,
     _ensure_review_disclosures,
@@ -28,6 +33,20 @@ from bim_agent.model_tools import UNVERIFIED_STANDARDS_DISCLAIMER
 from bim_agent.project_tools import RawProjectTools
 
 from conftest import final_response, function_call, tool_response
+
+
+def test_partial_notices_follow_the_question_language_and_do_not_duplicate() -> None:
+    question = "כמה אלמנטים יש בפרויקט?"
+    budget_answer = _append_budget_notice("נמצאו 4 אלמנטים.", question)
+    partial_answer = _append_partial_notice("נמצאו 4 אלמנטים.", question)
+
+    assert budget_answer.endswith(HEBREW_COST_BUDGET_NOTICE)
+    assert partial_answer.endswith(HEBREW_EVIDENCE_PARTIAL_NOTICE)
+    assert "Partial answer" not in budget_answer + partial_answer
+    assert _append_budget_notice(budget_answer, question).count(HEBREW_COST_BUDGET_NOTICE) == 1
+    unsupported = _append_budget_notice(HEBREW_NO_SUPPORTED_PARTIAL_NOTICE, question)
+    assert HEBREW_NO_SUPPORTED_PARTIAL_NOTICE in unsupported
+    assert unsupported.endswith(HEBREW_COST_BUDGET_NOTICE)
 
 
 def _with_usage(
