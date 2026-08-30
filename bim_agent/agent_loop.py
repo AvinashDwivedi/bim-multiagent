@@ -32,8 +32,16 @@ ROUTING_INSTRUCTIONS = "\n\n".join(
 )
 
 COST_BUDGET_NOTICE = (
-    "The answer was stopped because the configured per-answer cost budget was reached before the evidence "
-    "could be finalized."
+    "⚠️ Partial answer: the configured per-answer cost budget was reached. The findings above are limited to "
+    "evidence already collected; unresolved checks were not completed."
+)
+EVIDENCE_PARTIAL_NOTICE = (
+    "⚠️ Partial answer: only claims supported by cited tool observations are included; unsupported or "
+    "unresolved claims from the draft were omitted."
+)
+NO_SUPPORTED_PARTIAL_NOTICE = (
+    "⚠️ Partial answer: no factual statement from the final draft could be retained as supported by its cited "
+    "observations. The collected evidence remains available for a revised answer or rerun."
 )
 
 
@@ -44,6 +52,8 @@ when the investigation is finished.
 
 Ground every project claim in the supplied read-only tools. Begin by inspecting or searching the project when
 you need project facts. You may revisit tools, change interpretation, inspect counterexamples, retrieve raw
+evidence, or omit a claim that remains unsupported. Never replace supported findings with a blanket refusal:
+when some checks remain unresolved, return the strongest cited partial answer and state its limitation.
 records, search IFC relationships, and calculate as often as useful. For project filters, joins, counts, and
 aggregates, use the read-only SQL workspace; use calculate only for arithmetic over values already retrieved.
 Distinguish hierarchy/definition records from
@@ -82,16 +92,18 @@ Use model-authored programmatic tool calling, when available, only to filter, jo
 validate several predictable tool results into a smaller evidence object. Keep adaptive semantic decisions and
 final validation in direct model turns.
 
-Before finishing a materially quantitative, geometric, connectivity, ambiguous, or multi-source answer, call
+Before finishing a geometric, connectivity, compliance, materially ambiguous, or multi-source answer, call
 review_scope_and_evidence with your proposed scope, exclusions, evidence, and draft, then decide whether follow-up
-investigation is needed. For a
+investigation is needed. A routine single-source count or list over a schema-validated SQL population does not
+need a separate model review. For a
 normative compliance question, use research_standards when external requirements are necessary, and keep those
 requirements distinct from project facts. Do not ask the user to choose a floor or interpretation when the project
 data lets you report all material alternatives concisely.
 Answer in the user's language. Give the direct result first, then concise evidence and limitations. Do not expose
 private chain-of-thought. Do not author snapshot, scope, uniqueness, source-mismatch, unit, or type-semantics
 disclosure sentences yourself; the runtime appends required disclosures in canonical cited form. Return a normal
-assistant message only when you judge the substantive answer ready.
+assistant message only when you judge the substantive answer ready. Preserve any material, evidence-backed
+exclusion that changes the meaning of a reported total, such as separately modeled accessories or fittings.
 
 The versioned routing and evidence rules below are mandatory:
 """ + ROUTING_INSTRUCTIONS
@@ -124,6 +136,8 @@ class ModelDirectedBimAgent:
         local_python_timeout_seconds: float,
         local_python_output_chars: int,
         python_cache_root: Path,
+        model_tool_reasoning_effort: str,
+        finalization_reasoning_effort: str,
         openai_max_retries: int = 4,
         openai_timeout_seconds: float = 180.0,
         pricing_overrides: dict[str, dict[str, float]] | None = None,
@@ -147,6 +161,8 @@ class ModelDirectedBimAgent:
         self.tools = tools
         self.model = model
         self.reasoning_effort = reasoning_effort
+        self.model_tool_reasoning_effort = model_tool_reasoning_effort
+        self.finalization_reasoning_effort = finalization_reasoning_effort
         self.max_iterations = max(1, max_iterations)
         self.max_tool_output_chars = max(2000, max_tool_output_chars)
         self.max_answer_cost_usd = max(0.0, float(max_answer_cost_usd))
@@ -155,7 +171,7 @@ class ModelDirectedBimAgent:
         self.model_tools = ModelAssistedTools(
             client=client,
             model=model,
-            reasoning_effort=reasoning_effort,
+            reasoning_effort=self.model_tool_reasoning_effort,
             project_tools=tools,
         )
         self.python_sandbox = LocalPythonSandbox(
@@ -215,6 +231,9 @@ class ModelDirectedBimAgent:
             if question_plan is not None
             else _classify_route(question)
         )
+        if question_plan is not None:
+            route["scope_preflight_resolved"] = _plan_has_resolved_scope(question_plan)
+            route["model_review_required"] = _plan_requires_model_review(question_plan)
         reconciliation_required = (
             "reconciliation" in set(route.get("required_capabilities", []))
             or _requires_population_reconciliation(question)
@@ -228,13 +247,22 @@ class ModelDirectedBimAgent:
         evidence: dict[str, dict[str, Any]] = {}
         evidence_aliases: dict[str, str] = {}
         tool_call_ordinal = 0
-        tool_categories: set[str] = set()
+        # A valid preflight inspected the runtime schema. This satisfies the planned
+        # schema capability, but it is deliberately not counted as project evidence.
+        tool_categories: set[str] = (
+            {"schema"} if question_plan is not None and question_plan.contract_valid else set()
+        )
         observed_sources: set[str] = set()
         outstanding_cursors: set[str] = set()
         completeness_forced = False
         completeness_attempts = 0
         completion_limited = False
         unresolved_completion_issues: list[str] = []
+        best_grounded_candidate = ""
+        best_grounded_candidate_score: tuple[int, int, int] = (-10_000, -1, -1)
+        best_grounded_candidate_iteration: int | None = None
+        best_grounded_candidate_issues: list[str] = []
+        best_grounded_candidate_is_salvaged = False
         grounding_content_forced = False
         grounding_format_forced = False
         cost_budget_exceeded = False
@@ -246,6 +274,7 @@ class ModelDirectedBimAgent:
         review_required_follow_up: list[str] = []
         review_required_disclosures: list[str] = []
         review_unsupported_claims: list[str] = []
+        population_mismatch_observed = False
         disclosure_state: dict[str, dict[str, Any]] = {}
         citation_repairs: list[dict[str, Any]] = []
         usage_records: list[dict[str, Any]] = (
@@ -328,11 +357,14 @@ class ModelDirectedBimAgent:
                 program_outputs=sum(1 for item in output if getattr(item, "type", None) == "program_output"),
                 python_calls=len(python_calls),
             )
-            if _cost_limit_reached(
+            response_cost_limit_reached = _cost_limit_reached(
                 usage_records,
                 limit_usd=self.max_answer_cost_usd,
                 pricing_overrides=self.pricing_overrides,
-            ):
+            )
+            # A no-tool draft is grounded and checkpointed below before a budget
+            # stop can replace it. Tool calls still stop before execution.
+            if response_cost_limit_reached and (calls or not candidate_answer):
                 cost_budget_exceeded = True
                 termination_reason = "cost_budget_exceeded"
                 final_answer, budget_metadata, disclosure_state, current_repairs = self._budget_answer(
@@ -342,7 +374,7 @@ class ModelDirectedBimAgent:
                         if not calls and not candidate_answer and output
                         else input_items
                     ),
-                    candidate_answer=candidate_answer if not calls else "",
+                    candidate_answer=best_grounded_candidate,
                     evidence=evidence,
                     evidence_aliases=evidence_aliases,
                     disclosure_codes=review_required_disclosures,
@@ -402,44 +434,6 @@ class ModelDirectedBimAgent:
                         unsupported_claims=review_unsupported_claims,
                     ))
                     completion_issues = list(dict.fromkeys(completion_issues))
-                    if completion_issues and iteration < self.max_iterations:
-                        completeness_forced = True
-                        completeness_attempts += 1
-                        feedback = (
-                            "Do not finalize yet. Continue from all accumulated observations and resolve only "
-                            "these outstanding verification checks: "
-                            + "; ".join(completion_issues)
-                            + ". Reuse existing evidence and completed reconciliations. Call additional tools "
-                              "only where a listed check still lacks evidence, then return the strongest fully "
-                              "supported answer."
-                        )
-                        input_items.extend([
-                            {"role": "assistant", "content": candidate_answer},
-                            {"role": "user", "content": feedback},
-                        ])
-                        trace.transcript("gate", gate="completeness", accepted=False, issues=completion_issues)
-                        iterations.append({
-                            "iteration": iteration,
-                            "response_id": response_id,
-                            "action": "completeness_continue",
-                            "issues": completion_issues,
-                            "python_calls": python_calls,
-                        })
-                        continue
-                    if completion_issues:
-                        completion_limited = True
-                        unresolved_completion_issues = list(completion_issues)
-                        trace.transcript(
-                            "gate", gate="completeness", accepted=False, issues=completion_issues
-                        )
-                        iterations.append({
-                            "iteration": iteration,
-                            "response_id": response_id,
-                            "action": "completeness_limited",
-                            "issues": completion_issues,
-                            "python_calls": python_calls,
-                        })
-
                     trusted_disclosures = {
                         str(item.get("text", ""))
                         for item in disclosure_state.values()
@@ -468,9 +462,109 @@ class ModelDirectedBimAgent:
                         require_disclaimer=unverified_disclaimer_required,
                         trusted_claims=trusted_disclosures,
                     )
+                    salvaged_candidate = ""
+                    if grounding_issues:
+                        salvaged_candidate = _evidence_supported_partial_answer(
+                            question,
+                            candidate_answer,
+                            evidence,
+                            evidence_aliases=evidence_aliases,
+                            trusted_claims=trusted_disclosures,
+                        )
+                        if salvaged_candidate:
+                            salvaged_score = (
+                                -len(completion_issues) - 1,
+                                len(set(_REF_RE.findall(salvaged_candidate))),
+                                len(salvaged_candidate),
+                            )
+                            if salvaged_score > best_grounded_candidate_score:
+                                best_grounded_candidate = salvaged_candidate
+                                best_grounded_candidate_score = salvaged_score
+                                best_grounded_candidate_iteration = iteration
+                                best_grounded_candidate_issues = list(completion_issues)
+                                best_grounded_candidate_is_salvaged = True
+                                trace.transcript(
+                                    "gate",
+                                    gate="evidence_partial_checkpoint",
+                                    accepted=True,
+                                    iteration=iteration,
+                                    omitted_claim_count=len(grounding_issues),
+                                    citation_count=salvaged_score[1],
+                                )
                     if grounding_issues:
                         trace.transcript("gate", gate="grounding", accepted=False, issues=grounding_issues)
                         issue_category = _grounding_issue_category(grounding_issues)
+                        if (
+                            completion_issues
+                            and iteration < self.max_iterations
+                            and not response_cost_limit_reached
+                        ):
+                            completeness_forced = True
+                            completeness_attempts += 1
+                            feedback = (
+                                "Do not finalize yet. Resolve these outstanding verification checks: "
+                                + "; ".join(completion_issues)
+                                + ". Also correct the citation-grounding issues: "
+                                + " ".join(grounding_issues)
+                                + " Use project tools only where evidence is missing, then cite the resulting "
+                                  "direct observations inline."
+                            )
+                            input_items.extend([
+                                {"role": "assistant", "content": candidate_answer},
+                                {"role": "user", "content": feedback},
+                            ])
+                            trace.transcript(
+                                "gate", gate="completeness", accepted=False, issues=completion_issues
+                            )
+                            iterations.append({
+                                "iteration": iteration,
+                                "response_id": response_id,
+                                "action": "completeness_continue",
+                                "issues": completion_issues,
+                                "grounding_issues": grounding_issues,
+                                "checkpointed": False,
+                                "python_calls": python_calls,
+                            })
+                            continue
+                        if response_cost_limit_reached:
+                            cost_budget_exceeded = True
+                            termination_reason = "cost_budget_exceeded"
+                            if best_grounded_candidate:
+                                final_answer, budget_metadata, disclosure_state, current_repairs = self._budget_answer(
+                                    question=question,
+                                    input_items=input_items,
+                                    candidate_answer=best_grounded_candidate,
+                                    evidence=evidence,
+                                    evidence_aliases=evidence_aliases,
+                                    disclosure_codes=review_required_disclosures,
+                                    require_disclaimer=unverified_disclaimer_required,
+                                    trace=trace,
+                                    usage_records=usage_records,
+                                    response_ids=response_ids,
+                                    iteration=iteration,
+                                    trigger="after_grounding_rejection",
+                                )
+                                citation_repairs.extend(current_repairs)
+                            else:
+                                final_answer = _append_budget_notice(NO_SUPPORTED_PARTIAL_NOTICE)
+                                budget_metadata = {
+                                    "trigger": "after_grounding_rejection",
+                                    "finalization_attempted": False,
+                                    "generated": False,
+                                    "fallback_used": True,
+                                    "response_id": "",
+                                    "generation_error": None,
+                                    "grounding_issues": grounding_issues,
+                                }
+                            iterations.append({
+                                "iteration": iteration,
+                                "response_id": response_id,
+                                "action": "cost_budget_answer",
+                                "budget_finalization": budget_metadata,
+                                "issues": grounding_issues,
+                                "python_calls": python_calls,
+                            })
+                            break
                         retry_used = (
                             grounding_format_forced
                             if issue_category == "formatting"
@@ -509,19 +603,126 @@ class ModelDirectedBimAgent:
                                 "python_calls": python_calls,
                             })
                             continue
-                        final_answer = (
-                            "The answer was withheld because its factual claims could not be validated against "
-                            "the cited tool observations."
+                        if best_grounded_candidate:
+                            completion_limited = True
+                            unresolved_completion_issues = list(best_grounded_candidate_issues)
+                            final_answer = best_grounded_candidate
+                            if unresolved_completion_issues:
+                                final_answer = _append_incomplete_checks(
+                                    final_answer, unresolved_completion_issues
+                                )
+                            if best_grounded_candidate_is_salvaged:
+                                final_answer = _append_partial_notice(final_answer)
+                            termination_reason = "evidence_supported_partial_after_rejected_retry"
+                            iterations.append({
+                                "iteration": iteration,
+                                "response_id": response_id,
+                                "action": "grounding_rejected_use_partial",
+                                "issues": grounding_issues,
+                                "checkpoint_iteration": best_grounded_candidate_iteration,
+                                "python_calls": python_calls,
+                            })
+                        else:
+                            final_answer = NO_SUPPORTED_PARTIAL_NOTICE
+                            termination_reason = "no_supported_partial_after_rejected_retry"
+                            iterations.append({
+                                "iteration": iteration,
+                                "response_id": response_id,
+                                "action": "grounding_rejected_no_supported_partial",
+                                "issues": grounding_issues,
+                                "python_calls": python_calls,
+                            })
+                        break
+
+                    candidate_score = (
+                        -len(completion_issues),
+                        len(set(_REF_RE.findall(candidate_answer))),
+                        len(candidate_answer),
+                    )
+                    if candidate_score > best_grounded_candidate_score:
+                        best_grounded_candidate = candidate_answer
+                        best_grounded_candidate_score = candidate_score
+                        best_grounded_candidate_iteration = iteration
+                        best_grounded_candidate_issues = list(completion_issues)
+                        best_grounded_candidate_is_salvaged = False
+                        trace.transcript(
+                            "gate",
+                            gate="grounded_candidate_checkpoint",
+                            accepted=True,
+                            iteration=iteration,
+                            unresolved_checks=completion_issues,
+                            citation_count=candidate_score[1],
                         )
-                        termination_reason = "grounding_rejected"
+
+                    if response_cost_limit_reached:
+                        cost_budget_exceeded = True
+                        termination_reason = "cost_budget_exceeded"
+                        final_answer, budget_metadata, disclosure_state, current_repairs = self._budget_answer(
+                            question=question,
+                            input_items=input_items,
+                            candidate_answer=best_grounded_candidate,
+                            evidence=evidence,
+                            evidence_aliases=evidence_aliases,
+                            disclosure_codes=review_required_disclosures,
+                            require_disclaimer=unverified_disclaimer_required,
+                            trace=trace,
+                            usage_records=usage_records,
+                            response_ids=response_ids,
+                            iteration=iteration,
+                            trigger="after_answer_generation",
+                        )
+                        citation_repairs.extend(current_repairs)
                         iterations.append({
                             "iteration": iteration,
                             "response_id": response_id,
-                            "action": "grounding_rejected",
-                            "issues": grounding_issues,
+                            "action": "cost_budget_answer",
+                            "budget_finalization": budget_metadata,
+                            "checkpoint_iteration": best_grounded_candidate_iteration,
                             "python_calls": python_calls,
                         })
                         break
+
+                    if completion_issues and iteration < self.max_iterations:
+                        completeness_forced = True
+                        completeness_attempts += 1
+                        feedback = (
+                            "Do not finalize yet. Continue from all accumulated observations and resolve only "
+                            "these outstanding verification checks: "
+                            + "; ".join(completion_issues)
+                            + ". Reuse existing evidence and completed reconciliations. Call additional tools "
+                              "only where a listed check still lacks evidence, then return the strongest fully "
+                              "supported answer. The prior grounded draft is checkpointed and will not be lost."
+                        )
+                        input_items.extend([
+                            {"role": "assistant", "content": candidate_answer},
+                            {"role": "user", "content": feedback},
+                        ])
+                        trace.transcript("gate", gate="completeness", accepted=False, issues=completion_issues)
+                        iterations.append({
+                            "iteration": iteration,
+                            "response_id": response_id,
+                            "action": "completeness_continue",
+                            "issues": completion_issues,
+                            "checkpointed": True,
+                            "python_calls": python_calls,
+                        })
+                        continue
+                    if completion_issues:
+                        completion_limited = True
+                        unresolved_completion_issues = list(best_grounded_candidate_issues)
+                        candidate_answer = best_grounded_candidate
+                        trace.transcript(
+                            "gate", gate="completeness", accepted=False,
+                            issues=unresolved_completion_issues,
+                        )
+                        iterations.append({
+                            "iteration": iteration,
+                            "response_id": response_id,
+                            "action": "completeness_limited",
+                            "issues": unresolved_completion_issues,
+                            "checkpoint_iteration": best_grounded_candidate_iteration,
+                            "python_calls": python_calls,
+                        })
 
                     final_answer = (
                         _append_incomplete_checks(candidate_answer, unresolved_completion_issues)
@@ -635,6 +836,10 @@ class ModelDirectedBimAgent:
                         "evidence_class": evidence_class,
                     }
                     evidence_aliases[citation_alias] = call_id
+                    if name == "reconcile_populations" and isinstance(result, dict):
+                        population_mismatch_observed = (
+                            population_mismatch_observed or _reconciliation_mismatch(result)
+                        )
                     if name == "review_scope_and_evidence" and isinstance(result, dict):
                         review_seen = True
                         review_can_finalize = bool(result.get("can_finalize", True))
@@ -642,9 +847,23 @@ class ModelDirectedBimAgent:
                         review_required_follow_up = [
                             str(item) for item in result.get("required_follow_up", [])
                         ]
-                        review_required_disclosures = [
+                        requested_disclosures = [
                             str(item) for item in result.get("required_disclosures", [])
                         ]
+                        # A model review is advice, not project evidence. It may
+                        # require a mismatch disclosure only after a direct
+                        # reconciliation observation has actually found one.
+                        review_required_disclosures = _validated_review_disclosures(
+                            requested_disclosures,
+                            population_mismatch_observed=population_mismatch_observed,
+                        )
+                        if "cross_source_mismatch" in requested_disclosures and not population_mismatch_observed:
+                            trace.event(
+                                "review_disclosure_rejected",
+                                iteration=iteration,
+                                code="cross_source_mismatch",
+                                reason="no_direct_population_mismatch_observed",
+                            )
                         disclosure_state = {}
                         review_unsupported_claims = [
                             str(item) for item in result.get("unsupported_claims", [])
@@ -711,6 +930,9 @@ class ModelDirectedBimAgent:
                     reconciliation["trigger_call_id"] = call_id
                     reconciliation["population_ids_available"] = True
                     reconciliation["mismatch"] = _reconciliation_mismatch(reconciliation)
+                    population_mismatch_observed = (
+                        population_mismatch_observed or bool(reconciliation["mismatch"])
+                    )
                     reconciliation_text, reconciliation_truncated = _tool_output(
                         reconciliation, self.max_tool_output_chars
                     )
@@ -768,7 +990,7 @@ class ModelDirectedBimAgent:
                 final_answer, budget_metadata, disclosure_state, current_repairs = self._budget_answer(
                     question=question,
                     input_items=input_items,
-                    candidate_answer="",
+                    candidate_answer=best_grounded_candidate,
                     evidence=evidence,
                     evidence_aliases=evidence_aliases,
                     disclosure_codes=review_required_disclosures,
@@ -783,6 +1005,16 @@ class ModelDirectedBimAgent:
                 iterations[-1]["action"] = "cost_budget_answer"
                 iterations[-1]["budget_finalization"] = budget_metadata
                 break
+
+        if not final_answer and best_grounded_candidate:
+            completion_limited = True
+            unresolved_completion_issues = list(best_grounded_candidate_issues)
+            final_answer = _append_incomplete_checks(
+                best_grounded_candidate, unresolved_completion_issues
+            )
+            if best_grounded_candidate_is_salvaged:
+                final_answer = _append_partial_notice(final_answer)
+            termination_reason = "best_grounded_candidate_at_iteration_limit"
 
         limitations = [
             (
@@ -810,8 +1042,14 @@ class ModelDirectedBimAgent:
             final_answer = final_answer or (
                 "The model-directed agent did not produce a final answer before its iteration safety limit."
             )
-            if termination_reason == "grounding_rejected":
-                limitations.append("The final draft failed the citation-grounding check after one forced retry.")
+            if termination_reason in {
+                "evidence_supported_partial_after_rejected_retry",
+                "no_supported_partial_after_rejected_retry",
+            }:
+                limitations.append(
+                    "Unsupported final-draft claims were omitted; the returned result is limited to the "
+                    "evidence-supported portion."
+                )
             elif termination_reason == "completed_with_incomplete_checks":
                 limitations.append(
                     "The answer preserves grounded findings, but one or more required scope, population, "
@@ -873,6 +1111,16 @@ class ModelDirectedBimAgent:
                 "completeness_attempts": completeness_attempts,
                 "completion_limited": completion_limited,
                 "unresolved_completion_issues": unresolved_completion_issues,
+                "best_grounded_candidate": {
+                    "available": bool(best_grounded_candidate),
+                    "iteration": best_grounded_candidate_iteration,
+                    "unresolved_checks": best_grounded_candidate_issues,
+                    "citation_count": (
+                        len(set(_REF_RE.findall(best_grounded_candidate)))
+                        if best_grounded_candidate else 0
+                    ),
+                    "salvaged_partial": best_grounded_candidate_is_salvaged,
+                },
                 "grounding_forced": grounding_content_forced or grounding_format_forced,
                 "grounding_content_forced": grounding_content_forced,
                 "grounding_format_forced": grounding_format_forced,
@@ -940,7 +1188,7 @@ class ModelDirectedBimAgent:
                             ),
                         },
                     ],
-                    reasoning={"effort": "low"},
+                    reasoning={"effort": self.finalization_reasoning_effort},
                     store=False,
                     max_output_tokens=1200,
                     prompt_cache_key=f"{self.prompt_cache_key}-budget"[:64],
@@ -973,9 +1221,7 @@ class ModelDirectedBimAgent:
                 )
         draft = draft.replace(COST_BUDGET_NOTICE, "").strip()
         if not draft:
-            draft = (
-                "The accumulated observations were insufficient to produce a verified substantive answer."
-            )
+            draft = NO_SUPPORTED_PARTIAL_NOTICE
         if require_disclaimer and UNVERIFIED_STANDARDS_DISCLAIMER not in draft:
             draft = f"{draft.rstrip()}\n\n{UNVERIFIED_STANDARDS_DISCLAIMER}"
         draft, disclosure_state = _ensure_review_disclosures(
@@ -1005,6 +1251,20 @@ class ModelDirectedBimAgent:
             require_disclaimer=require_disclaimer,
             trusted_claims=trusted_disclosures,
         )
+        partial_salvage_used = False
+        if grounding_issues:
+            supported_partial = _evidence_supported_partial_answer(
+                question,
+                draft,
+                evidence,
+                evidence_aliases=evidence_aliases,
+                trusted_claims=trusted_disclosures,
+            )
+            if supported_partial:
+                draft = supported_partial
+                partial_salvage_used = True
+            else:
+                draft = NO_SUPPORTED_PARTIAL_NOTICE
         final_answer = _append_budget_notice(draft)
         metadata = {
             "trigger": trigger,
@@ -1014,6 +1274,7 @@ class ModelDirectedBimAgent:
             "response_id": generated_response_id,
             "generation_error": generation_error or None,
             "grounding_issues": grounding_issues,
+            "partial_salvage_used": partial_salvage_used,
         }
         trace.event(
             "cost_budget_exceeded",
@@ -1047,6 +1308,10 @@ class ModelDirectedBimAgent:
             # The deprecated aggregate tool is never restored by a plan; SQL is
             # the single certifying path for JSON-backed aggregates.
             allowed.discard("aggregate_records")
+            if planned_route.get("scope_preflight_resolved"):
+                allowed.discard("explore_object_scope")
+            if not planned_route.get("model_review_required", True):
+                allowed.discard("review_scope_and_evidence")
             project_definitions = [
                 item for item in project_definitions
                 if item.get("name") in allowed and item.get("name") != "aggregate_records"
@@ -1195,6 +1460,41 @@ def _tool_category(name: str) -> str:
     return mapping.get(name, "other")
 
 
+def _plan_has_resolved_scope(plan: QuestionPlan) -> bool:
+    """Return true only when preflight resolved every material scope choice."""
+    if not plan.contract_valid:
+        return False
+    ambiguities = plan.interpretation_plan.get("ambiguities", [])
+    if any(isinstance(item, dict) and item.get("material") for item in ambiguities):
+        return False
+    resolution = plan.schema_resolution_observation
+    if isinstance(resolution, dict):
+        return bool(
+            resolution.get("runtime_validated")
+            and resolution.get("complete")
+            and resolution.get("primary_candidate_id")
+        )
+    population = plan.interpretation_plan.get("population")
+    filters = population.get("filters", []) if isinstance(population, dict) else []
+    mappings = plan.interpretation_plan.get("schema_grounded_mappings", [])
+    return bool(filters or mappings)
+
+
+def _plan_requires_model_review(plan: QuestionPlan) -> bool:
+    """Reserve the critic for evidence contracts where it adds a distinct check."""
+    if not plan.contract_valid or not _plan_has_resolved_scope(plan):
+        return True
+    route = plan.route
+    answer_shape = str(route.get("answer_shape") or "")
+    if answer_shape in {"ranking", "measurement", "comparison", "connectivity", "compliance"}:
+        return True
+    capabilities = {str(item) for item in route.get("required_capabilities", [])}
+    if capabilities.intersection({"geometry", "graph", "standards_research"}):
+        return True
+    sources = {str(item) for item in route.get("required_sources", [])}
+    return len(sources) > 1
+
+
 def _completion_issues(
     question: str,
     *,
@@ -1251,9 +1551,18 @@ def _completion_issues(
         r"property name|ambiguous)\b",
         normalized,
     ))
-    if project_question and ambiguous_scope and "scope" not in tool_categories:
+    scope_preflight_resolved = bool(route and route.get("scope_preflight_resolved"))
+    model_review_required = bool(route and route.get("model_review_required", True))
+    if (
+        project_question and ambiguous_scope and not scope_preflight_resolved
+        and "scope" not in tool_categories
+    ):
         issues.append("the ambiguous category, location, or property boundary with explore_object_scope")
-    if project_question and ambiguous_scope and "scope" in tool_categories and "review" not in tool_categories:
+    if (
+        project_question and ambiguous_scope and model_review_required
+        and (scope_preflight_resolved or "scope" in tool_categories)
+        and "review" not in tool_categories
+    ):
         issues.append("the chosen ambiguous scope with review_scope_and_evidence")
     if route and route.get("requirements_enforced"):
         capability_categories = {
@@ -1357,6 +1666,16 @@ def _review_completion_issues(
     return issues
 
 
+def _validated_review_disclosures(
+    requested: list[str], *, population_mismatch_observed: bool,
+) -> list[str]:
+    """Require direct project evidence before asserting a cross-source mismatch."""
+    return list(dict.fromkeys(
+        code for code in requested
+        if code != "cross_source_mismatch" or population_mismatch_observed
+    ))
+
+
 def _split_line_claims(line: str) -> list[str]:
     """Split prose into sentences while binding each inline ref to the sentence immediately before it."""
     claims: list[str] = []
@@ -1449,7 +1768,8 @@ def _grounding_issues(
         ]
         if unmatched_numbers:
             issues.append(
-                f"Claimed value(s) {', '.join(unmatched_numbers)} do not occur in the cited output(s)."
+                f"Claimed value(s) {', '.join(unmatched_numbers)} do not occur in the cited output(s) for: "
+                f"{claim_text[:180]!r}."
             )
             continue
         if not numbers and not _textual_evidence_overlap(claim_text, combined_output):
@@ -1461,6 +1781,64 @@ def _grounding_issue_category(issues: list[str]) -> str:
     if issues and all(item.startswith("Claim has no inline tool reference:") for item in issues):
         return "formatting"
     return "content"
+
+
+def _evidence_supported_partial_answer(
+    question: str,
+    answer: str,
+    evidence: dict[str, dict[str, Any]],
+    *,
+    evidence_aliases: dict[str, str],
+    trusted_claims: set[str] | None = None,
+) -> str:
+    """Retain independently grounded draft lines while omitting rejected claims.
+
+    Presentation-only headings and table headers are carried forward only when
+    at least one substantive cited claim survives. The warning is appended by
+    the caller after validation so it is never mistaken for a project claim.
+    """
+    kept_lines: list[str] = []
+    pending_scaffolding: list[str] = []
+    substantive_claims = 0
+    for line in answer.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if kept_lines and kept_lines[-1] != "":
+                pending_scaffolding.append("")
+            continue
+        claims = [item for item in _split_line_claims(line) if item.strip()]
+        if claims and all(
+            claim.rstrip().endswith(":")
+            or _markdown_heading_scaffolding(claim)
+            or _markdown_table_scaffolding(claim)
+            for claim in claims
+        ):
+            pending_scaffolding.append(line)
+            continue
+        supported_claims = [
+            claim for claim in claims
+            if not _grounding_issues(
+                question,
+                claim,
+                evidence,
+                evidence_aliases=evidence_aliases,
+                require_disclaimer=False,
+                trusted_claims=trusted_claims,
+            )
+        ]
+        if not supported_claims:
+            pending_scaffolding = []
+            continue
+        if pending_scaffolding:
+            kept_lines.extend(pending_scaffolding)
+            pending_scaffolding = []
+        kept_lines.append(" ".join(supported_claims))
+        substantive_claims += len(supported_claims)
+    if not substantive_claims:
+        return ""
+    while kept_lines and not kept_lines[-1].strip():
+        kept_lines.pop()
+    return "\n".join(kept_lines).strip()
 
 
 def _repair_citation_placement(
@@ -1894,11 +2272,13 @@ def _markdown_table_scaffolding(claim: str) -> bool:
     cells = [cell.strip() for cell in stripped.strip("|").split("|")]
     if all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells if cell):
         return True
-    return not _NUMBER_RE.search(stripped) and "`" not in stripped
+    return not _NUMBER_RE.search(stripped)
 
 
 def _markdown_heading_scaffolding(claim: str) -> bool:
     stripped = _REF_RE.sub("", claim).strip()
+    if re.fullmatch(r"\*\*[^*\n]+:?\*\*", stripped):
+        return True
     if not re.match(r"^#{1,6}\s+", stripped):
         return False
     heading = re.sub(r"^#{1,6}\s+", "", stripped).strip()
@@ -1918,6 +2298,14 @@ def _is_single_clarifying_question(answer: str) -> bool:
 def _append_budget_notice(answer: str) -> str:
     substantive = answer.replace(COST_BUDGET_NOTICE, "").strip()
     return f"{substantive}\n\n{COST_BUDGET_NOTICE}" if substantive else COST_BUDGET_NOTICE
+
+
+def _append_partial_notice(answer: str) -> str:
+    substantive = answer.replace(EVIDENCE_PARTIAL_NOTICE, "").strip()
+    return (
+        f"{substantive}\n\n{EVIDENCE_PARTIAL_NOTICE}"
+        if substantive else NO_SUPPORTED_PARTIAL_NOTICE
+    )
 
 
 def _append_incomplete_checks(answer: str, issues: list[str]) -> str:

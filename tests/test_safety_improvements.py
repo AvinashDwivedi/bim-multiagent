@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from bim_agent import BimAgent
 from bim_agent.agent_loop import (
     COST_BUDGET_NOTICE,
+    EVIDENCE_PARTIAL_NOTICE,
+    NO_SUPPORTED_PARTIAL_NOTICE,
     _classify_route,
     _disclosure_present,
     _ensure_review_disclosures,
@@ -18,6 +20,7 @@ from bim_agent.agent_loop import (
     _requires_population_reconciliation,
     _review_completion_issues,
     _tool_cache_key,
+    _validated_review_disclosures,
 )
 from bim_agent.model_tools import _review_disclosure_text
 from bim_agent.config import Settings
@@ -440,7 +443,7 @@ def test_grounding_gate_rejects_a_cited_value_absent_from_tool_output(
     assert "99" in client.responses.requests[2]["input"][-1]["content"]
 
 
-def test_grounding_gate_withholds_answer_after_failed_retry(
+def test_grounding_gate_returns_warning_instead_of_runtime_withholding(
     sample_data: Path, fake_client_factory,
 ) -> None:
     client = fake_client_factory(
@@ -451,8 +454,43 @@ def test_grounding_gate_withholds_answer_after_failed_retry(
     report = BimAgent(sample_data, client=client).ask("Calculate 2 + 3")
 
     assert report.status == "limited"
-    assert report.agent_loop["termination_reason"] == "grounding_rejected"
-    assert report.answer.startswith("The answer was withheld")
+    assert report.agent_loop["termination_reason"] == "no_supported_partial_after_rejected_retry"
+    assert report.answer == NO_SUPPORTED_PARTIAL_NOTICE
+    assert "withheld" not in report.answer.casefold()
+    assert "99" not in report.answer
+
+
+def test_grounding_gate_salvages_supported_lines_from_a_mixed_draft(
+    sample_data: Path, fake_client_factory,
+) -> None:
+    mixed = "The result is 5. [ref: call-1]\nThe alternate result is 99. [ref: call-1]"
+    client = fake_client_factory(
+        tool_response(1, "calculate", {"expression": "2 + 3"}),
+        final_response(2, mixed),
+        final_response(3, mixed),
+    )
+
+    report = BimAgent(sample_data, client=client).ask("Calculate 2 + 3")
+
+    assert report.status == "limited"
+    assert report.answer.startswith("The result is 5. [ref: call-1]")
+    assert "99" not in report.answer
+    assert report.answer.endswith(EVIDENCE_PARTIAL_NOTICE)
+    assert report.agent_loop["best_grounded_candidate"]["salvaged_partial"] is True
+
+
+def test_review_cannot_assert_cross_source_mismatch_without_direct_observation() -> None:
+    requested = ["loaded_snapshot", "cross_source_mismatch", "selected_scope_only"]
+
+    without_mismatch = _validated_review_disclosures(
+        requested, population_mismatch_observed=False,
+    )
+    with_mismatch = _validated_review_disclosures(
+        requested, population_mismatch_observed=True,
+    )
+
+    assert without_mismatch == ["loaded_snapshot", "selected_scope_only"]
+    assert with_mismatch == requested
 
 
 def test_content_and_formatting_grounding_retries_have_independent_budgets(
@@ -535,7 +573,7 @@ def test_completeness_gate_preserves_grounded_answer_after_iterative_retries(
         }),
         final_response(2, answer),
         final_response(3, answer),
-        final_response(4, answer),
+        final_response(4, "I could not complete the remaining verification check."),
     )
     settings = Settings(
         data_dir=sample_data,
@@ -556,9 +594,10 @@ def test_completeness_gate_preserves_grounded_answer_after_iterative_retries(
     assert "answer was withheld" not in report.answer.casefold()
     assert report.agent_loop["completeness_attempts"] == 2
     assert report.agent_loop["completion_limited"] is True
-    assert report.agent_loop["termination_reason"] == "completed_with_incomplete_checks"
+    assert report.agent_loop["best_grounded_candidate"]["iteration"] == 2
+    assert report.agent_loop["termination_reason"] == "evidence_supported_partial_after_rejected_retry"
     assert any(
-        item["action"] == "completeness_limited"
+        item["action"] == "grounding_rejected_use_partial"
         for item in report.agent_loop["iterations"]
     )
 

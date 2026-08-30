@@ -28,6 +28,8 @@ class BimAgent:
             tools=self.tools,
             model=self.settings.model,
             reasoning_effort=self.settings.reasoning_effort,
+            model_tool_reasoning_effort=self.settings.model_tool_reasoning_effort,
+            finalization_reasoning_effort=self.settings.finalization_reasoning_effort,
             max_iterations=self.settings.max_agent_iterations,
             max_tool_output_chars=self.settings.max_tool_output_chars,
             max_answer_cost_usd=self.settings.max_answer_cost_usd,
@@ -47,7 +49,7 @@ class BimAgent:
             QuestionPlanner(
                 client=self.agent.client,
                 model=self.settings.planning_model or self.settings.model,
-                reasoning_effort=self.settings.reasoning_effort,
+                reasoning_effort=self.settings.planning_reasoning_effort,
                 project_tools=self.tools,
             )
             if self.settings.enable_question_planning
@@ -83,6 +85,7 @@ class BimAgent:
             "question_planning": {
                 "enabled": self.planner is not None,
                 "model": self.settings.planning_model or self.settings.model,
+                "reasoning_effort": self.settings.planning_reasoning_effort,
             },
         }
 

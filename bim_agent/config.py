@@ -63,6 +63,9 @@ class Settings:
     pricing_overrides: dict[str, dict[str, float]] = field(default_factory=dict)
     enable_question_planning: bool = False
     planning_model: str | None = None
+    planning_reasoning_effort: str = "medium"
+    model_tool_reasoning_effort: str = "medium"
+    finalization_reasoning_effort: str = "low"
 
     @classmethod
     def from_env(
@@ -100,6 +103,15 @@ class Settings:
             pricing_overrides=pricing_overrides,
             enable_question_planning=_env_bool("BIM_ENABLE_QUESTION_PLANNING", True),
             planning_model=os.getenv("BIM_PLANNING_MODEL", "").strip() or model,
+            planning_reasoning_effort=os.getenv(
+                "BIM_PLANNING_REASONING_EFFORT", "medium"
+            ),
+            model_tool_reasoning_effort=os.getenv(
+                "BIM_MODEL_TOOL_REASONING_EFFORT", "medium"
+            ),
+            finalization_reasoning_effort=os.getenv(
+                "BIM_FINALIZATION_REASONING_EFFORT", "low"
+            ),
         )
 
 

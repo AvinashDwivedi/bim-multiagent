@@ -141,6 +141,33 @@ def test_gpt_56_enables_programmatic_tool_calling_with_scoped_callers(
     assert report.agent_loop["programmatic_tool_calling"] is True
 
 
+def test_resolved_preflight_removes_redundant_scope_and_review_tools(
+    sample_data: Path, tmp_path: Path, fake_client_factory,
+) -> None:
+    settings = Settings(
+        data_dir=sample_data,
+        trace_dir=tmp_path / "traces",
+        model="gpt-5.6-sol",
+        reasoning_effort="high",
+        max_agent_iterations=2,
+    )
+    agent = BimAgent(settings=settings, client=fake_client_factory(final_response(1, "Done.")))
+    tools = agent.agent._api_tools(planned_route={
+        "exposed_tool_names": [
+            "describe_bim_workspace", "query_bim_workspace",
+            "explore_object_scope", "review_scope_and_evidence",
+        ],
+        "scope_preflight_resolved": True,
+        "model_review_required": False,
+    })
+
+    names = {item.get("name") for item in tools}
+    assert "describe_bim_workspace" in names
+    assert "query_bim_workspace" in names
+    assert "explore_object_scope" not in names
+    assert "review_scope_and_evidence" not in names
+
+
 def test_programmatic_function_caller_is_preserved_on_tool_output(
     sample_data: Path, tmp_path: Path, fake_client_factory
 ) -> None:
@@ -237,6 +264,44 @@ def test_primary_agent_can_invoke_model_backed_evidence_review(
         if isinstance(item, dict) and item.get("type") == "function_call_output"
     )
     assert "Electrical Fixtures" in model_observation
+
+
+def test_scope_explorer_uses_bounded_structured_output(
+    sample_data: Path, tmp_path: Path, fake_client_factory,
+) -> None:
+    payload = {
+        "summary": "Two plausible populations.",
+        "candidate_scopes": [{
+            "label": "Primary",
+            "root_object_ids": ["7"],
+            "evidence": "Observed hierarchy label.",
+            "inclusions": ["descendants"],
+            "exclusions": [],
+            "possible_false_positives": [],
+            "next_check": "Count the selected descendants with SQL.",
+        }],
+        "unresolved_ambiguity": "",
+    }
+    settings = Settings(
+        data_dir=sample_data,
+        trace_dir=tmp_path / "traces",
+        model="gpt-5.4",
+        reasoning_effort="high",
+        max_agent_iterations=2,
+    )
+    client = fake_client_factory(final_response(1, json.dumps(payload)))
+    agent = BimAgent(settings=settings, client=client)
+
+    result = agent.agent.model_tools.execute("explore_object_scope", {
+        "question": "Which objects belong to this concept?",
+        "candidate_concepts": ["concept"],
+        "ambiguity_notes": "Two labels may overlap.",
+    })
+
+    request = client.responses.requests[0]
+    assert request["max_output_tokens"] == 1800
+    assert request["text"]["format"]["name"] == "bim_scope_options"
+    assert result["candidate_scopes"][0]["root_object_ids"] == ["7"]
 
 
 def test_structured_review_blocks_finalization_until_follow_up_is_re_reviewed(
