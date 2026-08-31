@@ -5,7 +5,7 @@ description: Route schema-aware BIM questions to read-only evidence, computation
 
 # BIM Tool Routing Rules
 
-Version: 1.3.0
+Version: 1.4.0
 
 These rules are runtime instructions for the BIM answer agent. They are deliberately kept outside the loop code so routing changes can be reviewed and tested independently.
 
@@ -18,7 +18,7 @@ The runtime also loads the companion contracts in this directory. They define po
 - Put references on every factual table row. Markdown headings and separator rows do not require references.
 - A citation must point to a tool observation that contains the stated value or fact. A tool call by itself is not evidence.
 - Project claims require project-tool evidence. `research_standards` is external standards evidence and cannot establish a fact about the project.
-- `explore_object_scope` and `review_scope_and_evidence` are model-assisted advice, not project observations. A category, exclusion, count, or other project fact must also cite a direct project-tool observation, regardless of answer language.
+- `review_scope_and_evidence` is model-assisted advice, not a project observation. A category, exclusion, count, or other project fact must also cite a direct project-tool observation, regardless of answer language.
 - If a claim cannot be grounded in a project-tool observation, do not state it as fact. Issue another tool call to verify it, or explicitly tell the engineer that the information is unavailable or unverified. Never guess or present an ungrounded claim as sourced.
 - Reconcile the selected population across the available tree, properties, and IFC identities before an exhaustive “all”/“every” claim, a ranking, a cross-source conclusion, or a compliance conclusion. A routine count over one clearly defined SQL population does not require reconciliation by itself. Reuse a completed reconciliation for the same selected population.
 - When a pageable result has `returned_count < total_count` and a non-null `cursor`, use `fetch_more` before making a claim that requires the complete population. Do not use raw pagination to compute totals over a large population: after at most five continuation calls, use `query_bim_workspace` aggregate functions or narrow the inspection query.
@@ -37,7 +37,7 @@ Do not use `calculate` to derive an aggregate directly from project records. Do 
 ## BIM domain checks
 
 - Never assume a fixed tree depth identifies physical instances.
-- When an element category, location, or property name is ambiguous, use `explore_object_scope` before querying the selected project population. Before finalizing an answer that depends on that scope decision, use `review_scope_and_evidence` with the selected scope, alternatives, exclusions, evidence, reconciliation, and draft.
+- When an element category, location, or property name is ambiguous, query candidate hierarchy paths, authored types, counts, and representative IDs directly with `query_bim_workspace`, `list_tree_children`, or record tools. Keep this inspection bounded and prefer one compact candidate-summary query. Before finalizing an answer that depends on that scope decision, use `review_scope_and_evidence` with the selected scope, alternatives, exclusions, direct evidence, reconciliation, and draft.
 - If project tools cannot resolve a material ambiguity, ask the engineer one concise clarifying question instead of guessing the scope.
 - Preserve distinct dimension axes and units. IFC geometry uses the project units declared by `IfcUnitAssignment`; confirm those units before comparing IFC geometry with JSON exports. Treat JSON units as source-specific unless an explicit unit accompanies the value, and convert only after both source units are known.
 - When sources disagree about the same property for the same resolved element identity, do not silently choose one value. Report the conflicting values with separate references and source labels, check whether units, identity mapping, or provenance resolves the disagreement, and otherwise mark it unresolved.

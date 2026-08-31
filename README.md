@@ -40,7 +40,7 @@ The application exposes generic read-only project capabilities plus model-backed
 - `rank_ifc_geometry`: complete-population mesh ranking by volume, area, or an explicit X/Y/Z extent.
 - `reconcile_populations`: identity/count reconciliation for model-selected populations, overlaps, duplicates, and missing IDs.
 - `analyze_ifc_graph`: direction- and role-aware traversal of named IFC relationships with evidence paths.
-- `explore_object_scope`: a model-backed hierarchy explorer that proposes competing scopes without fixed-depth rules.
+- Ambiguous scopes are resolved from direct SQL, hierarchy paths, authored types, counts, and representative project records; unresolved material alternatives are reported or clarified.
 - `review_scope_and_evidence`: a model-backed critic that challenges omissions, duplicates, identities, conflicting
   evidence, exclusions, and unreconciled totals without consulting expected answers.
 - `research_standards`: model-directed web research for external codes and standards, kept separate from project facts.
@@ -80,7 +80,8 @@ python -m pip install -e ".[test]"
 Copy-Item .env.example .env
 ```
 
-`OPENAI_API_KEY` is required. There is intentionally no deterministic or offline answer path.
+`OPENAI_API_KEY` is required for primary planning and answering. Runtime-limit handling is deterministic and does
+not make an additional model request.
 
 ```dotenv
 OPENAI_API_KEY=
@@ -91,7 +92,6 @@ BIM_ENABLE_QUESTION_PLANNING=true
 BIM_PLANNING_MODEL=
 BIM_PLANNING_REASONING_EFFORT=medium
 BIM_MODEL_TOOL_REASONING_EFFORT=medium
-BIM_FINALIZATION_REASONING_EFFORT=low
 BIM_DATA_DIR=test-project-data
 BIM_PROJECTS_ROOT=
 BIM_TRACE_DIR=logs/traces
@@ -162,7 +162,7 @@ The trace carries a session ID and the full model/tool transcript (with secret-k
 cached-call markers, automatic reconciliation, and untrimmed tool observations.
 
 Every report also includes `cost`, which totals token usage across all Responses API calls needed for that answer,
-including nested scope exploration, evidence review, and standards research. It reports USD list-price estimates,
+including nested evidence review and standards research. It reports USD list-price estimates,
 cached/uncached input tokens, output tokens, per-request breakdowns, pricing date/source, and whether the estimate is
 complete. GPT-5.4 and GPT-5.6 Sol defaults follow their official model pages. Unknown/private model prices can be
 supplied with `BIM_MODEL_PRICING_JSON`; tool-specific fees such as web search are listed as excluded rather than
@@ -170,10 +170,10 @@ silently reported as zero. Local Docker execution has no OpenAI tool fee.
 `BIM_MAX_ANSWER_COST_USD` is an opt-in guard. It defaults to `0` (disabled) while real question-cost distributions
 are collected; set a positive amount only after choosing a threshold from observed workloads. When enabled, it stops
 further investigation once the running list-price estimate reaches the configured amount. It then preserves an
-already-produced answer or permits one bounded, tool-disabled best-effort finalization from accumulated evidence and
-appends the canonical budget notice. That finalization is included in the cost report. The completed request may exceed
-the threshold because usage is available only after a request returns and the terminal synthesis is intentionally
-allowed after the trigger. Stable prompt-cache keys and compact model-facing observations reduce repeated input.
+already-produced grounded answer, deterministically salvages its supported cited portion when needed, and appends the
+canonical budget notice. It never makes a separate finalization model call. The completed request may exceed the
+threshold because usage is available only after a request returns. Stable prompt-cache keys and relevance-pruned
+cross-iteration observations reduce repeated input.
 Retryable upstream failures are returned as HTTP 503 with a structured `retryable` flag. The health response
 reports whether the local Docker runtime and configured image are ready. A local container is created only if the
 model calls `run_local_python`, and it is removed immediately after the call.

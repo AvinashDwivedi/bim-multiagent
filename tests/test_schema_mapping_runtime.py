@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 
-from bim_agent.agent_loop import _completion_issues, _ensure_interpretation_disclosure
+from bim_agent.agent_loop import _ensure_interpretation_disclosure
 
 
 def _schema_mapped_plan() -> dict:
@@ -52,45 +52,6 @@ def _schema_mapped_plan() -> dict:
             "binding": "observed_schema_mapping",
         }],
     }
-
-
-def _route() -> dict:
-    return {
-        "answer_shape": "count",
-        "requirements_enforced": True,
-        "required_capabilities": [],
-        "required_sources": [],
-    }
-
-
-def test_schema_grounded_mapping_requires_scope_exploration_before_completion() -> None:
-    plan = _schema_mapped_plan()
-    otherwise_complete_categories = {"schema", "sql", "review"}
-
-    issues_without_scope = _completion_issues(
-        "כמה מפסקים בפרויקט?",
-        tool_categories=otherwise_complete_categories,
-        outstanding_cursors=set(),
-        interpretation_plan=plan,
-        reconciliation_required=False,
-        reconciliation_status="matched",
-        route=_route(),
-    )
-
-    assert any("explore_object_scope" in issue for issue in issues_without_scope)
-
-    issues_with_scope = _completion_issues(
-        "כמה מפסקים בפרויקט?",
-        tool_categories={*otherwise_complete_categories, "scope"},
-        outstanding_cursors=set(),
-        interpretation_plan=plan,
-        reconciliation_required=False,
-        reconciliation_status="matched",
-        route=_route(),
-    )
-
-    assert not any("explore_object_scope" in issue for issue in issues_with_scope)
-    assert issues_with_scope == []
 
 
 def test_interpretation_disclosure_renders_only_typed_schema_mapping_fields() -> None:

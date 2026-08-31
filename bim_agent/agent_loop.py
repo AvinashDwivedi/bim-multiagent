@@ -62,17 +62,21 @@ provided with the request. Treat its validated population, metric, unit, relatio
 execution constraints, but never as project evidence. Decide which permitted tools to call, in which order, and
 when the investigation is finished.
 
+Work quickly and efficiently. Prefer a brief answer; add detail only when it is necessary to establish the result,
+explain a material ambiguity or limitation, or support an engineering decision. Prefer compact certifying queries
+and reuse relevant observations instead of repeating exploration.
+
 Ground every project claim in the supplied read-only tools. Begin by inspecting or searching the project when
 you need project facts. You may revisit tools, change interpretation, inspect counterexamples, retrieve raw
 evidence, or omit a claim that remains unsupported. Never replace supported findings with a blanket refusal:
 when some checks remain unresolved, return the strongest cited partial answer and state its limitation.
-records, search IFC relationships, and calculate as often as useful. For project filters, joins, counts, and
+Search records, inspect IFC relationships, and calculate as often as useful. For project filters, joins, counts, and
 aggregates, use the read-only SQL workspace; use calculate only for arithmetic over values already retrieved.
 Distinguish hierarchy/definition records from
 physical instances using the evidence you inspect; do not assume a category boundary without looking at paths
 and properties. Treat the three supplied files as the available project scope and disclose material uncertainty.
-Scope explorers and evidence reviewers are model-assisted advice, not project observations: cite a direct project
-tool as well for every category, exclusion, count, or other project fact, in every language.
+Evidence reviewers are model-assisted advice, not project observations: cite a direct project tool as well for
+every category, exclusion, count, or other project fact, in every language.
 Do not assume the files are current or mutually synchronized. When revision/export metadata is unavailable, scope
 the answer to the loaded snapshot. If JSON properties and IFC data disagree for the same resolved identity and
 concept, report both source-labelled values and treat the conflict as unresolved unless units or provenance explain it.
@@ -82,8 +86,10 @@ query_bim_workspace. Return grouped counts and totals in the same compact SQL ob
 state both; every cited total must occur literally in its cited observation. Do not retrieve individual leaves when
 an aggregate plus a few representative IDs will answer the question. Use named IFC tables and identity candidates before raw IFC text. Never assume a fixed tree
 depth identifies instances, and never treat a repeated GUID or property value as proof that physical records are
-duplicates. When a concept or category boundary is ambiguous, use explore_object_scope and then
-choose among its alternatives yourself. Use analyze_ifc_geometry whenever placement, actual dimensions, area,
+duplicates. When a concept or category boundary is ambiguous, inspect candidate hierarchy paths, authored types,
+counts, and representative IDs directly with SQL or hierarchy tools. If direct project evidence cannot resolve a
+material ambiguity, report the alternatives or ask one concise clarifying question. Use analyze_ifc_geometry
+whenever placement, actual dimensions, area,
 volume, or spatial containment matters; compare geometry-derived and property-derived data. Use rank_ifc_geometry
 for largest/smallest/longest comparisons across a population. Preserve every material dimension axis: do not merge
 objects that share width but differ in height, depth, material, type, or unit unless you explicitly disclose that
@@ -155,7 +161,6 @@ class ModelDirectedBimAgent:
         local_python_output_chars: int,
         python_cache_root: Path,
         model_tool_reasoning_effort: str,
-        finalization_reasoning_effort: str,
         openai_max_retries: int = 4,
         openai_timeout_seconds: float = 180.0,
         pricing_overrides: dict[str, dict[str, float]] | None = None,
@@ -180,7 +185,6 @@ class ModelDirectedBimAgent:
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.model_tool_reasoning_effort = model_tool_reasoning_effort
-        self.finalization_reasoning_effort = finalization_reasoning_effort
         self.max_iterations = max(1, max_iterations)
         self.max_tool_output_chars = max(2000, max_tool_output_chars)
         self.max_answer_cost_usd = max(0.0, float(max_answer_cost_usd))
@@ -303,6 +307,9 @@ class ModelDirectedBimAgent:
         population_mismatch_observed = False
         disclosure_state: dict[str, dict[str, Any]] = {}
         citation_repairs: list[dict[str, Any]] = []
+        context_compactions: list[dict[str, Any]] = []
+        latest_iteration_call_ids: set[str] = set()
+        latest_response_items: list[Any] = []
         usage_records: list[dict[str, Any]] = (
             [copy.deepcopy(item) for item in question_plan.all_usage_records]
             if question_plan is not None
@@ -326,6 +333,22 @@ class ModelDirectedBimAgent:
         )
 
         for iteration in range(1, self.max_iterations + 1):
+            if iteration > 1:
+                input_items, compaction = _compact_iteration_context(
+                    input_items,
+                    evidence=evidence,
+                    evidence_aliases=evidence_aliases,
+                    grounded_checkpoint=best_grounded_candidate,
+                    latest_call_ids=latest_iteration_call_ids,
+                    latest_response_items=latest_response_items,
+                    max_observation_characters=max(
+                        24_000, min(160_000, self.max_tool_output_chars * 2)
+                    ),
+                )
+                compaction["iteration"] = iteration
+                context_compactions.append(compaction)
+                if compaction["dropped_items"]:
+                    trace.event("iteration_context_compacted", **compaction)
             try:
                 response = self.client.responses.create(
                     model=self.model,
@@ -353,6 +376,7 @@ class ModelDirectedBimAgent:
             if response_id:
                 response_ids.append(response_id)
             output = list(getattr(response, "output", []) or [])
+            latest_response_items = list(output)
             calls = [item for item in output if getattr(item, "type", None) == "function_call"]
             candidate_answer = str(getattr(response, "output_text", "") or "").strip()
             python_calls: list[dict[str, Any]] = []
@@ -388,26 +412,19 @@ class ModelDirectedBimAgent:
                 limit_usd=self.max_answer_cost_usd,
                 pricing_overrides=self.pricing_overrides,
             )
-            # A no-tool draft is grounded and checkpointed below before a budget
-            # stop can replace it. Tool calls still stop before execution.
+            # A no-tool draft is grounded and checkpointed below before a runtime
+            # limit can stop execution. Tool calls stop before execution.
             if response_cost_limit_reached and (calls or not candidate_answer):
                 cost_budget_exceeded = True
                 termination_reason = "cost_budget_exceeded"
-                final_answer, budget_metadata, disclosure_state, current_repairs = self._budget_answer(
+                final_answer, stop_metadata, disclosure_state, current_repairs = self._deterministic_limit_answer(
                     question=question,
-                    input_items=(
-                        [*input_items, *output]
-                        if not calls and not candidate_answer and output
-                        else input_items
-                    ),
                     candidate_answer=best_grounded_candidate,
                     evidence=evidence,
                     evidence_aliases=evidence_aliases,
                     disclosure_codes=review_required_disclosures,
                     require_disclaimer=unverified_disclaimer_required,
                     trace=trace,
-                    usage_records=usage_records,
-                    response_ids=response_ids,
                     iteration=iteration,
                     trigger="before_tool_execution" if calls else "after_answer_generation",
                 )
@@ -415,8 +432,8 @@ class ModelDirectedBimAgent:
                 iterations.append({
                     "iteration": iteration,
                     "response_id": response_id,
-                    "action": "cost_budget_answer",
-                    "budget_finalization": budget_metadata,
+                    "action": "deterministic_cost_stop",
+                    "deterministic_stop": stop_metadata,
                     "python_calls": python_calls,
                 })
                 break
@@ -556,17 +573,14 @@ class ModelDirectedBimAgent:
                             cost_budget_exceeded = True
                             termination_reason = "cost_budget_exceeded"
                             if best_grounded_candidate:
-                                final_answer, budget_metadata, disclosure_state, current_repairs = self._budget_answer(
+                                final_answer, stop_metadata, disclosure_state, current_repairs = self._deterministic_limit_answer(
                                     question=question,
-                                    input_items=input_items,
                                     candidate_answer=best_grounded_candidate,
                                     evidence=evidence,
                                     evidence_aliases=evidence_aliases,
                                     disclosure_codes=review_required_disclosures,
                                     require_disclaimer=unverified_disclaimer_required,
                                     trace=trace,
-                                    usage_records=usage_records,
-                                    response_ids=response_ids,
                                     iteration=iteration,
                                     trigger="after_grounding_rejection",
                                 )
@@ -575,20 +589,17 @@ class ModelDirectedBimAgent:
                                 final_answer = _append_budget_notice(
                                     _no_supported_partial_notice(question), question
                                 )
-                                budget_metadata = {
+                                stop_metadata = {
                                     "trigger": "after_grounding_rejection",
-                                    "finalization_attempted": False,
-                                    "generated": False,
-                                    "fallback_used": True,
-                                    "response_id": "",
-                                    "generation_error": None,
+                                    "deterministic": True,
+                                    "source": "no_supported_checkpoint",
                                     "grounding_issues": grounding_issues,
                                 }
                             iterations.append({
                                 "iteration": iteration,
                                 "response_id": response_id,
-                                "action": "cost_budget_answer",
-                                "budget_finalization": budget_metadata,
+                                "action": "deterministic_cost_stop",
+                                "deterministic_stop": stop_metadata,
                                 "issues": grounding_issues,
                                 "python_calls": python_calls,
                             })
@@ -685,17 +696,14 @@ class ModelDirectedBimAgent:
                     if response_cost_limit_reached:
                         cost_budget_exceeded = True
                         termination_reason = "cost_budget_exceeded"
-                        final_answer, budget_metadata, disclosure_state, current_repairs = self._budget_answer(
+                        final_answer, stop_metadata, disclosure_state, current_repairs = self._deterministic_limit_answer(
                             question=question,
-                            input_items=input_items,
                             candidate_answer=best_grounded_candidate,
                             evidence=evidence,
                             evidence_aliases=evidence_aliases,
                             disclosure_codes=review_required_disclosures,
                             require_disclaimer=unverified_disclaimer_required,
                             trace=trace,
-                            usage_records=usage_records,
-                            response_ids=response_ids,
                             iteration=iteration,
                             trigger="after_answer_generation",
                         )
@@ -703,8 +711,8 @@ class ModelDirectedBimAgent:
                         iterations.append({
                             "iteration": iteration,
                             "response_id": response_id,
-                            "action": "cost_budget_answer",
-                            "budget_finalization": budget_metadata,
+                            "action": "deterministic_cost_stop",
+                            "deterministic_stop": stop_metadata,
                             "checkpoint_iteration": best_grounded_candidate_iteration,
                             "python_calls": python_calls,
                         })
@@ -1015,6 +1023,11 @@ class ModelDirectedBimAgent:
                 "calls": call_records,
                 "python_calls": python_calls,
             })
+            latest_iteration_call_ids = {
+                str(record.get("call_id") or "")
+                for record in call_records
+                if record.get("call_id")
+            }
             routine_query_limit = int(route.get("routine_query_limit") or 0)
             routine_reconciliation_ready = (
                 not reconciliation_required or "reconciliation" in tool_categories
@@ -1035,7 +1048,7 @@ class ModelDirectedBimAgent:
                 input_items.append({
                     "role": "developer",
                     "content": (
-                        "The SQL evidence budget is complete. The only remaining permitted operation is the "
+                        "The bounded SQL phase is complete. The only remaining permitted operation is the "
                         "required population reconciliation. Reconcile the already selected record object IDs "
                         "once; do not broaden the requested metric or inspect unrelated identity namespaces."
                     ),
@@ -1058,7 +1071,7 @@ class ModelDirectedBimAgent:
                 input_items.append({
                     "role": "developer",
                     "content": (
-                        "The bounded evidence budget for this resolved population summary is complete. "
+                        "The bounded evidence phase for this resolved population summary is complete. "
                         "No more tools are available. Answer now from the non-truncated SQL and reconciliation "
                         "observations already collected. State the exact identity namespace when describing "
                         "matching or missing identifiers, preserve material exclusions, and omit unrelated "
@@ -1079,23 +1092,20 @@ class ModelDirectedBimAgent:
             ):
                 cost_budget_exceeded = True
                 termination_reason = "cost_budget_exceeded"
-                final_answer, budget_metadata, disclosure_state, current_repairs = self._budget_answer(
+                final_answer, stop_metadata, disclosure_state, current_repairs = self._deterministic_limit_answer(
                     question=question,
-                    input_items=input_items,
                     candidate_answer=best_grounded_candidate,
                     evidence=evidence,
                     evidence_aliases=evidence_aliases,
                     disclosure_codes=review_required_disclosures,
                     require_disclaimer=unverified_disclaimer_required,
                     trace=trace,
-                    usage_records=usage_records,
-                    response_ids=response_ids,
                     iteration=iteration,
                     trigger="after_tool_execution",
                 )
                 citation_repairs.extend(current_repairs)
-                iterations[-1]["action"] = "cost_budget_answer"
-                iterations[-1]["budget_finalization"] = budget_metadata
+                iterations[-1]["action"] = "deterministic_cost_stop"
+                iterations[-1]["deterministic_stop"] = stop_metadata
                 break
 
         if not final_answer and best_grounded_candidate:
@@ -1217,6 +1227,7 @@ class ModelDirectedBimAgent:
                 "grounding_content_forced": grounding_content_forced,
                 "grounding_format_forced": grounding_format_forced,
                 "citation_repairs": citation_repairs,
+                "context_compactions": context_compactions,
                 "review_seen": review_seen,
                 "review_can_finalize": review_can_finalize,
                 "review_stale": review_stale,
@@ -1239,82 +1250,23 @@ class ModelDirectedBimAgent:
             },
         )
 
-    def _budget_answer(
+    def _deterministic_limit_answer(
         self,
         *,
         question: str,
-        input_items: list[Any],
         candidate_answer: str,
         evidence: dict[str, dict[str, Any]],
         evidence_aliases: dict[str, str],
         disclosure_codes: list[str],
         require_disclaimer: bool,
         trace: TraceLog,
-        usage_records: list[dict[str, Any]],
-        response_ids: list[str],
         iteration: int,
         trigger: str,
     ) -> tuple[str, dict[str, Any], dict[str, dict[str, Any]], list[dict[str, Any]]]:
-        """Produce one bounded, no-tools answer from accumulated evidence when investigation spending stops."""
+        """Finalize from accumulated evidence without another model or tool request."""
         draft = candidate_answer.strip()
-        generated_response_id = ""
-        generation_error = ""
-        finalization_attempted = not bool(draft)
-        generated = False
-        if not draft:
-            try:
-                response = self.client.responses.create(
-                    model=self.model,
-                    instructions=(
-                        AGENT_INSTRUCTIONS
-                        + "\nThe investigation cost budget is exhausted. Do not call any tool. Give a concise "
-                          "best-effort answer using only observations already present in the input. Cite every "
-                          "factual sentence with an existing [ref: call_id]. State that a requested value is "
-                          "unavailable when the observations do not establish it. Do not write disclosure or "
-                          "cost-budget notices; the runtime appends them."
-                    ),
-                    input=[
-                        *input_items,
-                        {
-                            "role": "user",
-                            "content": (
-                                "Stop investigating and answer now from the evidence already collected. "
-                                "Do not request or call another tool."
-                            ),
-                        },
-                    ],
-                    reasoning={"effort": self.finalization_reasoning_effort},
-                    store=False,
-                    max_output_tokens=1200,
-                    prompt_cache_key=f"{self.prompt_cache_key}-budget"[:64],
-                    timeout=self.openai_timeout_seconds,
-                )
-                usage_records.append(response_usage_record(
-                    response,
-                    configured_model=self.model,
-                    purpose="budget_finalization",
-                ))
-                generated_response_id = str(getattr(response, "id", "") or "")
-                if generated_response_id:
-                    response_ids.append(generated_response_id)
-                draft = str(getattr(response, "output_text", "") or "").strip()
-                generated = bool(draft)
-                trace.transcript(
-                    "assistant",
-                    response_id=generated_response_id,
-                    text=draft,
-                    function_calls=[],
-                    budget_finalization=True,
-                )
-            except Exception as exc:
-                generation_error = f"{type(exc).__name__}: {exc}"
-                trace.event(
-                    "budget_finalization_error",
-                    iteration=iteration,
-                    error_type=type(exc).__name__,
-                    message=str(exc),
-                )
         draft = _strip_runtime_notices(draft)
+        source = "grounded_checkpoint" if draft else "no_supported_checkpoint"
         if not draft:
             draft = _no_supported_partial_notice(question)
         if require_disclaimer and UNVERIFIED_STANDARDS_DISCLAIMER not in draft:
@@ -1363,11 +1315,8 @@ class ModelDirectedBimAgent:
         final_answer = _append_budget_notice(draft, question)
         metadata = {
             "trigger": trigger,
-            "finalization_attempted": finalization_attempted,
-            "generated": generated,
-            "fallback_used": finalization_attempted and not generated,
-            "response_id": generated_response_id,
-            "generation_error": generation_error or None,
+            "deterministic": True,
+            "source": source,
             "grounding_issues": grounding_issues,
             "partial_salvage_used": partial_salvage_used,
         }
@@ -1403,8 +1352,6 @@ class ModelDirectedBimAgent:
             # The deprecated aggregate tool is never restored by a plan; SQL is
             # the single certifying path for JSON-backed aggregates.
             allowed.discard("aggregate_records")
-            if planned_route.get("scope_preflight_resolved"):
-                allowed.discard("explore_object_scope")
             if not planned_route.get("model_review_required", True):
                 allowed.discard("review_scope_and_evidence")
             if planned_route.get("direct_sql_population_summary"):
@@ -1472,6 +1419,11 @@ class ModelDirectedBimAgent:
 _REF_RE = re.compile(r"\[ref:\s*([A-Za-z0-9_.:-]+)\s*\]", re.IGNORECASE)
 _SPACED_REF_RE = re.compile(r"\s*\[ref:\s*[A-Za-z0-9_.:-]+\s*\]", re.IGNORECASE)
 _NUMBER_RE = re.compile(r"(?<![A-Za-z_])-?\d+(?:,\d{3})*(?:\.\d+)?")
+_SINGLETON_CONTEXT_TOOLS = {
+    "describe_bim_workspace",
+    "inspect_project",
+    "review_scope_and_evidence",
+}
 _NUMBER_WORD_VALUES = {
     "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
     "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
@@ -1496,6 +1448,180 @@ _HEBREW_DATA_OPERATION_TERMS = re.compile(
     "\u05de\u05de\u05d5\u05e6\u05e2|\u05de\u05d9\u05e0\u05d9\u05de\u05d5\u05dd|\u05de\u05e7\u05e1\u05d9\u05de\u05d5\u05dd|"
     "\u05dc\u05e4\u05d9|\u05e6\u05e4\u05d9\u05e4\u05d5\u05ea)"
 )
+
+
+def _compact_iteration_context(
+    input_items: list[Any],
+    *,
+    evidence: dict[str, dict[str, Any]],
+    evidence_aliases: dict[str, str],
+    grounded_checkpoint: str,
+    latest_call_ids: set[str],
+    latest_response_items: list[Any],
+    max_observation_characters: int,
+) -> tuple[list[Any], dict[str, Any]]:
+    """Retain only useful cross-iteration state while preserving tool call/output pairs.
+
+    The original question and planning constraints are always retained. Successful
+    observations are deduplicated, state-inventory/review observations are superseded
+    by their newest version, checkpoint-cited evidence is pinned, and the newest tool
+    result (including an error) survives so the agent can react without repeating it.
+    Opaque response-control items are carried for only their immediately associated
+    follow-up; stale response-control items and draft/repair exchanges are dropped.
+    """
+    if not input_items:
+        return [], {
+            "input_items": 0,
+            "retained_items": 0,
+            "dropped_items": 0,
+            "retained_tool_observations": 0,
+            "dropped_tool_observations": 0,
+            "retained_observation_characters": 0,
+        }
+
+    calls: dict[str, dict[str, Any]] = {}
+    outputs: dict[str, dict[str, Any]] = {}
+    for index, item in enumerate(input_items):
+        item_type = _context_item_value(item, "type")
+        if item_type == "function_call":
+            call_id = str(_context_item_value(item, "call_id") or "")
+            if call_id:
+                calls[call_id] = {
+                    "index": index,
+                    "name": str(_context_item_value(item, "name") or ""),
+                    "arguments": _canonical_context_arguments(
+                        _context_item_value(item, "arguments")
+                    ),
+                }
+        elif item_type == "function_call_output" and isinstance(item, dict):
+            call_id = str(item.get("call_id") or "")
+            if call_id:
+                outputs[call_id] = {
+                    "index": index,
+                    "characters": len(str(item.get("output") or "")),
+                }
+
+    pinned_call_ids = {
+        evidence_aliases.get(reference, reference)
+        for reference in _REF_RE.findall(grounded_checkpoint or "")
+    }
+    pinned_call_ids &= set(calls) & set(outputs)
+    successful_call_ids = set(evidence) & set(calls) & set(outputs)
+
+    # Exact repeated calls add no new execution state. Keep a cited occurrence;
+    # otherwise keep the newest successful occurrence.
+    by_signature: dict[tuple[str, str], list[str]] = {}
+    for call_id in successful_call_ids:
+        call = calls[call_id]
+        by_signature.setdefault((call["name"], call["arguments"]), []).append(call_id)
+    selected_call_ids: set[str] = set(pinned_call_ids)
+    for group in by_signature.values():
+        pinned_group = [call_id for call_id in group if call_id in pinned_call_ids]
+        if pinned_group:
+            selected_call_ids.update(pinned_group)
+        else:
+            selected_call_ids.add(max(group, key=lambda call_id: outputs[call_id]["index"]))
+
+    # Workspace inventories and reviews are snapshots. Older uncited snapshots are
+    # superseded by the newest successful call of the same kind.
+    for tool_name in _SINGLETON_CONTEXT_TOOLS:
+        matching = [
+            call_id for call_id in selected_call_ids
+            if calls[call_id]["name"] == tool_name and call_id not in pinned_call_ids
+        ]
+        if len(matching) > 1:
+            newest = max(matching, key=lambda call_id: outputs[call_id]["index"])
+            selected_call_ids.difference_update(set(matching) - {newest})
+
+    # Always let the agent see the immediately preceding execution result. This is
+    # especially important for one failed call, which is intentionally not evidence.
+    selected_call_ids.update(set(latest_call_ids) & set(calls) & set(outputs))
+    failed_call_ids = (set(calls) & set(outputs)) - successful_call_ids
+    if failed_call_ids:
+        selected_call_ids.add(max(failed_call_ids, key=lambda call_id: outputs[call_id]["index"]))
+
+    # Bound carried observation text. Pinned citations and the latest execution are
+    # mandatory; remaining observations are admitted newest-first until the cap.
+    mandatory = pinned_call_ids | (set(latest_call_ids) & selected_call_ids)
+    bounded_selection = set(mandatory)
+    used_characters = sum(outputs[call_id]["characters"] for call_id in mandatory)
+    optional = sorted(
+        selected_call_ids - mandatory,
+        key=lambda call_id: outputs[call_id]["index"],
+        reverse=True,
+    )
+    for call_id in optional:
+        characters = outputs[call_id]["characters"]
+        if used_characters + characters <= max_observation_characters or not bounded_selection:
+            bounded_selection.add(call_id)
+            used_characters += characters
+    selected_call_ids = bounded_selection
+
+    keep_indices: set[int] = set()
+    latest_response_item_ids = {id(item) for item in latest_response_items}
+    ordinary_user_indices: list[int] = []
+    assistant_indices: list[int] = []
+    program_indices: list[int] = []
+    for index, item in enumerate(input_items):
+        item_type = _context_item_value(item, "type")
+        role = str(_context_item_value(item, "role") or "")
+        content = str(_context_item_value(item, "content") or "")
+        if id(item) in latest_response_item_ids:
+            # Responses reasoning/program control items may be required alongside
+            # the immediately associated function-call outputs. Keep them for one
+            # turn only; they are not accumulated as durable evidence.
+            keep_indices.add(index)
+        elif index == 0 or role == "developer":
+            keep_indices.add(index)
+        elif role == "user":
+            if content.startswith("Automatic population reconciliation observation"):
+                keep_indices.add(index)
+            else:
+                ordinary_user_indices.append(index)
+        elif role == "assistant":
+            assistant_indices.append(index)
+        elif item_type in {"program", "program_output"}:
+            program_indices.append(index)
+
+    # Preserve only the latest repair/continuation exchange, not every stale draft.
+    if ordinary_user_indices:
+        keep_indices.add(ordinary_user_indices[-1])
+    if assistant_indices:
+        latest_assistant = assistant_indices[-1]
+        if any(index > latest_assistant for index in ordinary_user_indices):
+            keep_indices.add(latest_assistant)
+    if program_indices:
+        keep_indices.add(program_indices[-1])
+
+    for call_id in selected_call_ids:
+        keep_indices.add(calls[call_id]["index"])
+        keep_indices.add(outputs[call_id]["index"])
+
+    compacted = [item for index, item in enumerate(input_items) if index in keep_indices]
+    all_observation_ids = set(calls) & set(outputs)
+    return compacted, {
+        "input_items": len(input_items),
+        "retained_items": len(compacted),
+        "dropped_items": len(input_items) - len(compacted),
+        "retained_tool_observations": len(selected_call_ids),
+        "dropped_tool_observations": len(all_observation_ids - selected_call_ids),
+        "retained_observation_characters": used_characters,
+    }
+
+
+def _context_item_value(item: Any, field: str) -> Any:
+    if isinstance(item, dict):
+        return item.get(field)
+    return getattr(item, field, None)
+
+
+def _canonical_context_arguments(value: Any) -> str:
+    raw = str(value or "{}")
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return raw
+    return json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _is_project_question(value: str) -> bool:
@@ -1549,7 +1675,6 @@ def _tool_category(name: str) -> str:
         "rank_ifc_geometry": "geometry",
         "analyze_ifc_graph": "graph",
         "reconcile_populations": "reconciliation",
-        "explore_object_scope": "scope",
         "review_scope_and_evidence": "review",
         "research_standards": "standards",
         "run_local_python": "custom_compute",
@@ -1673,14 +1798,17 @@ def _completion_issues(
     ))
     scope_preflight_resolved = bool(route and route.get("scope_preflight_resolved"))
     model_review_required = bool(route and route.get("model_review_required", True))
+    direct_scope_evidence = bool({"sql", "hierarchy", "records"} & substantive)
     if (
         project_question and ambiguous_scope and not scope_preflight_resolved
-        and "scope" not in tool_categories
+        and not direct_scope_evidence
     ):
-        issues.append("the ambiguous category, location, or property boundary with explore_object_scope")
+        issues.append(
+            "the ambiguous category, location, or property boundary with direct SQL or hierarchy evidence"
+        )
     if (
         project_question and ambiguous_scope and model_review_required
-        and (scope_preflight_resolved or "scope" in tool_categories)
+        and (scope_preflight_resolved or direct_scope_evidence)
         and "review" not in tool_categories
     ):
         issues.append("the chosen ambiguous scope with review_scope_and_evidence")
@@ -2052,7 +2180,7 @@ def _evidence_class(name: str, result: dict[str, Any] | None) -> str:
         return "derived_calculation"
     if name == "run_local_python":
         return "project"
-    if name in {"explore_object_scope", "review_scope_and_evidence"}:
+    if name == "review_scope_and_evidence":
         return "model_review"
     return "project"
 
@@ -2060,7 +2188,7 @@ def _evidence_class(name: str, result: dict[str, Any] | None) -> str:
 def _needs_reconciliation(name: str, result: dict[str, Any]) -> bool:
     if name in {
         "reconcile_populations", "calculate", "run_local_python", "describe_bim_workspace",
-        "explore_object_scope", "review_scope_and_evidence", "research_standards",
+        "review_scope_and_evidence", "research_standards",
     }:
         return False
     if result.get("truncated") or result.get("cursor"):

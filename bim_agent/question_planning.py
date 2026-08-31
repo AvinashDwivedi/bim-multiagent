@@ -64,7 +64,6 @@ _BASE_READ_ONLY_TOOLS = {
     "describe_bim_workspace",
     "query_bim_workspace",
     "reconcile_populations",
-    "explore_object_scope",
     "review_scope_and_evidence",
 }
 _CAPABILITY_TOOLS = {

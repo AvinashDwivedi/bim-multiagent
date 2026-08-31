@@ -15,6 +15,7 @@ from bim_agent.agent_loop import (
     _append_budget_notice,
     _append_partial_notice,
     _classify_route,
+    _completion_issues,
     _disclosure_present,
     _ensure_review_disclosures,
     _grounding_issues,
@@ -33,6 +34,31 @@ from bim_agent.model_tools import UNVERIFIED_STANDARDS_DISCLAIMER
 from bim_agent.project_tools import RawProjectTools
 
 from conftest import final_response, function_call, tool_response
+
+
+def test_ambiguous_scope_uses_direct_project_evidence_instead_of_model_advice() -> None:
+    route = {
+        "scope_preflight_resolved": False,
+        "model_review_required": True,
+        "requirements_enforced": False,
+    }
+    missing = _completion_issues(
+        "Which categories are in this project?",
+        tool_categories={"schema"},
+        outstanding_cursors=set(),
+        route=route,
+        reconciliation_required=False,
+    )
+    resolved = _completion_issues(
+        "Which categories are in this project?",
+        tool_categories={"schema", "sql", "review"},
+        outstanding_cursors=set(),
+        route=route,
+        reconciliation_required=False,
+    )
+
+    assert any("direct SQL or hierarchy evidence" in issue for issue in missing)
+    assert resolved == []
 
 
 def test_partial_notices_follow_the_question_language_and_do_not_duplicate() -> None:
@@ -873,14 +899,20 @@ def test_cost_guard_stops_before_another_tool_execution(
     assert report.agent_loop["termination_reason"] == "cost_budget_exceeded"
     assert report.cost["budget_usd"] == 0.001
     assert report.cost["budget_exceeded"] is True
-    assert report.agent_loop["iterations"][0]["action"] == "cost_budget_answer"
-    assert report.agent_loop["iterations"][0]["budget_finalization"]["trigger"] == "before_tool_execution"
+    assert report.agent_loop["iterations"][0]["action"] == "deterministic_cost_stop"
+    assert report.agent_loop["iterations"][0]["deterministic_stop"] == {
+        "trigger": "before_tool_execution",
+        "deterministic": True,
+        "source": "no_supported_checkpoint",
+        "grounding_issues": [],
+        "partial_salvage_used": False,
+    }
     assert executions == []
-    assert "tools" not in client.responses.requests[1]
+    assert len(client.responses.requests) == 1
     assert report.answer.endswith(COST_BUDGET_NOTICE)
     assert report.answer.count(COST_BUDGET_NOTICE) == 1
     assert [item["purpose"] for item in report.cost["request_breakdown"]] == [
-        "agent_turn", "budget_finalization",
+        "agent_turn",
     ]
 
 
@@ -908,9 +940,10 @@ def test_final_candidate_that_crosses_budget_is_preserved_without_an_extra_reque
     assert report.answer.startswith("Best available answer.")
     assert report.answer.endswith(COST_BUDGET_NOTICE)
     assert report.answer.count(COST_BUDGET_NOTICE) == 1
-    metadata = report.agent_loop["iterations"][0]["budget_finalization"]
+    metadata = report.agent_loop["iterations"][0]["deterministic_stop"]
     assert metadata["trigger"] == "after_answer_generation"
-    assert metadata["finalization_attempted"] is False
+    assert metadata["deterministic"] is True
+    assert metadata["source"] == "grounded_checkpoint"
 
 
 def test_markdown_table_headers_do_not_trigger_a_grounding_retry(

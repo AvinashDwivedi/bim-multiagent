@@ -38,13 +38,11 @@ independent goals or delegate recursively:
    and a bounded description of the live project schema.
 2. **Execution model** — selects tools, examines observations, changes direction, and drafts an answer inside that
    contract.
-3. **Model-assisted scope explorer** — proposes candidate hierarchy scopes when the meaning of a category is
-   uncertain. Its output is advice, not project evidence.
-4. **Model-assisted evidence reviewer** — challenges omissions, duplicates, exclusions, conflicts, and incomplete
+3. **Model-assisted evidence reviewer** — challenges omissions, duplicates, exclusions, conflicts, and incomplete
    reconciliation. Its output is also advice, not project evidence.
-5. **Structured-claim producer** — translates each cited answer statement into a typed claim binding. It does not
+4. **Structured-claim producer** — translates each cited answer statement into a typed claim binding. It does not
    decide whether the claim is true.
-6. **Deterministic verifier and renderer** — checks the claim against the exact tool observation and renders only
+5. **Deterministic verifier and renderer** — checks the claim against the exact tool observation and renders only
    verifier-observed values.
 
 The planner, executor, reviewer, and claim producer may use the same configured model family. They are separated by
@@ -268,7 +266,6 @@ The principal tools are:
 | `rank_ifc_geometry` | Complete-population ranking for supported non-solid metrics | Project |
 | `reconcile_populations` | Compare independently sourced identity populations | Project |
 | `analyze_ifc_graph` | Direction- and role-aware named IFC relationship paths | Project |
-| `explore_object_scope` | Suggest competing semantic scopes | Advice, not evidence |
 | `review_scope_and_evidence` | Critique a proposed answer/evidence set | Advice, not evidence |
 | `research_standards` | Explore external standards | External, not project evidence |
 | `run_local_python` | Custom on-device computation in a constrained container | Derived calculation only |
@@ -437,12 +434,12 @@ quietly change a factual value.
   cannot be certified as complete.
 - Identical in-run tool calls are reused.
 - Stable prompt-cache keys reduce repeated model input.
-- Every planner, executor, reviewer, claim-producer, scope-explorer, and standards-research response contributes to
-  the cost report.
+- Every active planner, executor, reviewer, schema-resolver, and standards-research response contributes to the cost
+  report.
 - Cost includes cached/uncached input and output tokens and a per-request breakdown. Unknown model pricing can be
   configured. Tool fees that cannot be priced are disclosed as excluded rather than treated as zero.
-- `BIM_MAX_ANSWER_COST_USD=0` disables the guard by default. A positive guard is reactive: usage is known only after
-  each response, and one bounded tool-disabled finalization may occur after the threshold is crossed.
+- `BIM_MAX_ANSWER_COST_USD=0` disables the guard by default. A positive guard is reactive because usage is known only
+  after each response; crossing it now uses deterministic checkpoint salvage and makes no finalization model call.
 - The cached service agent serializes complete requests with a per-agent lock because evidence aliases, handles,
   review deltas, and usage counters are run-scoped mutable state.
 - The web cache is invalidated by project file and relevant configuration fingerprints.
@@ -538,7 +535,7 @@ method that conflates lifecycle with correctness. Those are the same failure mod
 | 2. Replace lexical grounding | **Implemented for final project claims** | Structured row/field/value/unit/predicate verification, exact aggregate scope, source-owned grouping, exhaustive direct-output coverage, lineage, completeness, ranking and deterministic rendering | Claim production is model-assisted and can withhold valid prose if mapping fails; exhaustive non-SQL per-identity output and external standards remain blocked |
 | 3. Schema-agnostic routing | **Implemented by default** | Model classification over runtime schema; capability-derived tools; uncertainty fails open to safe read-only superset | Legacy classifier remains when planning is disabled; schema discovery is not a domain ontology |
 | 4. Generalize the data model | **Partial** | Runtime SQLite schema discovery, arbitrary tree depth, exact properties, IFC semantics/geometry, strict units and identity | Loader still requires one tree + one properties + one IFC file; no federated/multi-format adapter layer; only one real discipline/project evaluated |
-| 5. Scale cost to complexity | **Partial / not solved** | Flat guard disabled by default; full multi-call cost telemetry; bounded finalization | No preflight cost estimate, adaptive tier, sub-question decomposition, or independent sub-budgets |
+| 5. Scale cost to complexity | **Partial / not solved** | Flat guard disabled by default; full multi-call cost telemetry; deterministic grounded-checkpoint salvage | No preflight cost estimate, adaptive tier, sub-question decomposition, or independent sub-budgets |
 | 6. Enforce reconciliation | **Implemented** | Source-owned complete populations; mismatch/incomplete outcomes block ordinary completion and downgrade status | Agreement does not establish freshness or truth; more identity adapters may be needed on new exports |
 | 7. Fix pagination dead-end | **Implemented within safety caps** | No five-page ceiling; signed cursor continuation; cumulative provenance-preserving results; complete SQL population handles | Overall iteration, 100,001-row handle, 200,000-value cache, and response-size caps remain |
 | 8. Broaden evaluation | **Not yet done** | Added extensive deterministic regression tests around the structural failures | Still needs multiple disciplines/projects, adversarial questions, verified references, and an independent judge family |
@@ -653,7 +650,7 @@ useful design. It is not yet universal.
 - `bim_agent/project_tools.py` — strict ingestion, read-only raw/SQL tools, pagination, handles, lineage, reconciliation,
   graph analysis.
 - `bim_agent/ifc_analysis.py` — IFC semantic index, geometry, selectors, metric ranking, unit handling.
-- `bim_agent/model_tools.py` — model-assisted scope review, evidence review, external research, strict review schema.
+- `bim_agent/model_tools.py` — model-assisted evidence review, external research, strict review schema.
 - `bim_agent/local_python.py` — local Docker execution boundary.
 - `bim_agent/models.py` — answer report and independent status dimensions.
 - `bim_agent/runtime.py` — configured agent assembly and per-agent run serialization.

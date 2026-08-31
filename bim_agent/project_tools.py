@@ -889,7 +889,7 @@ class RawProjectTools:
         sample_limit: int = 5,
         terms: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Compact raw hierarchy evidence for a model-controlled scope exploration call."""
+        """Compact raw hierarchy evidence for planning and evidence review."""
         max_nodes = max(0, int(max_nodes))
         sample_limit = max(0, min(10, int(sample_limit)))
         parents = {

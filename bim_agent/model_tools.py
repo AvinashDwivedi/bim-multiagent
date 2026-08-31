@@ -53,15 +53,6 @@ class ModelAssistedTools:
     def definitions(self) -> list[dict[str, Any]]:
         return [
             _strict_tool(
-                "explore_object_scope",
-                "Ask a model-backed scope explorer to inspect the complete project hierarchy and propose multiple candidate object populations for an ambiguous concept. It returns candidate root IDs, descendant/leaf evidence, inclusions, exclusions, alternatives, and unresolved ambiguity. Use before counting when category names, translations, instance depth, or scope boundaries are uncertain; the primary agent chooses the final scope.",
-                {
-                    "question": {"type": "string"},
-                    "candidate_concepts": {"type": "array", "items": {"type": "string"}, "maxItems": 30},
-                    "ambiguity_notes": {"type": "string"},
-                },
-            ),
-            _strict_tool(
                 "review_scope_and_evidence",
                 "Ask a model-backed critic to challenge a proposed BIM answer without using expected answers. It checks alternative interpretations, omitted populations, unsupported exclusions, property-versus-geometry conflicts, missing counterexamples, arithmetic reconciliation, and whether clarification is truly necessary. Returns an enforced structured finalize decision, follow-ups, disclosure codes, and unsupported claims.",
                 {
@@ -85,117 +76,11 @@ class ModelAssistedTools:
         ]
 
     def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        if name == "explore_object_scope":
-            return self._explore_scope(arguments)
         if name == "review_scope_and_evidence":
             return self._review(arguments)
         if name == "research_standards":
             return self._research_standards(arguments)
         raise ValueError(f"Unknown model-assisted tool: {name}")
-
-    def _explore_scope(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        profile = self.project_tools.scope_profile(
-            max_nodes=40,
-            sample_limit=3,
-            terms=[str(item) for item in arguments.get("candidate_concepts", [])],
-        )
-        payload = {
-            "question": arguments.get("question", ""),
-            "candidate_concepts": arguments.get("candidate_concepts", []),
-            "ambiguity_notes": arguments.get("ambiguity_notes", ""),
-            "project_hierarchy_profile": profile,
-        }
-        response = self.client.responses.create(
-            model=self.model,
-            instructions=(
-                "You are a BIM scope exploration tool, not the final answerer. Interpret the question against "
-                "the supplied raw hierarchy profile. Propose all materially plausible scopes rather than one "
-                "hard-coded taxonomy. For each scope, give root object IDs, descendant/leaf evidence, inclusions, "
-                "exclusions, possible false positives, and the next model-authored SQL/geometry check. Never use "
-                "fixed path depth as an instance rule. Return only the compact structured decision requested by "
-                "the schema and do not expose private chain-of-thought."
-            ),
-            input=json.dumps(payload, ensure_ascii=False),
-            reasoning={"effort": self.reasoning_effort},
-            store=False,
-            max_output_tokens=1800,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "bim_scope_options",
-                    "strict": True,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "summary": {"type": "string", "maxLength": 500},
-                            "candidate_scopes": {
-                                "type": "array",
-                                "maxItems": 6,
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "label": {"type": "string", "maxLength": 120},
-                                        "root_object_ids": {
-                                            "type": "array",
-                                            "items": {"type": "string", "maxLength": 120},
-                                            "maxItems": 12,
-                                        },
-                                        "evidence": {"type": "string", "maxLength": 360},
-                                        "inclusions": {
-                                            "type": "array",
-                                            "items": {"type": "string", "maxLength": 120},
-                                            "maxItems": 6,
-                                        },
-                                        "exclusions": {
-                                            "type": "array",
-                                            "items": {"type": "string", "maxLength": 120},
-                                            "maxItems": 6,
-                                        },
-                                        "possible_false_positives": {
-                                            "type": "array",
-                                            "items": {"type": "string", "maxLength": 120},
-                                            "maxItems": 6,
-                                        },
-                                        "next_check": {"type": "string", "maxLength": 300},
-                                    },
-                                    "required": [
-                                        "label", "root_object_ids", "evidence", "inclusions",
-                                        "exclusions", "possible_false_positives", "next_check"
-                                    ],
-                                    "additionalProperties": False,
-                                },
-                            },
-                            "unresolved_ambiguity": {"type": "string", "maxLength": 500},
-                        },
-                        "required": ["summary", "candidate_scopes", "unresolved_ambiguity"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            prompt_cache_key=f"{self.prompt_cache_key}-scope"[:64],
-        )
-        self._record_usage(response, "scope_exploration")
-        analysis = _required_model_text(response, "scope explorer")
-        if str(getattr(response, "status", "") or "").casefold() == "incomplete":
-            raise RuntimeError("The model-backed scope explorer returned an incomplete structured decision.")
-        try:
-            parsed = json.loads(analysis)
-            if not isinstance(parsed, dict):
-                raise ValueError("the scope response was not a JSON object")
-        except (json.JSONDecodeError, ValueError) as exc:
-            raise RuntimeError(f"The model-backed scope explorer returned invalid structured output: {exc}") from exc
-        return {
-            "analysis": str(parsed.get("summary") or ""),
-            "candidate_scopes": list(parsed.get("candidate_scopes") or []),
-            "unresolved_ambiguity": str(parsed.get("unresolved_ambiguity") or ""),
-            "response_id": str(getattr(response, "id", "") or ""),
-            "profile_summary": {
-                "record_count": profile["record_count"],
-                "tree_node_count": profile["tree_node_count"],
-                "hierarchy_nodes_supplied": len(profile["hierarchy_nodes"]),
-                "truncated": profile["truncated"],
-            },
-        }
 
     def _review(self, arguments: dict[str, Any]) -> dict[str, Any]:
         current_arguments = {

@@ -83,4 +83,3 @@ def test_reasoning_effort_defaults_to_high(
     assert settings.reasoning_effort == "high"
     assert settings.planning_reasoning_effort == "medium"
     assert settings.model_tool_reasoning_effort == "medium"
-    assert settings.finalization_reasoning_effort == "low"

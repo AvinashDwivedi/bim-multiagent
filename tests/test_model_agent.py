@@ -74,6 +74,42 @@ def test_no_fixed_tool_order_or_required_pipeline(
     assert report.agent_loop["iterations_used"] == 2
 
 
+def test_inter_iteration_context_deduplicates_repeated_execution_results(
+    sample_data: Path, fake_client_factory,
+) -> None:
+    client = fake_client_factory(
+        tool_response(1, "calculate", {"expression": "2 + 3"}),
+        tool_response(2, "calculate", {"expression": "2 + 3"}),
+        final_response(3, "The result is 5. [ref: call_2]"),
+    )
+
+    report = BimAgent(sample_data, client=client).ask("Calculate 2 + 3")
+
+    third_input = client.responses.requests[2]["input"]
+    retained_outputs = {
+        item["call_id"]
+        for item in third_input
+        if isinstance(item, dict) and item.get("type") == "function_call_output"
+    }
+    assert retained_outputs == {"call-2"}
+    assert report.answer == "The result is 5. [ref: call_2]"
+    assert report.agent_loop["context_compactions"][-1]["dropped_tool_observations"] == 1
+
+
+def test_execution_prompt_is_budget_blind_and_requests_brief_efficient_answers(
+    sample_data: Path, fake_client_factory,
+) -> None:
+    client = fake_client_factory(final_response(1, "No project claim is needed."))
+
+    BimAgent(sample_data, client=client).ask("Explain the approach")
+
+    instructions = client.responses.requests[0]["instructions"].casefold()
+    assert "budget" not in instructions
+    assert "spending guard" not in instructions
+    assert "work quickly and efficiently" in instructions
+    assert "prefer a brief answer" in instructions
+
+
 def test_tool_error_is_observed_by_model_instead_of_triggering_fallback(
     sample_data: Path, tmp_path: Path, monkeypatch, fake_client_factory
 ) -> None:
@@ -157,7 +193,7 @@ def test_resolved_preflight_removes_redundant_scope_and_review_tools(
             "inspect_project", "describe_bim_workspace", "query_bim_workspace",
             "list_tree_children", "search_records", "get_records",
             "analyze_ifc_geometry", "run_local_python", "calculate",
-            "reconcile_populations", "explore_object_scope", "review_scope_and_evidence",
+            "reconcile_populations", "review_scope_and_evidence",
         ],
         "scope_preflight_resolved": True,
         "model_review_required": False,
@@ -166,6 +202,16 @@ def test_resolved_preflight_removes_redundant_scope_and_review_tools(
 
     names = {item.get("name") for item in tools}
     assert names == {"query_bim_workspace", "reconcile_populations", None}
+
+
+def test_model_assisted_tool_registry_contains_only_review_and_research(
+    sample_data: Path, fake_client_factory,
+) -> None:
+    agent = BimAgent(sample_data, client=fake_client_factory(final_response(1, "Done.")))
+
+    names = {item["name"] for item in agent.agent.model_tools.definitions()}
+
+    assert names == {"review_scope_and_evidence", "research_standards"}
 
 
 def test_resolved_population_summary_stops_after_four_successful_sql_observations(
@@ -249,7 +295,7 @@ def test_resolved_population_summary_stops_after_four_successful_sql_observation
     assert first_names == {"query_bim_workspace", "reconcile_populations", None}
     assert client.responses.requests[4]["tools"] == []
     assert any(
-        "bounded evidence budget" in str(item.get("content") or "")
+            "bounded evidence phase" in str(item.get("content") or "")
         for item in client.responses.requests[4]["input"]
         if isinstance(item, dict)
     )
@@ -357,44 +403,6 @@ def test_primary_agent_can_invoke_model_backed_evidence_review(
         if isinstance(item, dict) and item.get("type") == "function_call_output"
     )
     assert "Electrical Fixtures" in model_observation
-
-
-def test_scope_explorer_uses_bounded_structured_output(
-    sample_data: Path, tmp_path: Path, fake_client_factory,
-) -> None:
-    payload = {
-        "summary": "Two plausible populations.",
-        "candidate_scopes": [{
-            "label": "Primary",
-            "root_object_ids": ["7"],
-            "evidence": "Observed hierarchy label.",
-            "inclusions": ["descendants"],
-            "exclusions": [],
-            "possible_false_positives": [],
-            "next_check": "Count the selected descendants with SQL.",
-        }],
-        "unresolved_ambiguity": "",
-    }
-    settings = Settings(
-        data_dir=sample_data,
-        trace_dir=tmp_path / "traces",
-        model="gpt-5.4",
-        reasoning_effort="high",
-        max_agent_iterations=2,
-    )
-    client = fake_client_factory(final_response(1, json.dumps(payload)))
-    agent = BimAgent(settings=settings, client=client)
-
-    result = agent.agent.model_tools.execute("explore_object_scope", {
-        "question": "Which objects belong to this concept?",
-        "candidate_concepts": ["concept"],
-        "ambiguity_notes": "Two labels may overlap.",
-    })
-
-    request = client.responses.requests[0]
-    assert request["max_output_tokens"] == 1800
-    assert request["text"]["format"]["name"] == "bim_scope_options"
-    assert result["candidate_scopes"][0]["root_object_ids"] == ["7"]
 
 
 def test_structured_review_blocks_finalization_until_follow_up_is_re_reviewed(

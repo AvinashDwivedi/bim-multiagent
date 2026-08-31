@@ -65,7 +65,6 @@ class Settings:
     planning_model: str | None = None
     planning_reasoning_effort: str = "medium"
     model_tool_reasoning_effort: str = "medium"
-    finalization_reasoning_effort: str = "low"
 
     @classmethod
     def from_env(
@@ -108,9 +107,6 @@ class Settings:
             ),
             model_tool_reasoning_effort=os.getenv(
                 "BIM_MODEL_TOOL_REASONING_EFFORT", "medium"
-            ),
-            finalization_reasoning_effort=os.getenv(
-                "BIM_FINALIZATION_REASONING_EFFORT", "low"
             ),
         )
 
