@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from pathlib import Path
 from typing import Any
 
 from bim_agent.models import AnswerReport
@@ -34,9 +35,12 @@ def evaluator_payload(
     limitations = list(report.limitations)
     if client_id or project_id:
         limitations.append(
-            "Project scope was resolved through BIM_PROJECTS_ROOT."
-            if os.getenv("BIM_PROJECTS_ROOT") and project_id
-            else "Project identifiers are request metadata because BIM_PROJECTS_ROOT is not configured; data scope is BIM_DATA_DIR."
+            "Project scope was resolved through the selected client/project folder."
+            if client_id and project_id and (
+                os.getenv("BIM_PROJECTS_ROOT")
+                or (Path(__file__).resolve().parents[1] / "bim-data").is_dir()
+            )
+            else "Project scope was matched to BIM_SINGLE_PROJECT_ID and resolved through BIM_DATA_DIR."
         )
     response_artifacts = [
         "response-" + hashlib.sha256(item.encode("utf-8")).hexdigest()[:16]

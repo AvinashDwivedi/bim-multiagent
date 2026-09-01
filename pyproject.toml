@@ -5,15 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "local-bim-agent"
 version = "0.1.0"
-description = "Model-directed tool-using Q&A over BIM tree, properties, and IFC exports"
+description = "Read-only built-in-tool Q&A over BIM tree, properties, and IFC exports"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.110",
-  "ifcopenshell>=0.8.5",
-  "numpy>=1.26",
   "openai>=2.53.0",
   "pydantic>=2.6",
-  "shapely>=2.0",
   "uvicorn>=0.29",
 ]
 
@@ -25,10 +22,6 @@ bim-agent = "bim_agent.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["bim_agent*", "bim_agents*"]
-
-[tool.setuptools.package-data]
-bim_agent = ["skills/*/*.md"]
-
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

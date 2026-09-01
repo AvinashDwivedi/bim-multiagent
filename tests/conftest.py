@@ -10,9 +10,8 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def isolate_optional_model_preflight(monkeypatch) -> None:
-    """Keep legacy mocked-agent tests single-stage unless they opt into planning."""
-    monkeypatch.setenv("BIM_ENABLE_QUESTION_PLANNING", "false")
+def isolate_runtime(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("BIM_TRACE_DIR", str(tmp_path / "traces"))
 
 
 @pytest.fixture()
@@ -204,6 +203,38 @@ def tool_response(index: int, name: str, arguments: dict[str, Any]) -> Any:
 
 def final_response(index: int, answer: str) -> Any:
     return SimpleNamespace(id=f"resp-{index}", output=[], output_text=answer)
+
+
+class FakeShell:
+    def __init__(self) -> None:
+        self.actions: list[Any] = []
+
+    def run_action(self, action: Any, *, should_cancel=None):
+        self.actions.append(action)
+        return ([{
+            "stdout": "2\n",
+            "stderr": "",
+            "outcome": {"type": "exit", "exit_code": 0},
+        }], 4096)
+
+    def status(self) -> dict[str, Any]:
+        return {"available": True, "test_double": True}
+
+
+def shell_response(index: int) -> Any:
+    return SimpleNamespace(
+        id=f"resp-{index}",
+        output=[SimpleNamespace(
+            type="shell_call",
+            call_id=f"shell-{index}",
+            action=SimpleNamespace(
+                commands=["python -c \"print(2)\""],
+                timeout_ms=10_000,
+                max_output_length=4096,
+            ),
+        )],
+        output_text="",
+    )
 
 
 @pytest.fixture()

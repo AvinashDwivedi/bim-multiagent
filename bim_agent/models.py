@@ -13,6 +13,7 @@ class AnswerReport:
     cost: dict[str, Any] = field(default_factory=dict)
     agent_loop: dict[str, Any] = field(default_factory=dict)
     limitations: list[str] = field(default_factory=list)
+    status_dimensions: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

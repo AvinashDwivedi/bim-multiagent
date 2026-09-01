@@ -1,0 +1,99 @@
+## ('AUD-B', 'Electrical Fixtures') 45
+   15 D-14 : 2h+2t
+   11 Elec- Face Based - פתח למערכות מרובע : Elec- Face Based - פתח למערכות מרובע
+   9 EF_2sock : double
+   6 EF_D11 : D11T
+   2 D17-קופסת שקעים : F-
+   2 Floor_Box-B : Recessed Service, Stamped Steel
+## ('AUD-B', 'Lighting Fixtures') 14
+   9 Y_LF_EmLighting : תאורת חירום
+   3 lighting_fixtures_rec_Trilux_fb : LR16 27*11.5*3.3
+   2 X-5 : Ceiling Mounted - Left
+## ('B1', 'Electrical Fixtures') 112
+   26 EF_2sock : double
+   14 Floor_Box : Recessed Service, Cast Iron
+   9 EF_D17 : 4h+2t
+   8 D14AV : 2h+2t+1HDMI
+   8 Elec- Face Based - פתח למערכות עגול : שרוול ''6
+   6 M_הזנה  : 120 V
+   6 D6 : 1
+   6 2xT_שקע : 120X86
+   4 D-14 : 2h+2t
+   4 Elec- Face Based - פתח למערכות עגול : שרוול ''3
+   4 מ_א תלת פאזי : מ_א תלת פאזי
+   3 D14AV : MMM2
+   3 EF_D11 : D11T
+   2 Elec- Face Based - פתח למערכות עגול : MCT 4''
+   2 D14 : 2h+4t
+   2 Elec- Face Based - פתח למערכות עגול : שרוול ''4
+   2 EF_socket : 1x16A
+   1 EF_2sock_FloorBox : double
+   1 EF_Socket_LC_hidden : EF_Socket_LC_hidden
+   1 שקע ישראלי עבור יחידת מיזוג אוויר(1_100) : N2 חירום
+## ('B1', 'Lighting Devices') 8
+   8 LD_Lighting Switch Water Proof : Single
+## ('B1', 'Lighting Fixtures') 12
+   3 Y_LF_EmLighting : תאורת חירום
+   3 TX_OleveonFit : C-Led
+   3 lighting_fixtures_rec_Trilux_fb : LR16 27*11.5*3.3
+   2 X-5 : Ceiling Mounted - Left
+   1 X-5 : Ceiling Mounted - Left and Right
+## ('GF', 'Communication Devices') 1
+   1 comm_devices_speaker_round : Diameter_20cm
+## ('GF', 'Electrical Fixtures') 189
+   38 Elec- Face Based - פתח למערכות עגול : שרוול ''4
+   34 EF_2sock : double
+   18 M_הזנה  : 230 V
+   14 Floor_Box : FB1
+   9 Elec- Face Based - פתח למערכות עגול : שרוול ''2
+   6 EF_D18 : 6t+4t
+   6 EF_2sock_FloorBox : double
+   6 EF_D11 : D11
+   5 D14AV : MMM2
+   5 EF_D17 : 4h+2t
+   5 EF_D11 : D11T
+   4 D14AV : 2h+2t+1HDMI
+   4 Elec- Face Based - פתח למערכות עגול : שרוול ''6
+   4 Elec- Face Based - פתח למערכות עגול : שרוול ''3
+   4 Elec- Face Based - פתח למערכות מרובע : Elec- Face Based - פתח למערכות מרובע
+   4 EF_Socket_LC_hidden : EF_Socket_LC_hidden
+   4 EF_Socket_1ph_hidden : x1
+   3 EF_D14 : 4h
+   3 D-14 : 2h+2t
+   2 CEE_Y : IP-44 1 POLS
+   2 Y_AC : 120X86
+   2 D-20 : 6h+4t+1HDMI
+   1 D17-קופסת שקעים : F-
+   1 M_הזנה  : 120 V
+   1 Floor_Box1 : Recessed Service, Cast Iron
+   1 EF_D14 : 2h+2t
+   1 electrical_fixture_generic_device : Generic Device 22x10x16.5cm
+   1 2xT_שקע : 120X86
+   1 Y_switch_Open door : אינטרקום
+## ('GF', 'Lighting Devices') 12
+   6 M_Lighting Switches_Y23 : Single Pole
+   4 ED_SwitchButton : ED_SwitchButton
+   1 מפסק דו קוטבי : מפסק דו קוטבי רגיל
+   1 M_Lighting Switches_Y23 : Double switch
+## ('GF', 'Lighting Fixtures') 40
+   30 Y_LF_EmLighting : תאורת חירום
+   4 TX_OleveonFit : C-Led
+   2 Y_EL-723ST_יציאה : יציאה-Wall
+   1 X-5 : Ceiling Mounted - Left
+   1 X-5 : Ceiling Mounted - Left and Right
+   1 X-5 : Ceiling Mounted - Right
+   1 lighting_fixtures_rec_Trilux_fb : LR16 27*11.5*3.3
+## ('M1', 'Electrical Fixtures') 29
+   19 Elec- Face Based - פתח למערכות מרובע : Elec- Face Based - פתח למערכות מרובע
+   4 EF_D18AB : 6t+4t
+   2 EF_socket : 1x16A
+   1 EF_D18A : 6h+2t
+   1 EF_D11 : D11T
+   1 D-14 : 2h+2t
+   1 M_הזנה  : 230 V
+## ('M1', 'Lighting Devices') 1
+   1 M_Lighting Switches_Y23 : Double switch
+## ('M1', 'Lighting Fixtures') 28
+   24 Y_LF_EmLighting : תאורת חירום
+   3 X-5 : Ceiling Mounted - Left
+   1 Y_EL-723ST_יציאה : יציאה Ceiling

@@ -6,8 +6,9 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from .project_tools import ProjectError
-from .agent_loop import _is_retryable_api_error
+from .builtin_agent import tool_policy
+from .errors import is_retryable_api_error
+from .project_data import ProjectDataError
 from .runtime import BimAgent
 
 
@@ -28,30 +29,35 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             agent = get_agent()
             return {
                 "status": "ok",
-                "raw_records": len(agent.tools.records),
                 "model_directed": True,
-                "local_python": agent.agent.python_sandbox.status(),
+                "source_count": 3,
+                "tools": tool_policy(),
+                "shell": agent.shell.status(),
             }
-        except (ProjectError, RuntimeError) as exc:
+        except (ProjectDataError, RuntimeError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.get("/api/tools")
+    def tools() -> dict:
+        return tool_policy()
 
     @app.get("/api/inspect")
     def inspect() -> dict:
         try:
             return get_agent().inspect()
-        except (ProjectError, RuntimeError) as exc:
+        except (ProjectDataError, RuntimeError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.post("/api/ask")
     def ask(request: AskRequest) -> dict:
         try:
             return get_agent().ask(request.question).to_dict()
-        except ProjectError as exc:
+        except ProjectDataError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            retryable = _is_retryable_api_error(exc)
+            retryable = is_retryable_api_error(exc)
             raise HTTPException(
                 status_code=503,
                 detail={

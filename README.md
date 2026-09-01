@@ -1,77 +1,42 @@
-# Model-Directed BIM Agent
+# BIM Built-in Tools Agent
 
-A schema-aware OpenAI Responses API agent for answering questions over Autodesk-style three-file BIM exports.
-A structured model preflight binds the requested population, metric, units, relationships, and required evidence
-to the runtime schema. The execution model then owns tool selection, iteration, checking, and answer composition
-within that contract.
+An OpenAI Responses API agent for answering questions over one three-file BIM export. The runtime has no custom
+function tools, MCP servers, planner tools, reviewer tools, skills, subagents, or project-specific routing.
 
-## Architecture
+## Tool policy
 
-```text
-plan = schema_aware_preflight(question, runtime_schema)
-while not finished:
-    response = model(question, plan, observations, permitted_tools)
-    if response calls tools:
-        observations += execute_or_reuse(tool calls)
-        observations += automatic_population_reconciliation
-    else:
-        completeness_gate(response)
-        citation_grounding_gate(response)
-        return response
-```
+The active runtime exposes only:
 
-There is no project-specific router, answer template, supervisor, subagent, fixed execution stage order, or offline
-answer fallback. Invalid or unresolved planning contracts fail open to safe read-only inspection and clarification;
-termination is constrained by deterministic route, completeness, reconciliation, and citation-grounding checks.
+- `shell`: the OpenAI equivalent of the reference Claude SDK agent's `Read`, `Grep`, `Glob`, and `Bash` tools.
+- `web_search`: the OpenAI equivalent of `WebSearch` and `WebFetch`; the hosted tool searches and opens pages.
 
-The application exposes generic read-only project capabilities plus model-backed analysis helpers:
+Like the Claude Agent SDK reference, `shell` executes native Bash with the selected project directory as its
+working directory. On Windows, Git Bash is discovered automatically; set `BIM_BASH_PATH` only when Bash is in a
+custom location. Docker is not installed, started, or used. The agent instruction limits Bash to read-only project
+analysis and disables dedicated write tools, matching the reference runtime's permission model.
 
-- `inspect_project`: source metadata, raw tree roots, record count, and property keys.
-- `list_tree_children`: cursor-paginated arbitrary hierarchy traversal.
-- `search_records`: cursor-paginated raw name, path, property-key, and property-value search.
-- `get_records`: exact raw records and properties by object ID.
-- `search_ifc`: cursor-paginated raw STEP IFC text search.
-- `fetch_more`: resumes any cursor returned by the pageable tree/record/IFC tools.
-- `calculate`: safe arithmetic.
-- `describe_bim_workspace` / `query_bim_workspace`: model-authored, read-only SQL over normalized records,
-  properties, arbitrary-depth hierarchy, named IFC objects and relationships, and record-to-IFC identity candidates.
-- `analyze_ifc_geometry`: model-selected IfcOpenShell analysis for world placement, bounding boxes, solid volume,
-  surface area, projected XY area, and spatial containers.
-- `rank_ifc_geometry`: complete-population mesh ranking by volume, area, or an explicit X/Y/Z extent.
-- `reconcile_populations`: identity/count reconciliation for model-selected populations, overlaps, duplicates, and missing IDs.
-- `analyze_ifc_graph`: direction- and role-aware traversal of named IFC relationships with evidence paths.
-- Ambiguous scopes are resolved from direct SQL, hierarchy paths, authored types, counts, and representative project records; unresolved material alternatives are reported or clarified.
-- `review_scope_and_evidence`: a model-backed critic that challenges omissions, duplicates, identities, conflicting
-  evidence, exclusions, and unreconciled totals without consulting expected answers.
-- `research_standards`: model-directed web research for external codes and standards, kept separate from project facts.
-- `run_local_python`: model-written Python in an on-device Docker sandbox. Networking is disabled, project inputs
-  and the normalized workspace are mounted read-only, the container root filesystem is read-only, and only an
-  ephemeral `/tmp` is writable. No OpenAI Containers or Files API is used.
+Project facts must come from the selected project's three artifacts. Web evidence is reserved for standards,
+regulations, product references, or current public information and cannot substitute for project evidence.
 
-On GPT-5.6 models, Programmatic Tool Calling is also enabled. The model may write a short hosted JavaScript program
-to coordinate predictable project-tool calls for filtering, joining, deduplication, aggregation, and evidence
-compression. Adaptive scope choices and the final answer remain direct model decisions.
+`GET /api/tools` reports the effective policy and its mapping to the Claude Agent SDK reference tools.
 
-The preflight derives a focused or safe-superset tool route from the discovered schema. The execution model supplies
-tool arguments, observes results, and changes direction when needed. Python additionally enforces per-run call deduplication, automatic population reconciliation,
-iterative evidence-preserving completeness continuation, unresolved-page checks, and claim-level `[ref: call_id]` validation. Numeric
-citations are accepted only when the cited observation contains the claimed value. Routing rules live in the
-versioned `bim_agent/skills/bim-routing/` Markdown contracts; ordinary project filters, joins, and aggregates are routed to SQL.
-The older `aggregate_records` executor remains callable only through the internal Python API for compatibility; it
-is not exposed to model runs.
+## Project contract
 
-## Input contract
-
-Each project directory must contain exactly:
+The selected project directory must contain exactly one file for each role:
 
 ```text
 project-data/
-├── <model-id>-tree.json
-├── <model-id>-properties.json
-└── <database-id>.ifc
+|-- <name>.ifc
+|-- <name>-properties.json
+`-- <name>-tree.json
 ```
 
-The tree and properties filenames must use the same model ID.
+The JSON files may also be named `properties.json` / `tree.json` or use an underscore before the role.
+
+For the evaluator and web application, place project folders under `bim-data/<client_id>/<project_id>/`. The service discovers
+that collection on every `GET /api/projects` request, reports incomplete folders separately, and resolves each chat
+request by its selected `client_id` and `project_id`. Set `BIM_PROJECTS_ROOT` only to use a different collection directory.
+Ambiguous or incomplete directories are rejected.
 
 ## Setup
 
@@ -80,109 +45,41 @@ python -m pip install -e ".[test]"
 Copy-Item .env.example .env
 ```
 
-`OPENAI_API_KEY` is required for primary planning and answering. Runtime-limit handling is deterministic and does
-not make an additional model request.
+Set `OPENAI_API_KEY` in `.env`. Windows requires Git for Windows, which supplies the same native Bash environment
+used by Claude Code. The application automatically maps `python`, `python3`, and `py` to the active interpreter,
+so Microsoft Store aliases do not interfere. API keys and token/password environment variables are removed from
+the Bash subprocess environment.
 
-```dotenv
-OPENAI_API_KEY=
-BIM_MODEL=gpt-5.6-sol
-BIM_REASONING_EFFORT=high
-BIM_ENABLE_QUESTION_PLANNING=true
-# Optional; defaults to BIM_MODEL.
-BIM_PLANNING_MODEL=
-BIM_PLANNING_REASONING_EFFORT=medium
-BIM_MODEL_TOOL_REASONING_EFFORT=medium
-BIM_DATA_DIR=test-project-data
-BIM_PROJECTS_ROOT=
-BIM_TRACE_DIR=logs/traces
-BIM_MAX_AGENT_ITERATIONS=40
-BIM_MAX_TOOL_OUTPUT_CHARS=80000
-BIM_MAX_ANSWER_COST_USD=0
-BIM_ENABLE_LOCAL_PYTHON=true
-BIM_LOCAL_PYTHON_IMAGE=python:3.12-slim
-BIM_PYTHON_MEMORY_LIMIT=4g
-BIM_LOCAL_PYTHON_CPUS=1.0
-BIM_LOCAL_PYTHON_TIMEOUT_SECONDS=120
-BIM_LOCAL_PYTHON_OUTPUT_CHARS=40000
-BIM_OPENAI_MAX_RETRIES=4
-BIM_OPENAI_TIMEOUT_SECONDS=180
-BIM_MODEL_PRICING_JSON=
-```
-
-Python analysis runs only on the device through Docker. Install Docker Desktop (or another compatible local Docker
-engine), start it, and install the configured image once:
-
-```powershell
-docker pull python:3.12-slim
-```
-
-The application never pulls an image automatically and never sends the raw BIM files through OpenAI's Containers
-or Files APIs. At execution time it mounts the selected project at `/project` and the generated SQLite workspace at
-`/workspace`, both read-only. The container uses `--network none`, a read-only root filesystem, dropped Linux
-capabilities, `no-new-privileges`, a non-root user, CPU/memory/PID caps, an execution timeout, bounded output, and an
-ephemeral `/tmp`. Configure a preinstalled custom image with `BIM_LOCAL_PYTHON_IMAGE` if analyses require packages
-beyond the Python standard library.
-
-The question and compact tool observations still go to the configured OpenAI model because this is a Responses API
-agent. Raw BIM source files remain on the device and are never uploaded by the Python integration.
-
-The workspace is built lazily for the selected project. The agent asks for its schema and writes its own SQL for
-the current question; there are no question-specific queries, expected answers, or semantic mappings. Only one
-`SELECT`, `WITH`, or `EXPLAIN QUERY PLAN` statement is accepted, mutations and external database attachment are
-denied, results are row-limited, and long-running queries are interrupted. STEP IFC files expose raw
-`ifc_entities`/`ifc_references` plus named `ifc_objects`, role-aware `ifc_relationships`, and
-`record_ifc_candidates`. SQLite IFC exports are attached read-only as `ifc_source`. Exact geometry is delegated
-to IfcOpenShell rather than inferred from names or evaluator cases.
-
-For multiple projects, `BIM_PROJECTS_ROOT/<project_id>/` must contain the same three-file contract.
-
-## CLI
+## CLI and server
 
 ```powershell
 python -m bim_agent --data-dir test-project-data inspect --json
-python -m bim_agent --data-dir test-project-data ask "כמה מפסקים בפרוייקט?"
-python -m bim_agent --data-dir test-project-data chat
-```
-
-## Server
-
-```powershell
+python -m bim_agent --data-dir test-project-data ask "How many doors are in the model?"
 python -m bim_agent --data-dir test-project-data serve --host 127.0.0.1 --port 8000
+# Multi-project server used by bim-evaluator (loads ./bim-data automatically):
+python -m bim_agents.webapp
 ```
 
-Endpoints:
+Core endpoints:
 
 - `GET /api/health`
+- `GET /api/tools`
 - `GET /api/inspect`
 - `POST /api/ask` with `{"question":"..."}`
-- Evaluator compatibility: `POST /api/chat` and `POST /api/chat/stream`
+- Evaluator compatibility: `GET /api/projects`, `POST /api/chat`, and `POST /api/chat/stream`
 
-Every answer includes source hashes, model response IDs, tool-call telemetry, and a request-scoped JSONL audit trace.
-The trace carries a session ID and the full model/tool transcript (with secret-key redaction), including arguments,
-cached-call markers, automatic reconciliation, and untrimmed tool observations.
+Reports include artifact hashes, model response IDs, built-in tool traces, token/cost accounting, limitations, and
+a request-scoped JSONL audit trace. Web-search fees are reported separately from token-price estimates.
 
-Every report also includes `cost`, which totals token usage across all Responses API calls needed for that answer,
-including nested evidence review and standards research. It reports USD list-price estimates,
-cached/uncached input tokens, output tokens, per-request breakdowns, pricing date/source, and whether the estimate is
-complete. GPT-5.4 and GPT-5.6 Sol defaults follow their official model pages. Unknown/private model prices can be
-supplied with `BIM_MODEL_PRICING_JSON`; tool-specific fees such as web search are listed as excluded rather than
-silently reported as zero. Local Docker execution has no OpenAI tool fee.
-`BIM_MAX_ANSWER_COST_USD` is an opt-in guard. It defaults to `0` (disabled) while real question-cost distributions
-are collected; set a positive amount only after choosing a threshold from observed workloads. When enabled, it stops
-further investigation once the running list-price estimate reaches the configured amount. It then preserves an
-already-produced grounded answer, deterministically salvages its supported cited portion when needed, and appends the
-canonical budget notice. It never makes a separate finalization model call. The completed request may exceed the
-threshold because usage is available only after a request returns. Stable prompt-cache keys and relevance-pruned
-cross-iteration observations reduce repeated input.
-Retryable upstream failures are returned as HTTP 503 with a structured `retryable` flag. The health response
-reports whether the local Docker runtime and configured image are ready. A local container is created only if the
-model calls `run_local_python`, and it is removed immediately after the call.
+Every run prints a compact terminal timeline for model turns, requested commands, execution backend, result
+previews, elapsed time, estimated cost, and final status. Set `BIM_PRETTY_LOGS=false` to disable it or `NO_COLOR=1`
+to keep the layout without color. Private model reasoning is never printed.
 
 ## Tests
-
-Tests mock model responses and verify strict tool schemas, caller transport, the model-controlled review path,
-IFC/workspace mechanics, and the generic function-calling loop without creating a deterministic semantic fallback.
 
 ```powershell
 pytest
 ```
+
+The policy tests assert that only `shell` and `web_search` are sent to the Responses API and that native Bash—not
+Docker or a partial shell emulator—executes project analysis.

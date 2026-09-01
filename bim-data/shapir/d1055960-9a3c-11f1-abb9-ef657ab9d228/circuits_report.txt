@@ -1,0 +1,84 @@
+
+#### PANEL (no panel member) | circuits: 1
+  <unnamed>   1 dev       30 VA  D-14:2h+2t:1743741x1
+  SUM devices = 30 VA | empty (panel-only) circuits: 0 -> 
+
+#### PANEL EL-B1 | circuits: 76
+  F41      2 dev       60 VA  D14AV:2h+2t+1HDMI:1316980x1, D14AV:MMM2:1608609x1
+  F42      3 dev       90 VA  EF_2sock:double:903354x1, EF_2sock:double:903387x1, EF_2sock:double:903624x1
+  F43      4 dev      120 VA  D-14:2h+2t:1320822x1, D14:2h+4t:1320915x1, D-14:2h+2t:1321009x1, D-14:2h+2t:1321025x1
+  F44      2 dev       60 VA  D14:2h+4t:1604965x1, D-14:2h+2t:1604979x1
+  F45      6 dev      180 VA  EF_2sock:double:928713x1, EF_2sock:double:928803x1, EF_2sock:double:1626495x1, EF_2sock:double:1626508x1, EF_2sock:double:1830861x1
+  F46      4 dev      120 VA  D14AV:2h+2t+1HDMI:1288082x1, D14AV:2h+2t+1HDMI:1315304x1, D14AV:2h+2t+1HDMI:1315333x1, D14AV:2h+2t+1HDMI:2061096x1
+  F51      7 dev      210 VA  EF_2sock:double:893049x1, EF_2sock:double:893105x1, EF_2sock:double:896757x1, EF_2sock:double:1376689x1, EF_2sock:double:1604863x1
+  F52      4 dev      120 VA  D14AV:2h+2t+1HDMI:845870x1, EF_D17:4h+2t:845882x1, EF_D17:4h+2t:846158x1, EF_D17:4h+2t:1316170x1
+  F53      5 dev      150 VA  EF_D17:4h+2t:846020x1, EF_D17:4h+2t:1316106x1, EF_D17:4h+2t:1316140x1, D14AV:2h+2t+1HDMI:1604179x1, D14AV:MMM2:1604232x1
+  F54      5 dev      150 VA  EF_2sock:double:1358044x1, EF_2sock:double:1627638x1, EF_2sock:double:1627779x1, EF_2sock:double:1627816x1, EF_2sock:double:1847596x1
+  F55      2 dev       60 VA  EF_2sock:double:1738601x1, EF_2sock:double:1738963x1
+  F56      1 dev       30 VA  EF_2sock:double:1738680x1
+  F57      3 dev       90 VA  EF_D17:4h+2t:2064710x1, EF_2sock:double:2110034x1, EF_2sock:double:2110044x1
+  F58      6 dev      360 VA  M_\X2\05D405D605E005D4\X0\ :120 V:1357597x1, M_\X2\05D405D605E005D4\X0\ :120 V:1357695x1, M_\X2\05D405D605E005D4\X0\ :120 V:2060931x1, M_\X2\05D405D605E005D4\X0\ :120 V:2063829x1, M_\X2\05D405D605E005D4\X0\ :120 V:2063945x1
+  F61      4 dev        0 VA  Floor_Box:Recessed Service, Cast Iron:2041393x1, Floor_Box:Recessed Service, Cast Iron:2041447x1, Floor_Box:Recessed Service, Cast Iron:2041458x1, Floor_Box:Recessed Service, Cast Iron:2041467x1
+  F62      4 dev        0 VA  Floor_Box:Recessed Service, Cast Iron:2040803x1, Floor_Box:Recessed Service, Cast Iron:2041351x1, Floor_Box:Recessed Service, Cast Iron:2041382x1, Floor_Box:Recessed Service, Cast Iron:2041556x1
+  F63      3 dev        0 VA  Floor_Box:Recessed Service, Cast Iron:2041618x1, Floor_Box:Recessed Service, Cast Iron:2041631x1, Floor_Box:Recessed Service, Cast Iron:2041671x1
+  F64      3 dev        0 VA  Floor_Box:Recessed Service, Cast Iron:2041640x1, Floor_Box:Recessed Service, Cast Iron:2041649x1, Floor_Box:Recessed Service, Cast Iron:2041662x1
+  F65      4 dev      120 VA  D-14:2h+2t:2063603x1, D-14:2h+2t:2063604x1, D-14:2h+2t:2063605x1, D-14:2h+2t:2063606x1
+  F66      4 dev      120 VA  D-14:2h+2t:2063449x1, D-14:2h+2t:2063450x1, D-14:2h+2t:2063451x1, D-14:2h+2t:2063583x1
+  F67      3 dev       90 VA  D-14:2h+2t:2063382x1, D-14:2h+2t:2063383x1, D-14:2h+2t:2063384x1
+  F68      3 dev       90 VA  D-14:2h+2t:2063192x1, D-14:2h+2t:2063227x1, D-14:2h+2t:2063246x1
+  F71      1 dev        0 VA  \X2\05DE\X0\_\X2\05D0\X0\ \X2\05EA05DC05EA\X0\ \X2\05E405D005D605D9\X0\:\X2\05DE\X0\_\X2\05D0\X0\ \X2\05EA05DC05EA\X0\ \X2\05E405D005D605D9\X0\:2189848x1
+  F72      1 dev        0 VA  \X2\05DE\X0\_\X2\05D0\X0\ \X2\05EA05DC05EA\X0\ \X2\05E405D005D605D9\X0\:\X2\05DE\X0\_\X2\05D0\X0\ \X2\05EA05DC05EA\X0\ \X2\05E405D005D605D9\X0\:2190074x1
+  F73      1 dev        0 VA  \X2\05DE\X0\_\X2\05D0\X0\ \X2\05EA05DC05EA\X0\ \X2\05E405D005D605D9\X0\:\X2\05DE\X0\_\X2\05D0\X0\ \X2\05EA05DC05EA\X0\ \X2\05E405D005D605D9\X0\:2189811x1
+  F74      1 dev        0 VA  \X2\05DE\X0\_\X2\05D0\X0\ \X2\05EA05DC05EA\X0\ \X2\05E405D005D605D9\X0\:\X2\05DE\X0\_\X2\05D0\X0\ \X2\05EA05DC05EA\X0\ \X2\05E405D005D605D9\X0\:2164712x1
+  F76      1 dev        0 VA  \X2\05E905E705E2\X0\ \X2\05D905E905E805D005DC05D9\X0\ \X2\05E205D105D505E8\X0\ \X2\05D905D705D905D305EA\X0\ \X2\05DE05D905D605D505D2\X0\ \X2\05D005D505D505D905E8\X0\(1_100):N2 \X2\05D705D905E805D505DD\X0\:2189730x1
+  F77      1 dev       30 VA  EF_socket:1x16A:2214904x1
+  SUM devices = 2250 VA | empty (panel-only) circuits: 48 -> F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30, F31, F32, F33, F34, F35, F36, F37, F38, F39, F40, F47, F48, F49, F50, F59, F60, F70, F75
+
+#### PANEL EP-GF-AUD-L | circuits: 64
+  L41      7 dev      210 VA  EF_2sock:double:939619x1, EF_2sock:double:940030x1, EF_2sock:double:1605146x1, EF_2sock:double:1605180x1, EF_2sock:double:1605550x1
+  L42      6 dev      180 VA  EF_2sock:double:1607303x1, EF_2sock:double:1653985x1, EF_2sock:double:1654167x1, EF_2sock:double:1654593x1, EF_2sock:double:1654920x1
+  L43      8 dev      240 VA  EF_2sock:double:1605848x1, EF_2sock:double:1606536x1, EF_2sock:double:1608303x1, EF_2sock:double:1655439x1, EF_2sock:double:1655634x1
+  L44      4 dev      120 VA  EF_2sock:double:1606179x1, EF_2sock:double:1607314x1, EF_2sock_FloorBox:double:1656060x1, EF_2sock_FloorBox:double:1657238x1
+  L45      5 dev      150 VA  EF_2sock_FloorBox:double:1653965x1, EF_2sock_FloorBox:double:1656507x1, EF_2sock_FloorBox:double:1657581x1, EF_2sock_FloorBox:double:1657869x1, EF_2sock_FloorBox:double:1657986x1
+  L46      2 dev       60 VA  EF_2sock:double:1323279x1, EF_2sock:double:1377245x1
+  L48      1 dev       30 VA  Y_AC:120X86:2184985x1
+  L51      1 dev       30 VA  D17-\X2\05E705D505E405E105EA\X0\ \X2\05E905E705E205D905DD\X0\:F-:1324290x1
+  L52      2 dev      120 VA  Floor_Box-B:Recessed Service, Stamped Steel:1887228x1, Floor_Box-B:Recessed Service, Stamped Steel:1887264x1
+  L53      2 dev       60 VA  D17-\X2\05E705D505E405E105EA\X0\ \X2\05E905E705E205D905DD\X0\:F-:1324286x1, D17-\X2\05E705D505E405E105EA\X0\ \X2\05E905E705E205D905DD\X0\:F-:1324288x1
+  L54      1 dev       60 VA  M_\X2\05D405D605E005D4\X0\ :230 V:1621979x1
+  L55      2 dev       90 VA  EF_D14:2h+2t:2064811x1, M_\X2\05D405D605E005D4\X0\ :230 V:2065899x1
+  L56      1 dev       60 VA  M_\X2\05D405D605E005D4\X0\ :230 V:2186531x1
+  L57      2 dev       60 VA  D-20:6h+4t+1HDMI:2278985x1, D-20:6h+4t+1HDMI:2279053x1
+  L58      3 dev      180 VA  M_\X2\05D405D605E005D4\X0\ :230 V:1610550x1, M_\X2\05D405D605E005D4\X0\ :230 V:1611027x1, M_\X2\05D405D605E005D4\X0\ :230 V:1789144x1
+  L61      2 dev       60 VA  EF_D18:6t+4t:1322701x1, EF_D18:6t+4t:1322716x1
+  L62      2 dev       60 VA  D14AV:MMM2:2271717x1, D14AV:MMM2:2271785x1
+  L71      1 dev        0 VA  EF_Socket_1ph_hidden:x1:2304455x1
+  L72      1 dev        0 VA  EF_Socket_1ph_hidden:x1:2304706x1
+  SUM devices = 1770 VA | empty (panel-only) circuits: 45 -> L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12, L13, L14, L15, L16, L17, L18, L19, L20, L21, L22, L23, L24, L25, L26, L27, L28, L29, L30, L31, L32, L33, L34, L35, L36, L37, L38, L39, L40, L47, L49, L50, L59, L60
+
+#### PANEL EP-GF-F | circuits: 96
+  F50      2 dev       60 VA  EF_D18A:6h+2t:929758x1, EF_2sock:double:930213x1
+  F51      1 dev       30 VA  EF_socket:1x16A:930125x1
+  F52      1 dev       30 VA  EF_socket:1x16A:1612884x1
+  F53      1 dev       30 VA  EF_2sock:double:1623318x1
+  F54      2 dev       60 VA  EF_D18AB:6t+4t:930273x1, EF_D18AB:6t+4t:930310x1
+  F55      2 dev       60 VA  EF_D18AB:6t+4t:930537x1, EF_D18AB:6t+4t:930645x1
+  F73      2 dev       60 VA  EF_2sock:double:939675x1, EF_2sock:double:939857x1
+  F74      8 dev      240 VA  EF_2sock:double:944580x1, EF_2sock:double:944607x1, EF_2sock:double:944764x1, EF_2sock:double:1323338x1, EF_2sock:double:1603066x1
+  F75      5 dev      150 VA  D14AV:2h+2t+1HDMI:1377938x1, EF_D18:6t+4t:1624387x1, EF_D18:6t+4t:1624448x1, D14AV:MMM2:1981554x1, EF_D14:4h:2184915x1
+  F76      2 dev       60 VA  EF_D18:6t+4t:1321161x1, EF_D18:6t+4t:1321284x1
+  F77      6 dev      180 VA  EF_2sock:double:1622277x1, EF_2sock:double:1622502x1, EF_2sock:double:1622529x1, EF_2sock:double:1622707x1, EF_2sock:double:1622812x1
+  F78      4 dev      120 VA  D14AV:2h+2t+1HDMI:939322x1, EF_D17:4h+2t:1321522x1, EF_D17:4h+2t:1322269x1, EF_D14:4h:1322608x1
+  F79      3 dev       90 VA  EF_D17:4h+2t:1322552x1, EF_D17:4h+2t:1322558x1, EF_D14:4h:1625331x1
+  F80      3 dev       90 VA  D14AV:MMM2:939077x1, D14AV:2h+2t+1HDMI:1323517x1, D14AV:2h+2t+1HDMI:1554628x1
+  F81      4 dev      120 VA  EF_D17:4h+2t:1321353x1, EF_D17:4h+2t:1321417x1, D-14:2h+2t:1783187x1, D-14:2h+2t:2223611x1
+  F82      9 dev      540 VA  M_\X2\05D405D605E005D4\X0\ :230 V:1608693x1, M_\X2\05D405D605E005D4\X0\ :230 V:1608756x1, M_\X2\05D405D605E005D4\X0\ :230 V:1608925x1, M_\X2\05D405D605E005D4\X0\ :230 V:1608989x1, M_\X2\05D405D605E005D4\X0\ :230 V:1609141x1
+  F83      1 dev       60 VA  Floor_Box1:Recessed Service, Cast Iron:1824821x1
+  F84      1 dev       30 VA  Y_AC:120X86:2184571x1
+  F91      3 dev        0 VA  Floor_Box:FB1:2043369x1, Floor_Box:FB1:2043461x1, Floor_Box:FB1:2062967x1
+  F92      3 dev        0 VA  Floor_Box:FB1:2042999x1, Floor_Box:FB1:2043051x1, Floor_Box:FB1:2043149x1
+  F93      4 dev        0 VA  Floor_Box:FB1:2042669x1, Floor_Box:FB1:2042733x1, Floor_Box:FB1:2042777x1, Floor_Box:FB1:2042805x1
+  F94      4 dev        0 VA  Floor_Box:FB1:2042213x1, Floor_Box:FB1:2042311x1, Floor_Box:FB1:2042393x1, Floor_Box:FB1:2042485x1
+  F95      1 dev        0 VA  EF_Socket_1ph_hidden:x1:2305657x1
+  F96      1 dev        0 VA  EF_Socket_1ph_hidden:x1:2305788x1
+  SUM devices = 2010 VA | empty (panel-only) circuits: 72 -> F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30, F31, F32, F33, F34, F35, F36, F37, F38, F39, F40, F41, F42, F43, F44, F45, F46, F47, F48, F49, F56, F57, F58, F59, F60, F61, F62, F63, F64, F65, F66, F67, F68, F69, F70, F71, F72, F85, F86, F87, F88, F89, F90

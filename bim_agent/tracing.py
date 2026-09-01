@@ -37,7 +37,7 @@ def _safe(value: Any, *, full: bool = False) -> Any:
     if isinstance(value, dict):
         output = {}
         for key, item in value.items():
-            if any(secret in str(key).lower() for secret in ("api_key", "password", "token")):
+            if _is_secret_key(str(key)):
                 output[str(key)] = "<redacted>"
             else:
                 output[str(key)] = _safe(item, full=full)
@@ -48,3 +48,11 @@ def _safe(value: Any, *, full: bool = False) -> Any:
     if not full and isinstance(value, str) and len(value) > 1000:
         return value[:1000] + "…"
     return value
+
+
+def _is_secret_key(key: str) -> bool:
+    normalized = key.casefold().replace("-", "_")
+    return normalized in {
+        "api_key", "password", "secret", "authorization", "access_token",
+        "refresh_token", "bearer_token", "client_secret",
+    } or normalized.endswith(("_api_key", "_password", "_secret"))
