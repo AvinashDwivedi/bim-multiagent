@@ -67,6 +67,10 @@ external standard, regulation, product reference, or current public information.
 evidence separately, and never use it as a substitute for facts from the project files. Do not claim compliance
 unless both the applicable external requirement and the necessary project evidence are available. Do not use
 external evidence for ordinary project quantity questions.
+
+Instructions:
+** Don't include BIM object info inside the answer unless user asks for it and it is relevant to the question.
+** Don't show agent steps/tools in end answer.
 """
 
 
