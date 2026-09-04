@@ -5,10 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "local-bim-agent"
 version = "0.1.0"
-description = "Read-only built-in-tool Q&A over BIM tree, properties, and IFC exports"
+description = "Read-only built-in-tool Q&A over IFC and Autodesk property-database artifacts"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.110",
+  "ifcopenshell>=0.8.0",
   "openai>=2.53.0",
   "pydantic>=2.6",
   "uvicorn>=0.29",

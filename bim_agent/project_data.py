@@ -12,18 +12,16 @@ DEFAULT_BIM_DATA_DIR = ROOT / "bim-data"
 
 
 class ProjectDataError(ValueError):
-    """The selected directory is not one complete three-file BIM snapshot."""
+    """The selected directory does not contain one unambiguous IFC artifact."""
 
 
 @dataclass(frozen=True)
 class ProjectFiles:
     project_dir: Path
     ifc: Path
-    properties: Path
-    tree: Path
 
     def paths(self) -> dict[str, Path]:
-        return {"ifc": self.ifc, "properties": self.properties, "tree": self.tree}
+        return {"ifc": self.ifc}
 
     def manifest(self) -> list[dict[str, Any]]:
         output: list[dict[str, Any]] = []
@@ -52,17 +50,7 @@ def resolve_project_files(data_dir: str | Path) -> ProjectFiles:
         role="IFC",
         project_dir=project_dir,
     )
-    properties = _one_file(
-        [path for path in files if _matches_json_role(path, "properties")],
-        role="properties JSON",
-        project_dir=project_dir,
-    )
-    tree = _one_file(
-        [path for path in files if _matches_json_role(path, "tree")],
-        role="tree JSON",
-        project_dir=project_dir,
-    )
-    return ProjectFiles(project_dir, ifc, properties, tree)
+    return ProjectFiles(project_dir, ifc)
 
 
 def configured_projects_root() -> Path:
@@ -109,7 +97,7 @@ def project_manifest(
     return {
         "client_id": client_id,
         "project_id": project_id,
-        "source_count": 3,
+        "source_count": len(project.paths()),
         "artifacts": {
             role: {"name": path.name, "bytes": path.stat().st_size}
             for role, path in project.paths().items()
@@ -163,14 +151,6 @@ def discover_projects(*, projects_root: str | Path | None = None) -> dict[str, A
         "projects": projects,
         "invalid_projects": invalid_projects,
     }
-
-
-def _matches_json_role(path: Path, role: str) -> bool:
-    name = path.name.casefold()
-    if not name.endswith(".json"):
-        return False
-    stem = name[:-5]
-    return stem == role or stem.endswith(f"-{role}") or stem.endswith(f"_{role}")
 
 
 def _one_file(files: list[Path], *, role: str, project_dir: Path) -> Path:

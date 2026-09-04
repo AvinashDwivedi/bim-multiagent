@@ -68,7 +68,7 @@ class BimAgent:
     def inspect(self) -> dict[str, Any]:
         return {
             "data_dir": str(self.project.project_dir),
-            "source_count": 3,
+            "source_count": len(self.project.paths()),
             "sources": self.project.manifest(),
             "agentic_flow": self.agent.inspect(),
             "tool_policy": tool_policy(),

@@ -19,7 +19,7 @@ def test_api_health_tools_and_answer(sample_data: Path, monkeypatch, fake_client
     health = http.get("/api/health")
     assert health.status_code == 200
     assert health.json()["model_directed"] is True
-    assert health.json()["source_count"] == 3
+    assert health.json()["source_count"] == 1
 
     tools = http.get("/api/tools")
     assert tools.status_code == 200

@@ -65,9 +65,13 @@ def test_evaluator_api_discovers_and_resolves_projects(
     assert listing.json()["client_count"] == 1
     assert listing.json()["clients"][0]["client_id"] == "client-one"
     assert [item["project_id"] for item in listing.json()["projects"]] == ["project-one"]
+    assert listing.json()["projects"][0]["source_count"] == 1
+    assert list(listing.json()["projects"][0]["artifacts"]) == ["ifc"]
     assert health.status_code == 200
     assert health.json()["client_id"] == "client-one"
     assert health.json()["project_id"] == "project-one"
+    assert health.json()["source_count"] == 1
+    assert list(health.json()["artifacts"]) == ["ifc"]
 
 
 def test_evaluator_api_rejects_project_path_traversal(tmp_path: Path, monkeypatch) -> None:

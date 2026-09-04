@@ -118,24 +118,26 @@ def test_native_bash_runs_unrestricted_analysis_syntax_used_in_failed_trace(
         pytest.skip("Native Bash is not installed on this test host.")
     command = (
         "python3 - <<'PY'\n"
-        "import json,pprint\n"
+        "import pprint,sqlite3\n"
         "counter=0\n"
         "def inspect_data():\n"
         " global counter\n"
         " counter += 1\n"
-        " data=json.load(open('/project/model-tree.json',encoding='utf-8'))\n"
-        " pprint.pp({'type':type(data).__name__,'length':len(data),'counter':counter})\n"
+        " uri='file:/project/model.ifc?mode=ro'\n"
+        " with sqlite3.connect(uri,uri=True) as db:\n"
+        "  count=db.execute('select count(*) from _objects_id').fetchone()[0]\n"
+        " pprint.pp({'type':'sqlite','length':count,'counter':counter})\n"
         "inspect_data()\n"
         "PY\n"
         "printf 'objects='\n"
-        "grep -o 'objectid' model-tree.json | awk '{n++} END {print n}'"
+        "python3 -c \"import sqlite3; print(sqlite3.connect('file:model.ifc?mode=ro', uri=True).execute('select count(*) from _objects_id').fetchone()[0])\""
     )
 
     result = shell.run(command, timeout=15, max_output_chars=4000)
 
     assert result.exit_code == 0
     assert result.stderr == ""
-    assert "'type': 'dict'" in result.stdout
+    assert "'type': 'sqlite'" in result.stdout
     assert "objects=" in result.stdout
 
 
@@ -147,6 +149,18 @@ def test_system_prompt_matches_claude_native_bash_contract(sample_data: Path) ->
     assert "Never create, edit, move, delete" in prompt
     assert "Docker" not in prompt
     assert "portable fallback" not in prompt
+    assert "model.ifc" in prompt
+    assert "SQLite format 3" in prompt
+    assert "ISO-10303-21" in prompt
+    assert "properties JSON" not in prompt
+    assert "tree JSON" not in prompt
+
+
+def test_project_contract_and_manifest_expose_only_the_ifc(sample_data: Path) -> None:
+    project = resolve_project_files(sample_data)
+
+    assert project.paths() == {"ifc": (sample_data / "model.ifc").resolve()}
+    assert [item["role"] for item in project.manifest()] == ["ifc"]
 
 
 def test_pretty_terminal_log_shows_each_observable_step(

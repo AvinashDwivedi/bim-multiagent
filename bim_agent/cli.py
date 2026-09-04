@@ -9,8 +9,8 @@ from .runtime import BimAgent, report_json
 
 
 def parser() -> argparse.ArgumentParser:
-    value = argparse.ArgumentParser(prog="bim-agent", description="Ask evidence-backed questions over three BIM export files.")
-    value.add_argument("--data-dir", default=None, help="Directory containing tree JSON, properties JSON, and .ifc")
+    value = argparse.ArgumentParser(prog="bim-agent", description="Ask evidence-backed questions over one IFC artifact.")
+    value.add_argument("--data-dir", default=None, help="Directory containing exactly one .ifc file")
     commands = value.add_subparsers(dest="command", required=True)
 
     ask = commands.add_parser("ask", help="Ask a BIM question")

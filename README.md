@@ -1,6 +1,6 @@
 # BIM Built-in Tools Agent
 
-An OpenAI Responses API agent for answering questions over one three-file BIM export. The runtime has no custom
+An OpenAI Responses API agent for answering questions over one IFC artifact. The runtime has no custom
 function tools, MCP servers, planner tools, reviewer tools, skills, subagents, or project-specific routing.
 
 ## Tool policy
@@ -15,28 +15,28 @@ working directory. On Windows, Git Bash is discovered automatically; set `BIM_BA
 custom location. Docker is not installed, started, or used. The agent instruction limits Bash to read-only project
 analysis and disables dedicated write tools, matching the reference runtime's permission model.
 
-Project facts must come from the selected project's three artifacts. Web evidence is reserved for standards,
+Project facts must come from the selected project's IFC artifact. Web evidence is reserved for standards,
 regulations, product references, or current public information and cannot substitute for project evidence.
 
 `GET /api/tools` reports the effective policy and its mapping to the Claude Agent SDK reference tools.
 
 ## Project contract
 
-The selected project directory must contain exactly one file for each role:
+The selected project directory must contain exactly one `.ifc` file:
 
 ```text
 project-data/
-|-- <name>.ifc
-|-- <name>-properties.json
-`-- <name>-tree.json
+`-- <name>.ifc
 ```
 
-The JSON files may also be named `properties.json` / `tree.json` or use an underscore before the role.
+The runtime detects the content rather than trusting the extension. It supports genuine STEP IFC files beginning
+with `ISO-10303-21` and Autodesk SQLite property databases beginning with `SQLite format 3`. JSON property and
+tree exports are not required and are not exposed to the agent as project evidence.
 
 For the evaluator and web application, place project folders under `bim-data/<client_id>/<project_id>/`. The service discovers
 that collection on every `GET /api/projects` request, reports incomplete folders separately, and resolves each chat
 request by its selected `client_id` and `project_id`. Set `BIM_PROJECTS_ROOT` only to use a different collection directory.
-Ambiguous or incomplete directories are rejected.
+Directories with no IFC file or more than one IFC file are rejected.
 
 ## Setup
 

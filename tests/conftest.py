@@ -16,7 +16,7 @@ def isolate_runtime(monkeypatch, tmp_path: Path) -> None:
 
 @pytest.fixture()
 def sample_data(tmp_path: Path) -> Path:
-    data_dir = tmp_path / "three-files"
+    data_dir = tmp_path / "ifc-only"
     data_dir.mkdir()
 
     tree = {
@@ -146,9 +146,6 @@ def sample_data(tmp_path: Path) -> Path:
     properties["34"] = record(34, "Beta Switchboard [3002]", type_name="Panel", level="B1")
     properties["43"] = record(43, "Pipe [4001]", type_name="CW", level="GF", length="2.5 m")
     properties["44"] = record(44, "Pipe [4002]", type_name="CW", level="GF", length="3.0 m")
-
-    (data_dir / "model-tree.json").write_text(json.dumps(tree, ensure_ascii=False), encoding="utf-8")
-    (data_dir / "model-properties.json").write_text(json.dumps(properties, ensure_ascii=False), encoding="utf-8")
 
     database_path = data_dir / "model.ifc"
     with sqlite3.connect(database_path) as database:

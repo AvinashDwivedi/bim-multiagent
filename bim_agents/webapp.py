@@ -89,7 +89,7 @@ def _project_directory(
 
 
 def _fingerprint(data_dir: Path) -> tuple[tuple[str, int, int], ...]:
-    files = [*data_dir.glob("*-tree.json"), *data_dir.glob("*-properties.json"), *data_dir.glob("*.ifc")]
+    files = list(data_dir.glob("*.ifc"))
     return tuple(sorted((path.name, path.stat().st_size, path.stat().st_mtime_ns) for path in files))
 
 

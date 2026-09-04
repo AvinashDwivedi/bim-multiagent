@@ -1,4 +1,5 @@
 fastapi>=0.110
+ifcopenshell>=0.8.0
 openai>=2.53.0
 pydantic>=2.6
 uvicorn>=0.29

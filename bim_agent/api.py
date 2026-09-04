@@ -30,7 +30,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             return {
                 "status": "ok",
                 "model_directed": True,
-                "source_count": 3,
+                "source_count": len(agent.project.paths()),
                 "tools": tool_policy(),
                 "shell": agent.shell.status(),
             }
